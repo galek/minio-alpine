@@ -2,7 +2,7 @@ name: 'Sync fork with parent repository'
 
 on:
   schedule:
-    - cron: '*/3 * * * *' # every 3 minutes
+    - cron: '*/60 * * * *' # every 60 minutes
   workflow_dispatch: # on button click
 
 jobs:
