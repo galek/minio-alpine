@@ -13,7 +13,7 @@ jobs:
         with:
 #         token: ${{ secrets.PERSONAL_TOKEN }}
           owner: galek
-          repo: 'minio/minio'
+          repo: 'minio/test'
           base: master
           head: master
           merge_method: merge
