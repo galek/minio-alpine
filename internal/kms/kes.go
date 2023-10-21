@@ -20,15 +20,17 @@ package kms
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/minio/kes-go"
-	"github.com/minio/pkg/certs"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v2/certs"
+	"github.com/minio/pkg/v2/env"
 )
 
 const (
@@ -102,30 +104,17 @@ func NewWithConfig(config Config) (KMS, error) {
 	}
 	client.Endpoints = endpoints
 
-	var bulkAvailable bool
-	_, policy, err := client.DescribeSelf(context.Background())
-	if err == nil {
-		const BulkAPI = "/v1/key/bulk/decrypt/"
-		for _, allow := range policy.Allow {
-			if strings.HasPrefix(allow, BulkAPI) {
-				bulkAvailable = true
-				break
-			}
-		}
-	}
-
 	c := &kesClient{
-		client:        client,
-		enclave:       client.Enclave(config.Enclave),
-		defaultKeyID:  config.DefaultKeyID,
-		bulkAvailable: bulkAvailable,
+		client:       client,
+		enclave:      client.Enclave(config.Enclave),
+		defaultKeyID: config.DefaultKeyID,
 	}
 	go func() {
 		if config.Certificate == nil || config.ReloadCertEvents == nil {
 			return
 		}
+		var prevCertificate tls.Certificate
 		for {
-			var prevCertificate tls.Certificate
 			certificate, ok := <-config.ReloadCertEvents
 			if !ok {
 				return
@@ -164,11 +153,14 @@ type kesClient struct {
 	defaultKeyID string
 	client       *kes.Client
 	enclave      *kes.Enclave
-
-	bulkAvailable bool
 }
 
-var _ KMS = (*kesClient)(nil) // compiler check
+var ( // compiler checks
+	_ KMS             = (*kesClient)(nil)
+	_ KeyManager      = (*kesClient)(nil)
+	_ IdentityManager = (*kesClient)(nil)
+	_ PolicyManager   = (*kesClient)(nil)
+)
 
 // Stat returns the current KES status containing a
 // list of KES endpoints and the default key ID.
@@ -257,13 +249,14 @@ func (c *kesClient) DeleteKey(ctx context.Context, keyID string) error {
 	return c.enclave.DeleteKey(ctx, keyID)
 }
 
-// ListKeys List all key names that match the specified pattern. In particular,
-// the pattern * lists all keys.
-func (c *kesClient) ListKeys(ctx context.Context, pattern string) (*kes.KeyIterator, error) {
+// ListKeys returns an iterator over all key names.
+func (c *kesClient) ListKeys(ctx context.Context) (*kes.ListIter[string], error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	return c.enclave.ListKeys(ctx, pattern)
+	return &kes.ListIter[string]{
+		NextFunc: c.enclave.ListKeys,
+	}, nil
 }
 
 // GenerateKey generates a new data encryption key using
@@ -302,7 +295,9 @@ func (c *kesClient) ImportKey(ctx context.Context, keyID string, bytes []byte) e
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	return c.enclave.ImportKey(ctx, keyID, bytes)
+	return c.enclave.ImportKey(ctx, keyID, &kes.ImportKeyRequest{
+		Key: bytes,
+	})
 }
 
 // EncryptKey Encrypts and authenticates a (small) plaintext with the cryptographic key
@@ -335,30 +330,6 @@ func (c *kesClient) DecryptKey(keyID string, ciphertext []byte, ctx Context) ([]
 func (c *kesClient) DecryptAll(ctx context.Context, keyID string, ciphertexts [][]byte, contexts []Context) ([][]byte, error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
-
-	if c.bulkAvailable {
-		CCPs := make([]kes.CCP, 0, len(ciphertexts))
-		for i := range ciphertexts {
-			bCtx, err := contexts[i].MarshalText()
-			if err != nil {
-				return nil, err
-			}
-			CCPs = append(CCPs, kes.CCP{
-				Ciphertext: ciphertexts[i],
-				Context:    bCtx,
-			})
-		}
-
-		PCPs, err := c.enclave.DecryptAll(ctx, keyID, CCPs...)
-		if err != nil {
-			return nil, err
-		}
-		plaintexts := make([][]byte, 0, len(PCPs))
-		for _, p := range PCPs {
-			plaintexts = append(plaintexts, p.Plaintext)
-		}
-		return plaintexts, nil
-	}
 
 	plaintexts := make([][]byte, 0, len(ciphertexts))
 	for i := range ciphertexts {
@@ -405,21 +376,14 @@ func (c *kesClient) DeletePolicy(ctx context.Context, policy string) error {
 	return c.enclave.DeletePolicy(ctx, policy)
 }
 
-// ListPolicies list all policy metadata that match the specified pattern.
-// In particular, the pattern * lists all policy metadata.
-func (c *kesClient) ListPolicies(ctx context.Context, pattern string) (*kes.PolicyIterator, error) {
+// ListPolicies returns an iterator over all policy names.
+func (c *kesClient) ListPolicies(ctx context.Context) (*kes.ListIter[string], error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	return c.enclave.ListPolicies(ctx, pattern)
-}
-
-// SetPolicy creates or updates a policy.
-func (c *kesClient) SetPolicy(ctx context.Context, policy string, policyItem *kes.Policy) error {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-
-	return c.enclave.SetPolicy(ctx, policy, policyItem)
+	return &kes.ListIter[string]{
+		NextFunc: c.enclave.ListPolicies,
+	}, nil
 }
 
 // GetPolicy gets a policy from KMS.
@@ -459,11 +423,60 @@ func (c *kesClient) DeleteIdentity(ctx context.Context, identity string) error {
 	return c.enclave.DeleteIdentity(ctx, kes.Identity(identity))
 }
 
-// ListIdentities list all identity metadata that match the specified pattern.
-// In particular, the pattern * lists all identity metadata.
-func (c *kesClient) ListIdentities(ctx context.Context, pattern string) (*kes.IdentityIterator, error) {
+// ListPolicies returns an iterator over all identities.
+func (c *kesClient) ListIdentities(ctx context.Context) (*kes.ListIter[kes.Identity], error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	return c.enclave.ListIdentities(ctx, pattern)
+	return &kes.ListIter[kes.Identity]{
+		NextFunc: c.enclave.ListIdentities,
+	}, nil
+}
+
+// Verify verifies all KMS endpoints and returns details
+func (c *kesClient) Verify(ctx context.Context) []VerifyResult {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	results := []VerifyResult{}
+	kmsContext := Context{"MinIO admin API": "ServerInfoHandler"} // Context for a test key operation
+	for _, endpoint := range c.client.Endpoints {
+		client := kes.Client{
+			Endpoints:  []string{endpoint},
+			HTTPClient: c.client.HTTPClient,
+		}
+
+		// 1. Get stats for the KES instance
+		state, err := client.Status(ctx)
+		if err != nil {
+			results = append(results, VerifyResult{Status: "offline", Endpoint: endpoint})
+			continue
+		}
+
+		// 2. Generate a new key using the KMS.
+		kmsCtx, err := kmsContext.MarshalText()
+		if err != nil {
+			results = append(results, VerifyResult{Status: "offline", Endpoint: endpoint})
+			continue
+		}
+		result := VerifyResult{Status: "online", Endpoint: endpoint, Version: state.Version}
+		key, err := client.GenerateKey(ctx, env.Get(EnvKESKeyName, ""), kmsCtx)
+		if err != nil {
+			result.Encrypt = fmt.Sprintf("Encryption failed: %v", err)
+		} else {
+			result.Encrypt = "success"
+		}
+		// 3. Verify that we can indeed decrypt the (encrypted) key
+		decryptedKey, err := client.Decrypt(ctx, env.Get(EnvKESKeyName, ""), key.Ciphertext, kmsCtx)
+		switch {
+		case err != nil:
+			result.Decrypt = fmt.Sprintf("Decryption failed: %v", err)
+		case subtle.ConstantTimeCompare(key.Plaintext, decryptedKey) != 1:
+			result.Decrypt = "Decryption failed: decrypted key does not match generated key"
+		default:
+			result.Decrypt = "success"
+		}
+		results = append(results, result)
+	}
+	return results
 }

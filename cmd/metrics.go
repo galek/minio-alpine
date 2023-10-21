@@ -25,7 +25,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v2/policy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
 )
@@ -38,6 +38,14 @@ var (
 			Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10},
 		},
 		[]string{"api"},
+	)
+	bucketHTTPRequestsDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "s3_ttfb_seconds",
+			Help:    "Time taken by requests served by current MinIO server instance per bucket",
+			Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10},
+		},
+		[]string{"api", "bucket"},
 	)
 	minioVersionInfo = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -100,7 +108,6 @@ func (c *minioCollector) Collect(ch chan<- prometheus.Metric) {
 	bucketUsageMetricsPrometheus(ch)
 	networkMetricsPrometheus(ch)
 	httpMetricsPrometheus(ch)
-	cacheMetricsPrometheus(ch)
 	healingMetricsPrometheus(ch)
 }
 
@@ -180,82 +187,6 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 	}
 }
 
-// collects cache metrics for MinIO server in Prometheus specific format
-// and sends to given channel
-func cacheMetricsPrometheus(ch chan<- prometheus.Metric) {
-	cacheObjLayer := newCachedObjectLayerFn()
-	// Service not initialized yet
-	if cacheObjLayer == nil {
-		return
-	}
-
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(cacheNamespace, "hits", "total"),
-			"Total number of drive cache hits in current MinIO instance",
-			nil, nil),
-		prometheus.CounterValue,
-		float64(cacheObjLayer.CacheStats().getHits()),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(cacheNamespace, "misses", "total"),
-			"Total number of drive cache misses in current MinIO instance",
-			nil, nil),
-		prometheus.CounterValue,
-		float64(cacheObjLayer.CacheStats().getMisses()),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(cacheNamespace, "data", "served"),
-			"Total number of bytes served from cache of current MinIO instance",
-			nil, nil),
-		prometheus.CounterValue,
-		float64(cacheObjLayer.CacheStats().getBytesServed()),
-	)
-	for _, cdStats := range cacheObjLayer.CacheStats().GetDiskStats() {
-		// Cache disk usage percentage
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName(cacheNamespace, "usage", "percent"),
-				"Total percentage cache usage",
-				[]string{"disk"}, nil),
-			prometheus.GaugeValue,
-			float64(cdStats.UsagePercent),
-			cdStats.Dir,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName(cacheNamespace, "usage", "high"),
-				"Indicates cache usage is high or low, relative to current cache 'quota' settings",
-				[]string{"disk"}, nil),
-			prometheus.GaugeValue,
-			float64(cdStats.UsageState),
-			cdStats.Dir,
-		)
-
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName("cache", "usage", "size"),
-				"Indicates current cache usage in bytes",
-				[]string{"disk"}, nil),
-			prometheus.GaugeValue,
-			float64(cdStats.UsageSize),
-			cdStats.Dir,
-		)
-
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName("cache", "total", "size"),
-				"Indicates total size of cache drive",
-				[]string{"disk"}, nil),
-			prometheus.GaugeValue,
-			float64(cdStats.TotalCapacity),
-			cdStats.Dir,
-		)
-	}
-}
-
 // collects http metrics for MinIO server in Prometheus specific format
 // and sends to given channel
 func httpMetricsPrometheus(ch chan<- prometheus.Metric) {
@@ -322,7 +253,7 @@ func networkMetricsPrometheus(ch chan<- prometheus.Metric) {
 			"Total number of bytes sent to the other peer nodes by current MinIO server instance",
 			nil, nil),
 		prometheus.CounterValue,
-		float64(connStats.TotalOutputBytes),
+		float64(connStats.internodeOutputBytes),
 	)
 
 	ch <- prometheus.MustNewConstMetric(
@@ -331,7 +262,7 @@ func networkMetricsPrometheus(ch chan<- prometheus.Metric) {
 			"Total number of internode bytes received by current MinIO server instance",
 			nil, nil),
 		prometheus.CounterValue,
-		float64(connStats.TotalInputBytes),
+		float64(connStats.internodeInputBytes),
 	)
 
 	// Network Sent/Received Bytes (Outbound)
@@ -341,7 +272,7 @@ func networkMetricsPrometheus(ch chan<- prometheus.Metric) {
 			"Total number of s3 bytes sent by current MinIO server instance",
 			nil, nil),
 		prometheus.CounterValue,
-		float64(connStats.S3OutputBytes),
+		float64(connStats.s3OutputBytes),
 	)
 
 	ch <- prometheus.MustNewConstMetric(
@@ -350,7 +281,7 @@ func networkMetricsPrometheus(ch chan<- prometheus.Metric) {
 			"Total number of s3 bytes received by current MinIO server instance",
 			nil, nil),
 		prometheus.CounterValue,
-		float64(connStats.S3InputBytes),
+		float64(connStats.s3InputBytes),
 	)
 }
 
@@ -373,7 +304,7 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 	}
 
 	for bucket, usageInfo := range dataUsageInfo.BucketsUsage {
-		stat := globalReplicationStats.getLatestReplicationStats(bucket, usageInfo)
+		stat := globalReplicationStats.getLatestReplicationStats(bucket)
 		// Total space used by bucket
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
@@ -395,20 +326,11 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		)
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
-				prometheus.BuildFQName("bucket", "replication", "failed_size"),
-				"Total capacity failed to replicate at least once",
-				[]string{"bucket"}, nil),
-			prometheus.GaugeValue,
-			float64(stat.FailedSize),
-			bucket,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
 				prometheus.BuildFQName("bucket", "replication", "successful_size"),
 				"Total capacity replicated to destination",
 				[]string{"bucket"}, nil),
 			prometheus.GaugeValue,
-			float64(stat.ReplicatedSize),
+			float64(stat.ReplicationStats.ReplicatedSize),
 			bucket,
 		)
 		ch <- prometheus.MustNewConstMetric(
@@ -417,18 +339,10 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 				"Total capacity replicated to this instance",
 				[]string{"bucket"}, nil),
 			prometheus.GaugeValue,
-			float64(stat.ReplicaSize),
+			float64(stat.ReplicationStats.ReplicaSize),
 			bucket,
 		)
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName("bucket", "replication", "failed_count"),
-				"Total replication operations failed",
-				[]string{"bucket"}, nil),
-			prometheus.GaugeValue,
-			float64(stat.FailedCount),
-			bucket,
-		)
+
 		for k, v := range usageInfo.ObjectSizesHistogram {
 			ch <- prometheus.MustNewConstMetric(
 				prometheus.NewDesc(
@@ -614,13 +528,18 @@ func metricsHandler() http.Handler {
 	})
 }
 
+// NoAuthMiddleware no auth middle ware.
+func NoAuthMiddleware(h http.Handler) http.Handler {
+	return h
+}
+
 // AuthMiddleware checks if the bearer token is valid and authorized.
 func AuthMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
 
 		claims, groups, owner, authErr := metricsRequestAuthenticate(r)
-		if authErr != nil || !claims.VerifyIssuer("prometheus", true) {
+		if authErr != nil || (claims != nil && !claims.VerifyIssuer("prometheus", true)) {
 			if ok {
 				tc.FuncName = "handler.MetricsAuth"
 				tc.ResponseRecorder.LogErrBody = true
@@ -637,10 +556,10 @@ func AuthMiddleware(h http.Handler) http.Handler {
 		}
 
 		// For authenticated users apply IAM policy.
-		if !globalIAMSys.IsAllowed(iampolicy.Args{
+		if !globalIAMSys.IsAllowed(policy.Args{
 			AccountName:     cred.AccessKey,
 			Groups:          cred.Groups,
-			Action:          iampolicy.PrometheusAdminAction,
+			Action:          policy.PrometheusAdminAction,
 			ConditionValues: getConditionValues(r, "", cred),
 			IsOwner:         owner,
 			Claims:          cred.Claims,

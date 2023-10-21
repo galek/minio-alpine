@@ -38,6 +38,7 @@ import (
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
+	"github.com/valyala/bytebufferpool"
 )
 
 //go:generate msgp -file $GOFILE -unexported
@@ -57,6 +58,7 @@ type dataUsageEntry struct {
 	Size             int64                `msg:"sz"`
 	Objects          uint64               `msg:"os"`
 	Versions         uint64               `msg:"vs"` // Versions that are not delete markers.
+	DeleteMarkers    uint64               `msg:"dms"`
 	ObjSizes         sizeHistogram        `msg:"szs"`
 	ObjVersions      versionsHistogram    `msg:"vh"`
 	ReplicationStats *replicationAllStats `msg:"rs,omitempty"`
@@ -163,6 +165,7 @@ type replicationStats struct {
 	AfterThresholdSize   uint64
 	MissedThresholdCount uint64
 	AfterThresholdCount  uint64
+	ReplicatedCount      uint64
 }
 
 func (rs replicationStats) Empty() bool {
@@ -172,14 +175,16 @@ func (rs replicationStats) Empty() bool {
 }
 
 type replicationAllStats struct {
-	Targets     map[string]replicationStats `msg:"t,omitempty"`
-	ReplicaSize uint64                      `msg:"r,omitempty"`
+	Targets      map[string]replicationStats `msg:"t,omitempty"`
+	ReplicaSize  uint64                      `msg:"r,omitempty"`
+	ReplicaCount uint64                      `msg:"rc,omitempty"`
 }
 
 //msgp:tuple replicationAllStatsV1
 type replicationAllStatsV1 struct {
-	Targets     map[string]replicationStats
-	ReplicaSize uint64 `msg:"ReplicaSize,omitempty"`
+	Targets      map[string]replicationStats
+	ReplicaSize  uint64 `msg:"ReplicaSize,omitempty"`
+	ReplicaCount uint64 `msg:"ReplicaCount,omitempty"`
 }
 
 // clone creates a deep-copy clone.
@@ -328,6 +333,7 @@ type dataUsageCacheInfo struct {
 func (e *dataUsageEntry) addSizes(summary sizeSummary) {
 	e.Size += summary.totalSize
 	e.Versions += summary.versions
+	e.DeleteMarkers += summary.deleteMarkers
 	e.ObjSizes.add(summary.totalSize)
 	e.ObjVersions.add(summary.versions)
 
@@ -339,20 +345,20 @@ func (e *dataUsageEntry) addSizes(summary sizeSummary) {
 		e.ReplicationStats.Targets = make(map[string]replicationStats)
 	}
 	e.ReplicationStats.ReplicaSize += uint64(summary.replicaSize)
+	e.ReplicationStats.ReplicaCount += uint64(summary.replicaCount)
 
-	if summary.replTargetStats != nil {
-		for arn, st := range summary.replTargetStats {
-			tgtStat, ok := e.ReplicationStats.Targets[arn]
-			if !ok {
-				tgtStat = replicationStats{}
-			}
-			tgtStat.PendingSize += uint64(st.pendingSize)
-			tgtStat.FailedSize += uint64(st.failedSize)
-			tgtStat.ReplicatedSize += uint64(st.replicatedSize)
-			tgtStat.FailedCount += st.failedCount
-			tgtStat.PendingCount += st.pendingCount
-			e.ReplicationStats.Targets[arn] = tgtStat
+	for arn, st := range summary.replTargetStats {
+		tgtStat, ok := e.ReplicationStats.Targets[arn]
+		if !ok {
+			tgtStat = replicationStats{}
 		}
+		tgtStat.PendingSize += uint64(st.pendingSize)
+		tgtStat.FailedSize += uint64(st.failedSize)
+		tgtStat.ReplicatedSize += uint64(st.replicatedSize)
+		tgtStat.ReplicatedCount += uint64(st.replicatedCount)
+		tgtStat.FailedCount += st.failedCount
+		tgtStat.PendingCount += st.pendingCount
+		e.ReplicationStats.Targets[arn] = tgtStat
 	}
 	if summary.tiers != nil {
 		if e.AllTierStats == nil {
@@ -366,6 +372,7 @@ func (e *dataUsageEntry) addSizes(summary sizeSummary) {
 func (e *dataUsageEntry) merge(other dataUsageEntry) {
 	e.Objects += other.Objects
 	e.Versions += other.Versions
+	e.DeleteMarkers += other.DeleteMarkers
 	e.Size += other.Size
 	if other.ReplicationStats != nil {
 		if e.ReplicationStats == nil {
@@ -374,14 +381,16 @@ func (e *dataUsageEntry) merge(other dataUsageEntry) {
 			e.ReplicationStats.Targets = make(map[string]replicationStats)
 		}
 		e.ReplicationStats.ReplicaSize += other.ReplicationStats.ReplicaSize
+		e.ReplicationStats.ReplicaCount += other.ReplicationStats.ReplicaCount
 		for arn, stat := range other.ReplicationStats.Targets {
 			st := e.ReplicationStats.Targets[arn]
 			e.ReplicationStats.Targets[arn] = replicationStats{
-				PendingSize:    stat.PendingSize + st.PendingSize,
-				FailedSize:     stat.FailedSize + st.FailedSize,
-				ReplicatedSize: stat.ReplicatedSize + st.ReplicatedSize,
-				PendingCount:   stat.PendingCount + st.PendingCount,
-				FailedCount:    stat.FailedCount + st.FailedCount,
+				PendingSize:     stat.PendingSize + st.PendingSize,
+				FailedSize:      stat.FailedSize + st.FailedSize,
+				ReplicatedSize:  stat.ReplicatedSize + st.ReplicatedSize,
+				PendingCount:    stat.PendingCount + st.PendingCount,
+				FailedCount:     stat.FailedCount + st.FailedCount,
+				ReplicatedCount: stat.ReplicatedCount + st.ReplicatedCount,
 			}
 		}
 	}
@@ -531,13 +540,14 @@ func (d *dataUsageCache) dui(path string, buckets []BucketInfo) DataUsageInfo {
 	}
 	flat := d.flatten(*e)
 	dui := DataUsageInfo{
-		LastUpdate:         d.Info.LastUpdate,
-		ObjectsTotalCount:  flat.Objects,
-		VersionsTotalCount: flat.Versions,
-		ObjectsTotalSize:   uint64(flat.Size),
-		BucketsCount:       uint64(len(e.Children)),
-		BucketsUsage:       d.bucketsUsageInfo(buckets),
-		TierStats:          d.tiersUsageInfo(buckets),
+		LastUpdate:              d.Info.LastUpdate,
+		ObjectsTotalCount:       flat.Objects,
+		VersionsTotalCount:      flat.Versions,
+		DeleteMarkersTotalCount: flat.DeleteMarkers,
+		ObjectsTotalSize:        uint64(flat.Size),
+		BucketsCount:            uint64(len(e.Children)),
+		BucketsUsage:            d.bucketsUsageInfo(buckets),
+		TierStats:               d.tiersUsageInfo(buckets),
 	}
 	return dui
 }
@@ -805,11 +815,14 @@ func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]Bucke
 			Size:                    uint64(flat.Size),
 			VersionsCount:           flat.Versions,
 			ObjectsCount:            flat.Objects,
+			DeleteMarkersCount:      flat.DeleteMarkers,
 			ObjectSizesHistogram:    flat.ObjSizes.toMap(),
 			ObjectVersionsHistogram: flat.ObjVersions.toMap(),
 		}
 		if flat.ReplicationStats != nil {
 			bui.ReplicaSize = flat.ReplicationStats.ReplicaSize
+			bui.ReplicaCount = flat.ReplicationStats.ReplicaCount
+
 			bui.ReplicationInfo = make(map[string]BucketTargetUsageInfo, len(flat.ReplicationStats.Targets))
 			for arn, stat := range flat.ReplicationStats.Targets {
 				bui.ReplicationInfo[arn] = BucketTargetUsageInfo{
@@ -818,6 +831,7 @@ func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]Bucke
 					ReplicationFailedSize:   stat.FailedSize,
 					ReplicationPendingCount: stat.PendingCount,
 					ReplicationFailedCount:  stat.FailedCount,
+					ReplicatedCount:         stat.ReplicatedCount,
 				}
 			}
 		}
@@ -910,39 +924,55 @@ type objectIO interface {
 // load the cache content with name from minioMetaBackgroundOpsBucket.
 // Only backend errors are returned as errors.
 // The loader is optimistic and has no locking, but tries 5 times before giving up.
-// If the object is not found or unable to deserialize d is cleared and nil error is returned.
+// If the object is not found, a nil error with empty data usage cache is returned.
 func (d *dataUsageCache) load(ctx context.Context, store objectIO, name string) error {
-	// Abandon if more than 5 minutes, so we don't hold up scanner.
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
+	// By defaut, empty data usage cache
+	*d = dataUsageCache{}
 
-	// Caches are read+written without locks,
-	retries := 0
-	for retries < 5 {
+	load := func(name string, timeout time.Duration) (bool, error) {
+		// Abandon if more than time.Minute, so we don't hold up scanner.
+		// drive timeout by default is 2 minutes, we do not need to wait longer.
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
 		r, err := store.GetObjectNInfo(ctx, dataUsageBucket, name, nil, http.Header{}, ObjectOptions{NoLock: true})
 		if err != nil {
 			switch err.(type) {
 			case ObjectNotFound, BucketNotFound:
+				return false, nil
 			case InsufficientReadQuorum, StorageErr:
-				retries++
-				time.Sleep(time.Duration(rand.Int63n(int64(time.Second))))
-				continue
-			default:
-				return toObjectErr(err, dataUsageBucket, name)
+				return true, nil
 			}
-			*d = dataUsageCache{}
-			return nil
+			return false, err
 		}
-		if err := d.deserialize(r); err != nil {
-			r.Close()
-			retries++
-			time.Sleep(time.Duration(rand.Int63n(int64(time.Second))))
-			continue
-		}
+		err = d.deserialize(r)
 		r.Close()
-		return nil
+		return err != nil, nil
 	}
-	*d = dataUsageCache{}
+
+	// Caches are read+written without locks,
+	retries := 0
+	for retries < 5 {
+		retry, err := load(name, time.Minute)
+		if err != nil {
+			return toObjectErr(err, dataUsageBucket, name)
+		}
+		if !retry {
+			break
+		}
+		retry, err = load(name+".bkp", 30*time.Second)
+		if err == nil && !retry {
+			// Only return when we have valid data from the backup
+			break
+		}
+		retries++
+		time.Sleep(time.Duration(rand.Int63n(int64(time.Second))))
+	}
+
+	if retries == 5 {
+		logger.LogOnceIf(ctx, fmt.Errorf("maximum retry reached to load the data usage cache `%s`", name), "retry-loading-data-usage-cache")
+	}
+
 	return nil
 }
 
@@ -952,47 +982,52 @@ var maxConcurrentScannerSaves = make(chan struct{}, 4)
 // save the content of the cache to minioMetaBackgroundOpsBucket with the provided name.
 // Note that no locking is done when saving.
 func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) error {
-	var r io.Reader
-	maxConcurrentScannerSaves <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case maxConcurrentScannerSaves <- struct{}{}:
+	}
 	defer func() {
-		<-maxConcurrentScannerSaves
-	}()
-	// If big, do streaming...
-	size := int64(-1)
-	if len(d.Cache) > 10000 {
-		pr, pw := io.Pipe()
-		go func() {
-			pw.CloseWithError(d.serializeTo(pw))
-		}()
-		defer pr.Close()
-		r = pr
-	} else {
-		var buf bytes.Buffer
-		err := d.serializeTo(&buf)
-		if err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+		case <-maxConcurrentScannerSaves:
 		}
-		r = &buf
-		size = int64(buf.Len())
+	}()
+
+	buf := bytebufferpool.Get()
+	defer func() {
+		buf.Reset()
+		bytebufferpool.Put(buf)
+	}()
+
+	if err := d.serializeTo(buf); err != nil {
+		return err
 	}
 
-	hr, err := hash.NewReader(r, size, "", "", size)
+	hr, err := hash.NewReader(ctx, bytes.NewReader(buf.Bytes()), int64(buf.Len()), "", "", int64(buf.Len()))
 	if err != nil {
 		return err
 	}
 
-	// Abandon if more than 5 minutes, so we don't hold up scanner.
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-	_, err = store.PutObject(ctx,
-		dataUsageBucket,
-		name,
-		NewPutObjReader(hr),
-		ObjectOptions{NoLock: true})
-	if isErrBucketNotFound(err) {
-		return nil
+	save := func(name string, timeout time.Duration) error {
+		// Abandon if more than a minute, so we don't hold up scanner.
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		_, err = store.PutObject(ctx,
+			dataUsageBucket,
+			name,
+			NewPutObjReader(hr),
+			ObjectOptions{NoLock: true})
+		if isErrBucketNotFound(err) {
+			return nil
+		}
+		return err
 	}
-	return err
+	defer save(name+".bkp", 30*time.Second) // Keep a backup as well
+
+	// drive timeout by default is 2 minutes, we do not need to wait longer.
+	return save(name, time.Minute)
 }
 
 // dataUsageCacheVer indicates the cache version.
@@ -1231,8 +1266,9 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 			var replicationStats *replicationAllStats
 			if v.ReplicationStats != nil {
 				replicationStats = &replicationAllStats{
-					Targets:     v.ReplicationStats.Targets,
-					ReplicaSize: v.ReplicationStats.ReplicaSize,
+					Targets:      v.ReplicationStats.Targets,
+					ReplicaSize:  v.ReplicationStats.ReplicaSize,
+					ReplicaCount: v.ReplicationStats.ReplicaCount,
 				}
 			}
 			due := dataUsageEntry{

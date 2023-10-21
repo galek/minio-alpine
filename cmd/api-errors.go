@@ -47,7 +47,7 @@ import (
 	levent "github.com/minio/minio/internal/config/lambda/event"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/hash"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v2/policy"
 )
 
 // APIError structure
@@ -138,6 +138,8 @@ const (
 	ErrReplicationDenyEditError
 	ErrRemoteTargetDenyAddError
 	ErrReplicationNoExistingObjects
+	ErrReplicationValidationError
+	ErrReplicationPermissionCheckError
 	ErrObjectRestoreAlreadyInProgress
 	ErrNoSuchKey
 	ErrNoSuchUpload
@@ -188,6 +190,7 @@ const (
 	ErrMaximumExpires
 	ErrSlowDownRead
 	ErrSlowDownWrite
+	ErrMaxVersionsExceeded
 	ErrInvalidPrefixMarker
 	ErrBadRequest
 	ErrKeyTooLongError
@@ -855,6 +858,11 @@ var errorCodes = errorCodeMap{
 		Description:    "Resource requested is unwritable, please reduce your request rate",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
+	ErrMaxVersionsExceeded: {
+		Code:           "MaxVersionsExceeded",
+		Description:    "You've exceeded the limit on the number of versions you can create on this object",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrInvalidPrefixMarker: {
 		Code:           "InvalidPrefixMarker",
 		Description:    "Invalid marker prefix combination",
@@ -1013,6 +1021,16 @@ var errorCodes = errorCodeMap{
 	ErrReplicationBucketNeedsVersioningError: {
 		Code:           "InvalidRequest",
 		Description:    "Versioning must be 'Enabled' on the bucket to add a replication target",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrReplicationValidationError: {
+		Code:           "InvalidRequest",
+		Description:    "Replication validation failed on target",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrReplicationPermissionCheckError: {
+		Code:           "ReplicationPermissionCheck",
+		Description:    "X-Minio-Source-Replication-Check cannot be specified in request. Request cannot be completed",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrNoSuchObjectLockConfiguration: {
@@ -1385,7 +1403,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrAdminConfigIDPCfgNameAlreadyExists: {
 		Code:           "XMinioAdminConfigIDPCfgNameAlreadyExists",
-		Description:    "An IDP configuration with the given name aleady exists",
+		Description:    "An IDP configuration with the given name already exists",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrAdminConfigIDPCfgNameDoesNotExist: {
@@ -2098,6 +2116,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrSlowDownRead
 	case errErasureWriteQuorum:
 		apiErr = ErrSlowDownWrite
+	case errMaxVersionsExceeded:
+		apiErr = ErrMaxVersionsExceeded
 	// SSE errors
 	case errInvalidEncryptionParameters:
 		apiErr = ErrInvalidEncryptionParameters
@@ -2216,8 +2236,6 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrSlowDownWrite
 	case InsufficientReadQuorum:
 		apiErr = ErrSlowDownRead
-	case InvalidMarkerPrefixCombination:
-		apiErr = ErrNotImplemented
 	case InvalidUploadIDKeyCombination:
 		apiErr = ErrNotImplemented
 	case MalformedUploadID:
@@ -2319,6 +2337,12 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 	case dns.ErrBucketConflict:
 		apiErr = ErrBucketAlreadyExists
 	default:
+		if _, ok := err.(tags.Error); ok {
+			// tag errors are not exported, so we check their custom interface to avoid logging.
+			// The correct type is inserted by toAPIError.
+			apiErr = ErrInternalError
+			break
+		}
 		var ie, iw int
 		// This work-around is to handle the issue golang/go#30648
 		//nolint:gocritic

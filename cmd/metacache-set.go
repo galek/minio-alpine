@@ -38,7 +38,7 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v2/console"
 )
 
 type listPathOptions struct {
@@ -436,31 +436,29 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 				break
 			}
 		}
-
+		retryWait := func() {
+			retries++
+			if retries == 1 {
+				time.Sleep(retryDelay)
+			} else {
+				time.Sleep(retryDelay250)
+			}
+		}
 		// Load first part metadata...
 		// Read metadata associated with the object from all disks.
 		fi, metaArr, onlineDisks, err := er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(0), ObjectOptions{}, true)
 		if err != nil {
 			switch toObjectErr(err, minioMetaBucket, o.objectPath(0)).(type) {
-			case ObjectNotFound:
-				retries++
-				if retries == 1 {
-					time.Sleep(retryDelay)
-				} else {
-					time.Sleep(retryDelay250)
-				}
+			case ObjectNotFound, InsufficientReadQuorum:
+				retryWait()
 				continue
-			case InsufficientReadQuorum:
-				retries++
-				if retries == 1 {
-					time.Sleep(retryDelay)
-				} else {
-					time.Sleep(retryDelay250)
-				}
-				continue
-			default:
-				return entries, fmt.Errorf("reading first part metadata: %w", err)
 			}
+			// Allow one fast retry for other errors.
+			if retries > 0 {
+				return entries, fmt.Errorf("reading first part metadata: %v", err)
+			}
+			retryWait()
+			continue
 		}
 
 		partN, err := o.findFirstPart(fi)
@@ -474,8 +472,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 				}
 				retries = -1
 			}
-			retries++
-			time.Sleep(retryDelay250)
+			retryWait()
 			continue
 		case errors.Is(err, io.EOF):
 			return entries, io.EOF
@@ -597,14 +594,11 @@ func getListQuorum(quorum string, driveCount int) int {
 		return 1
 	case "reduced":
 		return 2
-	case "strict":
-		return driveCount
-	}
-	// Defaults to (driveCount+1)/2 drives per set, defaults to "optimal" value
-	if driveCount > 0 {
+	case "optimal":
 		return (driveCount + 1) / 2
-	} // "3" otherwise.
-	return 3
+	}
+	// defaults to 'strict'
+	return driveCount
 }
 
 // Will return io.EOF if continuing would not yield more results.
@@ -767,7 +761,7 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 			return nil
 		}
 		o.debugln(color.Green("saveMetaCacheStream:")+" saving block", b.n, "to", o.objectPath(b.n))
-		r, err := hash.NewReader(bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)))
+		r, err := hash.NewReader(ctx, bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)))
 		logger.LogIf(ctx, err)
 		custom := b.headerKV()
 		_, err = er.putMetacacheObject(ctx, o.objectPath(b.n), NewPutObjReader(r), ObjectOptions{
@@ -791,7 +785,7 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 			for k, v := range meta {
 				fi.Metadata[k] = v
 			}
-			err := er.updateObjectMeta(ctx, minioMetaBucket, o.objectPath(0), fi, er.getDisks())
+			err := er.updateObjectMetaWithOpts(ctx, minioMetaBucket, o.objectPath(0), fi, er.getDisks(), UpdateMetadataOpts{NoPersistence: true})
 			if err == nil {
 				break
 			}

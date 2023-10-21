@@ -26,7 +26,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
 
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v2/policy"
 )
 
 // Validate all the ListObjects query arguments, returns an APIErrorCode
@@ -231,7 +231,7 @@ func parseRequestToken(token string) (subToken string, nodeIndex int) {
 	if token == "" {
 		return token, -1
 	}
-	i := strings.Index(token, "@")
+	i := strings.Index(token, ":")
 	if i < 0 {
 		return token, -1
 	}

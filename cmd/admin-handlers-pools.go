@@ -26,20 +26,18 @@ import (
 
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v2/policy"
 )
 
 var (
-	errRebalanceDecommissionAlreadyRunning = errors.New("Rebalance cannot be started, decommission is aleady in progress")
+	errRebalanceDecommissionAlreadyRunning = errors.New("Rebalance cannot be started, decommission is already in progress")
 	errDecommissionRebalanceAlreadyRunning = errors.New("Decommission cannot be started, rebalance is already in progress")
 )
 
 func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "StartDecommission")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DecommissionAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.DecommissionAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -113,11 +111,9 @@ func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Reque
 }
 
 func (a adminAPIHandlers) CancelDecommission(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "CancelDecommission")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DecommissionAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.DecommissionAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -161,11 +157,9 @@ func (a adminAPIHandlers) CancelDecommission(w http.ResponseWriter, r *http.Requ
 }
 
 func (a adminAPIHandlers) StatusPool(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "StatusPool")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerInfoAdminAction, iampolicy.DecommissionAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ServerInfoAdminAction, policy.DecommissionAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -204,11 +198,9 @@ func (a adminAPIHandlers) StatusPool(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a adminAPIHandlers) ListPools(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListPools")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerInfoAdminAction, iampolicy.DecommissionAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ServerInfoAdminAction, policy.DecommissionAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -239,10 +231,9 @@ func (a adminAPIHandlers) ListPools(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a adminAPIHandlers) RebalanceStart(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RebalanceStart")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.RebalanceAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -311,10 +302,9 @@ func (a adminAPIHandlers) RebalanceStart(w http.ResponseWriter, r *http.Request)
 }
 
 func (a adminAPIHandlers) RebalanceStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RebalanceStatus")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.RebalanceAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -352,10 +342,9 @@ func (a adminAPIHandlers) RebalanceStatus(w http.ResponseWriter, r *http.Request
 }
 
 func (a adminAPIHandlers) RebalanceStop(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RebalanceStop")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.RebalanceAdminAction)
 	if objectAPI == nil {
 		return
 	}

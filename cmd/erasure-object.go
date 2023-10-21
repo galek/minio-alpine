@@ -43,10 +43,10 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/mimedb"
-	"github.com/minio/pkg/sync/errgroup"
-	"github.com/minio/pkg/wildcard"
-	uatomic "go.uber.org/atomic"
+	"github.com/minio/pkg/v2/mimedb"
+	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v2/wildcard"
+	"github.com/tinylib/msgp/msgp"
 )
 
 // list all errors which can be ignored in object operations.
@@ -93,7 +93,7 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	if srcOpts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, storageDisks, srcBucket, srcObject, srcOpts.VersionID, true)
 	} else {
-		metaArr, errs = readAllXL(ctx, storageDisks, srcBucket, srcObject, true, false)
+		metaArr, errs = readAllXL(ctx, storageDisks, srcBucket, srcObject, true, false, true)
 	}
 
 	readQuorum, writeQuorum, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
@@ -278,6 +278,11 @@ func (er erasureObjects) GetObjectNInfo(ctx context.Context, bucket, object stri
 		return gr.WithCleanupFuncs(nsUnlocker), nil
 	}
 
+	if objInfo.Size == 0 {
+		// Zero byte objects don't even need to further initialize pipes etc.
+		return NewGetObjectReaderFromReader(bytes.NewReader(nil), objInfo, opts)
+	}
+
 	fn, off, length, err := NewGetObjectReader(rs, objInfo, opts)
 	if err != nil {
 		return nil, err
@@ -407,9 +412,14 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 				switch scan {
 				case madmin.HealNormalScan, madmin.HealDeepScan:
 					healOnce.Do(func() {
-						if _, healing := er.getOnlineDisksWithHealing(); !healing {
-							go healObject(bucket, object, fi.VersionID, scan)
-						}
+						globalMRFState.addPartialOp(partialOperation{
+							bucket:    bucket,
+							object:    object,
+							versionID: fi.VersionID,
+							queued:    time.Now(),
+							setIndex:  er.setIndex,
+							poolIndex: er.poolIndex,
+						})
 					})
 					// Healing is triggered and we have written
 					// successfully the content to client for
@@ -479,6 +489,24 @@ func auditDanglingObjectDeletion(ctx context.Context, bucket, object, versionID 
 	auditLogInternal(ctx, opts)
 }
 
+func joinErrors(errs ...error) error {
+	s := make([]string, 0, len(errs))
+	nonNilErrs := make([]any, 0, len(errs))
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		s = append(s, "[%w]")
+		nonNilErrs = append(nonNilErrs, err)
+	}
+	// If all the errors were nil, return nil.
+	if len(nonNilErrs) == 0 {
+		return nil
+	}
+	allErrs := strings.Join(s, "\n")
+	return fmt.Errorf(allErrs, nonNilErrs...)
+}
+
 func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object string, metaArr []FileInfo, errs []error, dataErrs []error, opts ObjectOptions) (FileInfo, error) {
 	_, file, line, cok := runtime.Caller(1)
 	var err error
@@ -487,7 +515,14 @@ func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object st
 		tags := make(map[string]interface{}, 4)
 		tags["set"] = er.setIndex
 		tags["pool"] = er.poolIndex
-		tags["parity"] = m.Erasure.ParityBlocks
+		tags["merrs"] = joinErrors(errs...)     // errors.Join(errs...)
+		tags["derrs"] = joinErrors(dataErrs...) // errors.Join(dataErrs...)
+		if m.IsValid() {
+			tags["size"] = m.Size
+			tags["mtime"] = m.ModTime.Format(http.TimeFormat)
+			tags["parity"] = m.Erasure.ParityBlocks
+		}
+
 		if cok {
 			tags["caller"] = fmt.Sprintf("%s:%d", file, line)
 		}
@@ -523,10 +558,14 @@ func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object st
 	return m, err
 }
 
-func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, readData, inclFreeVers bool) ([]FileInfo, []error) {
+func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, readData, inclFreeVers, allParts bool) ([]FileInfo, []error) {
 	metadataArray := make([]*xlMetaV2, len(disks))
 	metaFileInfos := make([]FileInfo, len(metadataArray))
 	metadataShallowVersions := make([][]xlMetaV2ShallowVersion, len(disks))
+	var v2bufs [][]byte
+	if !readData {
+		v2bufs = make([][]byte, len(disks))
+	}
 
 	g := errgroup.WithNErrs(len(disks))
 	// Read `xl.meta` in parallel across disks.
@@ -539,6 +578,10 @@ func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, r
 			rf, err := disks[index].ReadXL(ctx, bucket, object, readData)
 			if err != nil {
 				return err
+			}
+			if !readData {
+				// Save the buffer so we can reuse it.
+				v2bufs[index] = rf.Buf
 			}
 
 			var xl xlMetaV2
@@ -558,10 +601,13 @@ func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, r
 		errFileNameTooLong,
 		errVolumeNotFound,
 		errFileVersionNotFound,
-		errDiskNotFound,
 		io.ErrUnexpectedEOF, // some times we would read without locks, ignore these errors
 		io.EOF,              // some times we would read without locks, ignore these errors
+		msgp.ErrShortBytes,
+		context.DeadlineExceeded,
+		context.Canceled,
 	}
+	ignoredErrs = append(ignoredErrs, objectOpIgnoredErrs...)
 
 	errs := g.Wait()
 	for index, err := range errs {
@@ -583,7 +629,7 @@ func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, r
 
 	readQuorum := (len(disks) + 1) / 2
 	meta := &xlMetaV2{versions: mergeXLV2Versions(readQuorum, false, 1, metadataShallowVersions...)}
-	lfi, err := meta.ToFileInfo(bucket, object, "", inclFreeVers)
+	lfi, err := meta.ToFileInfo(bucket, object, "", inclFreeVers, allParts)
 	if err != nil {
 		for i := range errs {
 			if errs[i] == nil {
@@ -613,7 +659,7 @@ func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, r
 
 		// make sure to preserve this for diskmtime based healing bugfix.
 		diskMTime := metaFileInfos[index].DiskMTime
-		metaFileInfos[index], errs[index] = metadataArray[index].ToFileInfo(bucket, object, versionID, inclFreeVers)
+		metaFileInfos[index], errs[index] = metadataArray[index].ToFileInfo(bucket, object, versionID, inclFreeVers, allParts)
 		if errs[index] != nil {
 			continue
 		}
@@ -622,6 +668,11 @@ func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, r
 			metaFileInfos[index].Data = metadataArray[index].data.find(versionID)
 		}
 		metaFileInfos[index].DiskMTime = diskMTime
+	}
+	if !readData {
+		for i := range v2bufs {
+			metaDataPoolPut(v2bufs[i])
+		}
 	}
 
 	// Return all the metadata.
@@ -637,7 +688,7 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	if opts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, readData)
 	} else {
-		metaArr, errs = readAllXL(ctx, disks, bucket, object, readData, opts.InclFreeVersions)
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, readData, opts.InclFreeVersions, true)
 	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
@@ -714,9 +765,14 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	// additionally do not heal delete markers inline, let them be
 	// healed upon regular heal process.
 	if !fi.Deleted && missingBlocks > 0 && missingBlocks < readQuorum {
-		if _, healing := er.getOnlineDisksWithHealing(); !healing {
-			go healObject(bucket, object, fi.VersionID, madmin.HealNormalScan)
-		}
+		globalMRFState.addPartialOp(partialOperation{
+			bucket:    bucket,
+			object:    object,
+			versionID: fi.VersionID,
+			queued:    time.Now(),
+			setIndex:  er.setIndex,
+			poolIndex: er.poolIndex,
+		})
 	}
 
 	return fi, metaArr, onlineDisks, nil
@@ -932,11 +988,6 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 		}
 		partsMetadata[i].Data = inlineBuffers[i].Bytes()
 		partsMetadata[i].AddObjectPart(1, "", n, data.ActualSize(), modTime, index, nil)
-		partsMetadata[i].Erasure.AddChecksumInfo(ChecksumInfo{
-			PartNumber: 1,
-			Algorithm:  DefaultBitrotAlgorithm,
-			Hash:       bitrotWriterSum(w),
-		})
 	}
 
 	// Fill all the necessary metadata.
@@ -1063,47 +1114,31 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		// If we have offline disks upgrade the number of erasure codes for this object.
 		parityOrig := parityDrives
 
-		atomicParityDrives := uatomic.NewInt64(0)
-		atomicOfflineDrives := uatomic.NewInt64(0)
-
-		// Start with current parityDrives
-		atomicParityDrives.Store(int64(parityDrives))
-
-		var wg sync.WaitGroup
+		var offlineDrives int
 		for _, disk := range storageDisks {
 			if disk == nil {
-				atomicParityDrives.Inc()
-				atomicOfflineDrives.Inc()
+				parityDrives++
+				offlineDrives++
 				continue
 			}
 			if !disk.IsOnline() {
-				atomicParityDrives.Inc()
-				atomicOfflineDrives.Inc()
+				parityDrives++
+				offlineDrives++
 				continue
 			}
-			wg.Add(1)
-			go func(disk StorageAPI) {
-				defer wg.Done()
-				di, err := disk.DiskInfo(ctx)
-				if err != nil || di.ID == "" {
-					atomicOfflineDrives.Inc()
-					atomicParityDrives.Inc()
-				}
-			}(disk)
 		}
-		wg.Wait()
 
-		if int(atomicOfflineDrives.Load()) >= (len(storageDisks)+1)/2 {
+		if offlineDrives >= (len(storageDisks)+1)/2 {
 			// if offline drives are more than 50% of the drives
 			// we have no quorum, we shouldn't proceed just
 			// fail at that point.
 			return ObjectInfo{}, toObjectErr(errErasureWriteQuorum, bucket, object)
 		}
 
-		parityDrives = int(atomicParityDrives.Load())
 		if parityDrives >= len(storageDisks)/2 {
 			parityDrives = len(storageDisks) / 2
 		}
+
 		if parityOrig != parityDrives {
 			userDefined[minIOErasureUpgraded] = strconv.Itoa(parityOrig) + "->" + strconv.Itoa(parityDrives)
 		}
@@ -1168,15 +1203,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	partName := "part.1"
 	tempErasureObj := pathJoin(uniqueID, fi.DataDir, partName)
 
-	// Delete temporary object in the event of failure.
-	// If PutObject succeeded there would be no temporary
-	// object to delete.
-	var online int
-	defer func() {
-		if online != len(onlineDisks) {
-			er.deleteAll(context.Background(), minioMetaTmpBucket, tempObj)
-		}
-	}()
+	defer er.deleteAll(context.Background(), minioMetaTmpBucket, tempObj)
 
 	shardFileSize := erasure.ShardFileSize(data.Size())
 	writers := make([]io.Writer, len(onlineDisks))
@@ -1276,11 +1303,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		}
 		// No need to add checksum to part. We already have it on the object.
 		partsMetadata[i].AddObjectPart(1, "", n, data.ActualSize(), modTime, compIndex, nil)
-		partsMetadata[i].Erasure.AddChecksumInfo(ChecksumInfo{
-			PartNumber: 1,
-			Algorithm:  DefaultBitrotAlgorithm,
-			Hash:       bitrotWriterSum(w),
-		})
+		partsMetadata[i].Versioned = opts.Versioned || opts.VersionSuspended
 	}
 
 	userDefined["etag"] = r.MD5CurrentHexString()
@@ -1322,7 +1345,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		if errors.Is(err, errFileNotFound) {
 			return ObjectInfo{}, toObjectErr(errErasureWriteQuorum, bucket, object)
 		}
-		logger.LogOnceIf(ctx, err, "erasure-object-rename"+bucket+object)
+		logger.LogOnceIf(ctx, err, "erasure-object-rename-"+bucket+"-"+object)
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
@@ -1361,7 +1384,6 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	}
 
 	fi.ReplicationState = opts.PutReplicationState()
-	online = countOnlineDisks(onlineDisks)
 
 	// we are adding a new version to this object under the namespace lock, so this is the latest version.
 	fi.IsLatest = true
@@ -1607,10 +1629,12 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 
 	var lc *lifecycle.Lifecycle
 	var rcfg lock.Retention
+	var replcfg *replication.Config
 	if opts.Expiration.Expire {
 		// Check if the current bucket has a configured lifecycle policy
 		lc, _ = globalLifecycleSys.Get(bucket)
 		rcfg, _ = globalBucketObjectLockSys.Get(bucket)
+		replcfg, _ = getReplicationConfig(ctx, bucket)
 	}
 
 	// expiration attempted on a bucket with no lifecycle
@@ -1644,10 +1668,26 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 			return objInfo, gerr
 		}
 	}
+	if opts.EvalMetadataFn != nil {
+		dsc, err := opts.EvalMetadataFn(&goi, err)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		if dsc.ReplicateAny() {
+			opts.SetDeleteReplicationState(dsc, opts.VersionID)
+			goi.replicationDecision = opts.DeleteReplication.ReplicateDecisionStr
+		}
+	}
+
+	if opts.EvalRetentionBypassFn != nil {
+		if err := opts.EvalRetentionBypassFn(goi, gerr); err != nil {
+			return ObjectInfo{}, err
+		}
+	}
 
 	if opts.Expiration.Expire {
 		if gerr == nil {
-			evt := evalActionFromLifecycle(ctx, *lc, rcfg, goi)
+			evt := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, goi)
 			var isErr bool
 			switch evt.Action {
 			case lifecycle.NoneAction:
@@ -1752,7 +1792,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		if err = er.deleteObjectVersion(ctx, bucket, object, fi, opts.DeleteMarker); err != nil {
 			return objInfo, toObjectErr(err, bucket, object)
 		}
-		return fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended), nil
+		oi := fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
+		oi.replicationDecision = goi.replicationDecision
+		return oi, nil
 	}
 
 	// Delete the object version on all disks.
@@ -1806,7 +1848,7 @@ func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object s
 	if opts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false)
 	} else {
-		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false)
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false, true)
 	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
@@ -1842,7 +1884,7 @@ func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object s
 
 	objInfo := fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	if opts.EvalMetadataFn != nil {
-		if err := opts.EvalMetadataFn(&objInfo); err != nil {
+		if _, err := opts.EvalMetadataFn(&objInfo, err); err != nil {
 			return ObjectInfo{}, err
 		}
 	}
@@ -1879,7 +1921,7 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 	if opts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false)
 	} else {
-		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false)
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false, true)
 	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
@@ -1923,8 +1965,7 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 	return fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended), nil
 }
 
-// updateObjectMeta will update the metadata of a file.
-func (er erasureObjects) updateObjectMeta(ctx context.Context, bucket, object string, fi FileInfo, onlineDisks []StorageAPI) error {
+func (er erasureObjects) updateObjectMetaWithOpts(ctx context.Context, bucket, object string, fi FileInfo, onlineDisks []StorageAPI, opts UpdateMetadataOpts) error {
 	if len(fi.Metadata) == 0 {
 		return nil
 	}
@@ -1938,7 +1979,7 @@ func (er erasureObjects) updateObjectMeta(ctx context.Context, bucket, object st
 			if onlineDisks[index] == nil {
 				return errDiskNotFound
 			}
-			return onlineDisks[index].UpdateMetadata(ctx, bucket, object, fi)
+			return onlineDisks[index].UpdateMetadata(ctx, bucket, object, fi, opts)
 		}, index)
 	}
 
@@ -1946,6 +1987,11 @@ func (er erasureObjects) updateObjectMeta(ctx context.Context, bucket, object st
 	mErrs := g.Wait()
 
 	return reduceWriteQuorumErrs(ctx, mErrs, objectOpIgnoredErrs, er.defaultWQuorum())
+}
+
+// updateObjectMeta will update the metadata of a file.
+func (er erasureObjects) updateObjectMeta(ctx context.Context, bucket, object string, fi FileInfo, onlineDisks []StorageAPI) error {
+	return er.updateObjectMetaWithOpts(ctx, bucket, object, fi, onlineDisks, UpdateMetadataOpts{})
 }
 
 // DeleteObjectTags - delete object tags from an existing object
@@ -2119,7 +2165,7 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
 		}
 		defer gr.Close()
-		hashReader, err := hash.NewReader(gr, gr.ObjInfo.Size, "", "", gr.ObjInfo.Size)
+		hashReader, err := hash.NewReader(ctx, gr, gr.ObjInfo.Size, "", "", gr.ObjInfo.Size)
 		if err != nil {
 			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
 		}
@@ -2144,7 +2190,7 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 
 	// rehydrate the parts back on disk as per the original xl.meta prior to transition
 	for _, partInfo := range oi.Parts {
-		hr, err := hash.NewReader(io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", partInfo.Size)
+		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", partInfo.Size)
 		if err != nil {
 			return setRestoreHeaderFn(oi, err)
 		}

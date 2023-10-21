@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -28,7 +28,6 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
-	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -38,233 +37,22 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/lithammer/shortuuid/v4"
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7"
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/tags"
-	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/console"
-	"github.com/minio/pkg/env"
-	iampolicy "github.com/minio/pkg/iam/policy"
-	"github.com/minio/pkg/wildcard"
-	"github.com/minio/pkg/workers"
+	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v2/workers"
 	"gopkg.in/yaml.v2"
 )
-
-// replicate:
-//   # source of the objects to be replicated
-//   source:
-//     type: "minio"
-//     bucket: "testbucket"
-//     prefix: "spark/"
-//
-//   # optional flags based filtering criteria
-//   # for source objects
-//   flags:
-//     filter:
-//       newerThan: "7d"
-//       olderThan: "7d"
-//       createdAfter: "date"
-//       createdBefore: "date"
-//       tags:
-//         - key: "name"
-//           value: "value*"
-//       metadata:
-//         - key: "content-type"
-//           value: "image/*"
-//     notify:
-//       endpoint: "https://splunk-hec.dev.com"
-//       token: "Splunk ..." # e.g. "Bearer token"
-//
-//   # target where the objects must be replicated
-//   target:
-//     type: "minio"
-//     bucket: "testbucket1"
-//     endpoint: "https://play.min.io"
-//     path: "on"
-//     credentials:
-//       accessKey: "minioadmin"
-//       secretKey: "minioadmin"
-//       sessionToken: ""
-
-// BatchJobReplicateKV is a datatype that holds key and values for filtering of objects
-// used by metadata filter as well as tags based filtering.
-type BatchJobReplicateKV struct {
-	Key   string `yaml:"key" json:"key"`
-	Value string `yaml:"value" json:"value"`
-}
-
-// Validate returns an error if key is empty
-func (kv BatchJobReplicateKV) Validate() error {
-	if kv.Key == "" {
-		return errInvalidArgument
-	}
-	return nil
-}
-
-// Empty indicates if kv is not set
-func (kv BatchJobReplicateKV) Empty() bool {
-	return kv.Key == "" && kv.Value == ""
-}
-
-// Match matches input kv with kv, value will be wildcard matched depending on the user input
-func (kv BatchJobReplicateKV) Match(ikv BatchJobReplicateKV) bool {
-	if kv.Empty() {
-		return true
-	}
-	if strings.EqualFold(kv.Key, ikv.Key) {
-		return wildcard.Match(kv.Value, ikv.Value)
-	}
-	return false
-}
-
-// BatchReplicateRetry datatype represents total retry attempts and delay between each retries.
-type BatchReplicateRetry struct {
-	Attempts int           `yaml:"attempts" json:"attempts"` // number of retry attempts
-	Delay    time.Duration `yaml:"delay" json:"delay"`       // delay between each retries
-}
-
-// Validate validates input replicate retries.
-func (r BatchReplicateRetry) Validate() error {
-	if r.Attempts < 0 {
-		return errInvalidArgument
-	}
-
-	if r.Delay < 0 {
-		return errInvalidArgument
-	}
-
-	return nil
-}
-
-// BatchReplicateFilter holds all the filters currently supported for batch replication
-type BatchReplicateFilter struct {
-	NewerThan     time.Duration         `yaml:"newerThan,omitempty" json:"newerThan"`
-	OlderThan     time.Duration         `yaml:"olderThan,omitempty" json:"olderThan"`
-	CreatedAfter  time.Time             `yaml:"createdAfter,omitempty" json:"createdAfter"`
-	CreatedBefore time.Time             `yaml:"createdBefore,omitempty" json:"createdBefore"`
-	Tags          []BatchJobReplicateKV `yaml:"tags,omitempty" json:"tags"`
-	Metadata      []BatchJobReplicateKV `yaml:"metadata,omitempty" json:"metadata"`
-}
-
-// BatchReplicateNotification success or failure notification endpoint for each job attempts
-type BatchReplicateNotification struct {
-	Endpoint string `yaml:"endpoint" json:"endpoint"`
-	Token    string `yaml:"token" json:"token"`
-}
-
-// BatchJobReplicateFlags various configurations for replication job definition currently includes
-// - filter
-// - notify
-// - retry
-type BatchJobReplicateFlags struct {
-	Filter BatchReplicateFilter       `yaml:"filter" json:"filter"`
-	Notify BatchReplicateNotification `yaml:"notify" json:"notify"`
-	Retry  BatchReplicateRetry        `yaml:"retry" json:"retry"`
-}
-
-// BatchJobReplicateResourceType defines the type of batch jobs
-type BatchJobReplicateResourceType string
-
-// Validate validates if the replicate resource type is recognized and supported
-func (t BatchJobReplicateResourceType) Validate() error {
-	switch t {
-	case BatchJobReplicateResourceMinIO:
-	case BatchJobReplicateResourceS3:
-	default:
-		return errInvalidArgument
-	}
-	return nil
-}
-
-func (t BatchJobReplicateResourceType) isMinio() bool {
-	return t == BatchJobReplicateResourceMinIO
-}
-
-// Different types of batch jobs..
-const (
-	BatchJobReplicateResourceMinIO BatchJobReplicateResourceType = "minio"
-	BatchJobReplicateResourceS3    BatchJobReplicateResourceType = "s3"
-
-	// add future targets
-)
-
-// BatchJobReplicateCredentials access credentials for batch replication it may
-// be either for target or source.
-type BatchJobReplicateCredentials struct {
-	AccessKey    string `xml:"AccessKeyId" json:"accessKey,omitempty" yaml:"accessKey"`
-	SecretKey    string `xml:"SecretAccessKey" json:"secretKey,omitempty" yaml:"secretKey"`
-	SessionToken string `xml:"SessionToken" json:"sessionToken,omitempty" yaml:"sessionToken"`
-}
-
-// Empty indicates if credentials are not set
-func (c BatchJobReplicateCredentials) Empty() bool {
-	return c.AccessKey == "" && c.SecretKey == "" && c.SessionToken == ""
-}
-
-// Validate validates if credentials are valid
-func (c BatchJobReplicateCredentials) Validate() error {
-	if !auth.IsAccessKeyValid(c.AccessKey) || !auth.IsSecretKeyValid(c.SecretKey) {
-		return errInvalidArgument
-	}
-	return nil
-}
-
-// BatchJobReplicateTarget describes target element of the replication job that receives
-// the filtered data from source
-type BatchJobReplicateTarget struct {
-	Type     BatchJobReplicateResourceType `yaml:"type" json:"type"`
-	Bucket   string                        `yaml:"bucket" json:"bucket"`
-	Prefix   string                        `yaml:"prefix" json:"prefix"`
-	Endpoint string                        `yaml:"endpoint" json:"endpoint"`
-	Path     string                        `yaml:"path" json:"path"`
-	Creds    BatchJobReplicateCredentials  `yaml:"credentials" json:"credentials"`
-}
-
-// ValidPath returns true if path is valid
-func (t BatchJobReplicateTarget) ValidPath() bool {
-	return t.Path == "on" || t.Path == "off" || t.Path == "auto" || t.Path == ""
-}
-
-// BatchJobReplicateSource describes source element of the replication job that is
-// the source of the data for the target
-type BatchJobReplicateSource struct {
-	Type     BatchJobReplicateResourceType `yaml:"type" json:"type"`
-	Bucket   string                        `yaml:"bucket" json:"bucket"`
-	Prefix   string                        `yaml:"prefix" json:"prefix"`
-	Endpoint string                        `yaml:"endpoint" json:"endpoint"`
-	Path     string                        `yaml:"path" json:"path"`
-	Creds    BatchJobReplicateCredentials  `yaml:"credentials" json:"credentials"`
-}
-
-// ValidPath returns true if path is valid
-func (s BatchJobReplicateSource) ValidPath() bool {
-	switch s.Path {
-	case "on", "off", "auto", "":
-		return true
-	default:
-		return false
-	}
-}
-
-// BatchJobReplicateV1 v1 of batch job replication
-type BatchJobReplicateV1 struct {
-	APIVersion string                  `yaml:"apiVersion" json:"apiVersion"`
-	Flags      BatchJobReplicateFlags  `yaml:"flags" json:"flags"`
-	Target     BatchJobReplicateTarget `yaml:"target" json:"target"`
-	Source     BatchJobReplicateSource `yaml:"source" json:"source"`
-
-	clnt *miniogo.Core `msg:"-"`
-}
-
-// RemoteToLocal returns true if source is remote and target is local
-func (r BatchJobReplicateV1) RemoteToLocal() bool {
-	return !r.Source.Creds.Empty()
-}
 
 // BatchJobRequest this is an internal data structure not for external consumption.
 type BatchJobRequest struct {
@@ -277,23 +65,28 @@ type BatchJobRequest struct {
 	ctx       context.Context      `msg:"-"`
 }
 
-// Notify notifies notification endpoint if configured regarding job failure or success.
-func (r BatchJobReplicateV1) Notify(ctx context.Context, body io.Reader) error {
-	if r.Flags.Notify.Endpoint == "" {
+func notifyEndpoint(ctx context.Context, ri *batchJobInfo, endpoint, token string) error {
+	if endpoint == "" {
 		return nil
+	}
+
+	buf, err := json.Marshal(ri)
+	if err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Flags.Notify.Endpoint, body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(buf))
 	if err != nil {
 		return err
 	}
 
-	if r.Flags.Notify.Token != "" {
-		req.Header.Set("Authorization", r.Flags.Notify.Token)
+	if token != "" {
+		req.Header.Set("Authorization", token)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	clnt := http.Client{Transport: getRemoteInstanceTransport}
 	resp, err := clnt.Do(req)
@@ -309,6 +102,11 @@ func (r BatchJobReplicateV1) Notify(ctx context.Context, body io.Reader) error {
 	return nil
 }
 
+// Notify notifies notification endpoint if configured regarding job failure or success.
+func (r BatchJobReplicateV1) Notify(ctx context.Context, ri *batchJobInfo) error {
+	return notifyEndpoint(ctx, ri, r.Flags.Notify.Endpoint, r.Flags.Notify.Token)
+}
+
 // ReplicateFromSource - this is not implemented yet where source is 'remote' and target is local.
 func (r *BatchJobReplicateV1) ReplicateFromSource(ctx context.Context, api ObjectLayer, core *miniogo.Core, srcObjInfo ObjectInfo, retry bool) error {
 	srcBucket := r.Source.Bucket
@@ -316,20 +114,20 @@ func (r *BatchJobReplicateV1) ReplicateFromSource(ctx context.Context, api Objec
 	srcObject := srcObjInfo.Name
 	tgtObject := srcObjInfo.Name
 	if r.Target.Prefix != "" {
-		tgtObject = path.Join(r.Target.Prefix, srcObjInfo.Name)
+		tgtObject = pathJoin(r.Target.Prefix, srcObjInfo.Name)
 	}
 
-	versioned := globalBucketVersioningSys.PrefixEnabled(tgtBucket, tgtObject)
-	versionSuspended := globalBucketVersioningSys.PrefixSuspended(tgtBucket, tgtObject)
 	versionID := srcObjInfo.VersionID
 	if r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3 {
 		versionID = ""
 	}
 	if srcObjInfo.DeleteMarker {
 		_, err := api.DeleteObject(ctx, tgtBucket, tgtObject, ObjectOptions{
-			VersionID:          versionID,
-			VersionSuspended:   versionSuspended,
-			Versioned:          versioned,
+			VersionID: versionID,
+			// Since we are preserving a delete marker, we have to make sure this is always true.
+			// regardless of the current configuration of the bucket we must preserve all versions
+			// on the pool being batch replicated from source.
+			Versioned:          true,
 			MTime:              srcObjInfo.ModTime,
 			DeleteMarker:       srcObjInfo.DeleteMarker,
 			ReplicationRequest: true,
@@ -338,12 +136,10 @@ func (r *BatchJobReplicateV1) ReplicateFromSource(ctx context.Context, api Objec
 	}
 
 	opts := ObjectOptions{
-		VersionID:        srcObjInfo.VersionID,
-		Versioned:        versioned,
-		VersionSuspended: versionSuspended,
-		MTime:            srcObjInfo.ModTime,
-		PreserveETag:     srcObjInfo.ETag,
-		UserDefined:      srcObjInfo.UserDefined,
+		VersionID:    srcObjInfo.VersionID,
+		MTime:        srcObjInfo.ModTime,
+		PreserveETag: srcObjInfo.ETag,
+		UserDefined:  srcObjInfo.UserDefined,
 	}
 	if r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3 {
 		opts.VersionID = ""
@@ -371,7 +167,7 @@ func (r *BatchJobReplicateV1) ReplicateFromSource(ctx context.Context, api Objec
 	}
 	defer rd.Close()
 
-	hr, err := hash.NewReader(rd, objInfo.Size, "", "", objInfo.Size)
+	hr, err := hash.NewReader(ctx, rd, objInfo.Size, "", "", objInfo.Size)
 	if err != nil {
 		return err
 	}
@@ -386,7 +182,7 @@ func (r *BatchJobReplicateV1) copyWithMultipartfromSource(ctx context.Context, a
 	srcObject := srcObjInfo.Name
 	tgtObject := srcObjInfo.Name
 	if r.Target.Prefix != "" {
-		tgtObject = path.Join(r.Target.Prefix, srcObjInfo.Name)
+		tgtObject = pathJoin(r.Target.Prefix, srcObjInfo.Name)
 	}
 	if r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3 {
 		opts.VersionID = ""
@@ -434,7 +230,7 @@ func (r *BatchJobReplicateV1) copyWithMultipartfromSource(ctx context.Context, a
 		}
 		defer rd.Close()
 
-		hr, err = hash.NewReader(io.LimitReader(rd, objInfo.Size), objInfo.Size, "", "", objInfo.Size)
+		hr, err = hash.NewReader(ctx, io.LimitReader(rd, objInfo.Size), objInfo.Size, "", "", objInfo.Size)
 		if err != nil {
 			return err
 		}
@@ -474,6 +270,10 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 	}
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
+	isTags := len(r.Flags.Filter.Tags) != 0
+	isMetadata := len(r.Flags.Filter.Metadata) != 0
+	isStorageClassOnly := len(r.Flags.Filter.Metadata) == 1 && strings.EqualFold(r.Flags.Filter.Metadata[0].Key, xhttp.AmzStorageClass)
+
 	skip := func(oi ObjectInfo) (ok bool) {
 		if r.Flags.Filter.OlderThan > 0 && time.Since(oi.ModTime) < r.Flags.Filter.OlderThan {
 			// skip all objects that are newer than specified older duration
@@ -494,7 +294,8 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 			// skip all objects that are created after the specified time.
 			return true
 		}
-		if len(r.Flags.Filter.Tags) > 0 {
+
+		if isTags {
 			// Only parse object tags if tags filter is specified.
 			tagMap := map[string]string{}
 			tagStr := oi.UserTags
@@ -507,7 +308,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 			}
 			for _, kv := range r.Flags.Filter.Tags {
 				for t, v := range tagMap {
-					if kv.Match(BatchJobReplicateKV{Key: t, Value: v}) {
+					if kv.Match(BatchJobKV{Key: t, Value: v}) {
 						return true
 					}
 				}
@@ -517,23 +318,19 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 			return false
 		}
 
-		if len(r.Flags.Filter.Metadata) > 0 {
-			for _, kv := range r.Flags.Filter.Metadata {
-				for k, v := range oi.UserDefined {
-					if !strings.HasPrefix(strings.ToLower(k), "x-amz-meta-") && !isStandardHeader(k) {
-						continue
-					}
-					// We only need to match x-amz-meta or standardHeaders
-					if kv.Match(BatchJobReplicateKV{Key: k, Value: v}) {
-						return true
-					}
+		for _, kv := range r.Flags.Filter.Metadata {
+			for k, v := range oi.UserDefined {
+				if !stringsHasPrefixFold(k, "x-amz-meta-") && !isStandardHeader(k) {
+					continue
+				}
+				// We only need to match x-amz-meta or standardHeaders
+				if kv.Match(BatchJobKV{Key: k, Value: v}) {
+					return true
 				}
 			}
-
-			// None of the provided metadata filters match skip the object.
-			return false
 		}
 
+		// None of the provided filters match
 		return false
 	}
 
@@ -588,17 +385,32 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		for obj := range objInfoCh {
 			oi := toObjectInfo(r.Source.Bucket, obj.Key, obj)
 			if !minioSrc {
-				oi2, err := c.StatObject(ctx, r.Source.Bucket, obj.Key, miniogo.StatObjectOptions{})
-				if err == nil {
-					oi = toObjectInfo(r.Source.Bucket, obj.Key, oi2)
-				} else {
-					if isErrMethodNotAllowed(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) ||
-						isErrObjectNotFound(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) {
+				// Check if metadata filter was requested and it is expected to have
+				// all user metadata or just storageClass. If its only storageClass
+				// List() already returns relevant information for filter to be applied.
+				if isMetadata && !isStorageClassOnly {
+					oi2, err := c.StatObject(ctx, r.Source.Bucket, obj.Key, miniogo.StatObjectOptions{})
+					if err == nil {
+						oi = toObjectInfo(r.Source.Bucket, obj.Key, oi2)
+					} else {
+						if !isErrMethodNotAllowed(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) &&
+							!isErrObjectNotFound(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) {
+							logger.LogIf(ctx, err)
+						}
 						continue
 					}
-					logger.LogIf(ctx, err)
-					cancel()
-					return err
+				}
+				if isTags {
+					tags, err := c.GetObjectTagging(ctx, r.Source.Bucket, obj.Key, minio.GetObjectTaggingOptions{})
+					if err == nil {
+						oi.UserTags = tags.String()
+					} else {
+						if !isErrMethodNotAllowed(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) &&
+							!isErrObjectNotFound(ErrorRespToObjectError(err, r.Source.Bucket, obj.Key)) {
+							logger.LogIf(ctx, err)
+						}
+						continue
+					}
 				}
 			}
 			if skip(oi) {
@@ -645,8 +457,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		// persist in-memory state to disk.
 		logger.LogIf(ctx, ri.updateAfter(ctx, api, 0, job))
 
-		buf, _ := json.Marshal(ri)
-		if err := r.Notify(ctx, bytes.NewReader(buf)); err != nil {
+		if err := r.Notify(ctx, ri); err != nil {
 			logger.LogIf(ctx, fmt.Errorf("unable to notify %v", err))
 		}
 
@@ -687,10 +498,12 @@ func toObjectInfo(bucket, object string, objInfo miniogo.ObjectInfo) ObjectInfo 
 		ReplicationStatusInternal: objInfo.ReplicationStatus,
 		UserTags:                  tags.String(),
 	}
+
 	oi.UserDefined = make(map[string]string, len(objInfo.Metadata))
 	for k, v := range objInfo.Metadata {
 		oi.UserDefined[k] = v[0]
 	}
+
 	ce, ok := oi.UserDefined[xhttp.ContentEncoding]
 	if !ok {
 		ce, ok = oi.UserDefined[strings.ToLower(xhttp.ContentEncoding)]
@@ -698,6 +511,12 @@ func toObjectInfo(bucket, object string, objInfo miniogo.ObjectInfo) ObjectInfo 
 	if ok {
 		oi.ContentEncoding = ce
 	}
+
+	_, ok = oi.UserDefined[xhttp.AmzStorageClass]
+	if !ok {
+		oi.UserDefined[xhttp.AmzStorageClass] = objInfo.StorageClass
+	}
+
 	return oi
 }
 
@@ -1027,7 +846,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	}
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	skip := func(info FileInfo) (ok bool) {
+	selectObj := func(info FileInfo) (ok bool) {
 		if r.Flags.Filter.OlderThan > 0 && time.Since(info.ModTime) < r.Flags.Filter.OlderThan {
 			// skip all objects that are newer than specified older duration
 			return false
@@ -1062,7 +881,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 			for _, kv := range r.Flags.Filter.Tags {
 				for t, v := range tagMap {
-					if kv.Match(BatchJobReplicateKV{Key: t, Value: v}) {
+					if kv.Match(BatchJobKV{Key: t, Value: v}) {
 						return true
 					}
 				}
@@ -1075,11 +894,11 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		if len(r.Flags.Filter.Metadata) > 0 {
 			for _, kv := range r.Flags.Filter.Metadata {
 				for k, v := range info.Metadata {
-					if !strings.HasPrefix(strings.ToLower(k), "x-amz-meta-") && !isStandardHeader(k) {
+					if !stringsHasPrefixFold(k, "x-amz-meta-") && !isStandardHeader(k) {
 						continue
 					}
 					// We only need to match x-amz-meta or standardHeaders
-					if kv.Match(BatchJobReplicateKV{Key: k, Value: v}) {
+					if kv.Match(BatchJobKV{Key: k, Value: v}) {
 						return true
 					}
 				}
@@ -1137,7 +956,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		results := make(chan ObjectInfo, 100)
 		if err := api.Walk(ctx, r.Source.Bucket, r.Source.Prefix, results, ObjectOptions{
 			WalkMarker: lastObject,
-			WalkFilter: skip,
+			WalkFilter: selectObj,
 		}); err != nil {
 			cancel()
 			// Do not need to retry if we can't list objects on source.
@@ -1193,8 +1012,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		// persist in-memory state to disk.
 		logger.LogIf(ctx, ri.updateAfter(ctx, api, 0, job))
 
-		buf, _ := json.Marshal(ri)
-		if err := r.Notify(ctx, bytes.NewReader(buf)); err != nil {
+		if err := r.Notify(ctx, ri); err != nil {
 			logger.LogIf(ctx, fmt.Errorf("unable to notify %v", err))
 		}
 
@@ -1406,7 +1224,6 @@ func (j BatchJobRequest) delete(ctx context.Context, api ObjectLayer) {
 	case j.KeyRotate != nil:
 		deleteConfig(ctx, api, pathJoin(j.Location, batchKeyRotationName))
 	}
-	globalBatchJobsMetrics.delete(j.ID)
 	deleteConfig(ctx, api, j.Location)
 }
 
@@ -1463,11 +1280,9 @@ func batchReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (p
 // ListBatchJobs - lists all currently active batch jobs, optionally takes {jobType}
 // input to list only active batch jobs of 'jobType'
 func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListBatchJobs")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ListBatchJobsAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ListBatchJobsAction)
 	if objectAPI == nil {
 		return
 	}
@@ -1515,23 +1330,21 @@ var errNoSuchJob = errors.New("no such job")
 
 // DescribeBatchJob returns the currently active batch job definition
 func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "DescribeBatchJob")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DescribeBatchJobAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.DescribeBatchJobAction)
 	if objectAPI == nil {
 		return
 	}
 
-	id := r.Form.Get("jobId")
-	if id == "" {
+	jobID := r.Form.Get("jobId")
+	if jobID == "" {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, errInvalidArgument), r.URL)
 		return
 	}
 
 	req := &BatchJobRequest{}
-	if err := req.load(ctx, objectAPI, pathJoin(batchJobPrefix, id)); err != nil {
+	if err := req.load(ctx, objectAPI, pathJoin(batchJobPrefix, jobID)); err != nil {
 		if !errors.Is(err, errNoSuchJob) {
 			logger.LogIf(ctx, err)
 		}
@@ -1552,16 +1365,14 @@ func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Reques
 
 // StarBatchJob queue a new job for execution
 func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "StartBatchJob")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, creds := validateAdminReq(ctx, w, r, iampolicy.StartBatchJobAction)
+	objectAPI, creds := validateAdminReq(ctx, w, r, policy.StartBatchJobAction)
 	if objectAPI == nil {
 		return
 	}
 
-	buf, err := io.ReadAll(r.Body)
+	buf, err := io.ReadAll(ioutil.HardLimitReader(r.Body, humanize.MiByte*4))
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -1573,12 +1384,12 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 	}
 
 	job := &BatchJobRequest{}
-	if err = yaml.Unmarshal(buf, job); err != nil {
+	if err = yaml.UnmarshalStrict(buf, job); err != nil {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	job.ID = shortuuid.New()
+	job.ID = fmt.Sprintf("%s:%d", shortuuid.New(), GetProxyEndpointLocalIndex(globalProxyEndpoints))
 	job.User = user
 	job.Started = time.Now()
 
@@ -1608,27 +1419,33 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 
 // CancelBatchJob cancels a job in progress
 func (a adminAPIHandlers) CancelBatchJob(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "CancelBatchJob")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.CancelBatchJobAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.CancelBatchJobAction)
 	if objectAPI == nil {
 		return
 	}
+
 	jobID := r.Form.Get("id")
 	if jobID == "" {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, errInvalidArgument), r.URL)
 		return
 	}
+
+	if _, success := proxyRequestByToken(ctx, w, r, jobID); success {
+		return
+	}
+
 	if err := globalBatchJobPool.canceler(jobID, true); err != nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrInvalidRequest, err), r.URL)
 		return
 	}
+
 	j := BatchJobRequest{
 		ID:       jobID,
 		Location: pathJoin(batchJobPrefix, jobID),
 	}
+
 	j.delete(ctx, objectAPI)
 
 	writeSuccessNoContent(w)
@@ -1681,6 +1498,11 @@ func (j *BatchJobPool) resume() {
 		req := &BatchJobRequest{}
 		if err := req.load(ctx, j.objLayer, result.Name); err != nil {
 			logger.LogIf(ctx, err)
+			continue
+		}
+		_, nodeIdx := parseRequestToken(req.ID)
+		if nodeIdx > -1 && GetProxyEndpointLocalIndex(globalProxyEndpoints) != nodeIdx {
+			// This job doesn't belong on this node.
 			continue
 		}
 		if err := j.queueJob(req); err != nil {
@@ -1803,10 +1625,6 @@ type batchJobMetrics struct {
 	metrics map[string]*batchJobInfo
 }
 
-var globalBatchJobsMetrics = batchJobMetrics{
-	metrics: make(map[string]*batchJobInfo),
-}
-
 //msgp:ignore batchJobMetric
 //go:generate stringer -type=batchJobMetric -trimprefix=batchJobMetric $GOFILE
 type batchJobMetric uint8
@@ -1846,9 +1664,17 @@ func (m *batchJobMetrics) report(jobID string) (metrics *madmin.BatchJobMetrics)
 	metrics = &madmin.BatchJobMetrics{CollectedAt: time.Now(), Jobs: make(map[string]madmin.JobMetric)}
 	m.RLock()
 	defer m.RUnlock()
+
+	match := true
 	for id, job := range m.metrics {
-		match := jobID != "" && id == jobID
-		metrics.Jobs[id] = madmin.JobMetric{
+		if jobID != "" {
+			match = id == jobID
+		}
+		if !match {
+			continue
+		}
+
+		m := madmin.JobMetric{
 			JobID:         job.JobID,
 			JobType:       job.JobType,
 			StartTime:     job.StartTime,
@@ -1856,26 +1682,56 @@ func (m *batchJobMetrics) report(jobID string) (metrics *madmin.BatchJobMetrics)
 			RetryAttempts: job.RetryAttempts,
 			Complete:      job.Complete,
 			Failed:        job.Failed,
-			Replicate: &madmin.ReplicateInfo{
+		}
+
+		switch job.JobType {
+		case string(madmin.BatchJobReplicate):
+			m.Replicate = &madmin.ReplicateInfo{
 				Bucket:           job.Bucket,
 				Object:           job.Object,
 				Objects:          job.Objects,
 				ObjectsFailed:    job.ObjectsFailed,
 				BytesTransferred: job.BytesTransferred,
 				BytesFailed:      job.BytesFailed,
-			},
-			KeyRotate: &madmin.KeyRotationInfo{
+			}
+		case string(madmin.BatchJobKeyRotate):
+			m.KeyRotate = &madmin.KeyRotationInfo{
 				Bucket:        job.Bucket,
 				Object:        job.Object,
 				Objects:       job.Objects,
 				ObjectsFailed: job.ObjectsFailed,
-			},
+			}
 		}
-		if match {
-			break
-		}
+
+		metrics.Jobs[id] = m
 	}
 	return metrics
+}
+
+// keep job metrics for some time after the job is completed
+// in-case some one wants to look at the older results.
+func (m *batchJobMetrics) purgeJobMetrics() {
+	t := time.NewTicker(6 * time.Hour)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-GlobalContext.Done():
+			return
+		case <-t.C:
+			var toDeleteJobMetrics []string
+			m.RLock()
+			for id, metrics := range m.metrics {
+				if time.Since(metrics.LastUpdate) > 24*time.Hour && (metrics.Complete || metrics.Failed) {
+					toDeleteJobMetrics = append(toDeleteJobMetrics, id)
+				}
+			}
+			m.RUnlock()
+			for _, jobID := range toDeleteJobMetrics {
+				m.delete(jobID)
+			}
+		}
+	}
 }
 
 func (m *batchJobMetrics) delete(jobID string) {

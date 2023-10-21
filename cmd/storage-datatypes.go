@@ -46,6 +46,7 @@ type DiskInfo struct {
 	FreeInodes uint64
 	Major      uint32
 	Minor      uint32
+	NRRequests uint64
 	FSType     string
 	RootDisk   bool
 	Healing    bool
@@ -53,6 +54,7 @@ type DiskInfo struct {
 	Endpoint   string
 	MountPath  string
 	ID         string
+	Rotational bool
 	Metrics    DiskMetrics
 	Error      string // carries the error over the network
 }
@@ -61,8 +63,10 @@ type DiskInfo struct {
 // the number of calls of each API and the moving average of
 // the duration of each API.
 type DiskMetrics struct {
-	LastMinute map[string]AccElem `json:"apiLatencies,omitempty"`
-	APICalls   map[string]uint64  `json:"apiCalls,omitempty"`
+	LastMinute              map[string]AccElem `json:"apiLatencies,omitempty"`
+	APICalls                map[string]uint64  `json:"apiCalls,omitempty"`
+	TotalErrorsAvailability uint64             `json:"totalErrsAvailability"`
+	TotalErrorsTimeout      uint64             `json:"totalErrsTimeout"`
 }
 
 // VolsInfo is a collection of volume(bucket) information
@@ -232,6 +236,9 @@ type FileInfo struct {
 
 	// Combined checksum when object was uploaded.
 	Checksum []byte `msg:"cs,allownil"`
+
+	// Versioned - indicates if this file is versioned or not.
+	Versioned bool `msg:"vs"`
 }
 
 // WriteQuorum returns expected write quorum for this FileInfo

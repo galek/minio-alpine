@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -38,8 +39,7 @@ func access(name string) error {
 	return nil
 }
 
-// Forked from Golang but chooses fast path upon os.Mkdir()
-// error to avoid os.Lstat() call.
+// Forked from Golang but chooses to avoid performing lookup
 //
 // osMkdirAll creates a directory named path,
 // along with any necessary parents, and returns nil,
@@ -48,14 +48,11 @@ func access(name string) error {
 // directories that MkdirAll creates.
 // If path is already a directory, MkdirAll does nothing
 // and returns nil.
-func osMkdirAll(dirPath string, perm os.FileMode) error {
-	// Fast path: if we can tell whether path is a directory or file, stop with success or error.
-	err := Access(dirPath)
-	if err == nil {
-		return nil
-	}
-	if !osIsNotExist(err) {
-		return &os.PathError{Op: "mkdir", Path: dirPath, Err: err}
+func osMkdirAll(dirPath string, perm os.FileMode, baseDir string) error {
+	if baseDir != "" {
+		if strings.HasPrefix(baseDir, dirPath) {
+			return nil
+		}
 	}
 
 	// Slow path: make sure parent exists and then call Mkdir for path.
@@ -71,13 +68,13 @@ func osMkdirAll(dirPath string, perm os.FileMode) error {
 
 	if j > 1 {
 		// Create parent.
-		if err = osMkdirAll(dirPath[:j-1], perm); err != nil {
+		if err := osMkdirAll(dirPath[:j-1], perm, baseDir); err != nil {
 			return err
 		}
 	}
 
 	// Parent now exists; invoke Mkdir and use its result.
-	if err = Mkdir(dirPath, perm); err != nil {
+	if err := Mkdir(dirPath, perm); err != nil {
 		if osIsExist(err) {
 			return nil
 		}

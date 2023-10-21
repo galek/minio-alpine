@@ -36,6 +36,7 @@ type fanOutOptions struct {
 	Key      []byte
 	KmsCtx   kms.Context
 	Checksum *hash.Checksum
+	MD5Hex   string
 }
 
 // fanOutPutObject takes an input source reader and fans out multiple PUT operations
@@ -53,7 +54,14 @@ func fanOutPutObject(ctx context.Context, bucket string, objectAPI ObjectLayer, 
 
 			objInfos[idx] = ObjectInfo{Name: req.Key}
 
-			hr, err := hash.NewReader(bytes.NewReader(fanOutBuf), int64(len(fanOutBuf)), "", "", -1)
+			hopts := hash.Options{
+				Size:       int64(len(fanOutBuf)),
+				MD5Hex:     opts.MD5Hex,
+				SHA256Hex:  "",
+				ActualSize: -1,
+				DisableMD5: true,
+			}
+			hr, err := hash.NewReaderWithOpts(ctx, bytes.NewReader(fanOutBuf), hopts)
 			if err != nil {
 				errs[idx] = err
 				return
@@ -83,7 +91,7 @@ func fanOutPutObject(ctx context.Context, bucket string, objectAPI ObjectLayer, 
 				}
 
 				// do not try to verify encrypted content/
-				hr, err = hash.NewReader(encrd, -1, "", "", -1)
+				hr, err = hash.NewReader(ctx, encrd, -1, "", "", -1)
 				if err != nil {
 					errs[idx] = err
 					return

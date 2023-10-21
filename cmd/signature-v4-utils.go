@@ -30,7 +30,7 @@ import (
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v2/policy"
 	"golang.org/x/exp/slices"
 )
 
@@ -180,7 +180,7 @@ func checkKeyValid(r *http.Request, accessKey string) (auth.Credentials, bool, A
 		return cred, owner, ErrAccessKeyDisabled
 	}
 
-	if _, ok := claims[iampolicy.SessionPolicyName]; ok {
+	if _, ok := claims[policy.SessionPolicyName]; ok {
 		owner = false
 	}
 
@@ -259,4 +259,19 @@ func signV4TrimAll(input string) string {
 	// Compress adjacent spaces (a space is determined by
 	// unicode.IsSpace() internally here) to one space and return
 	return strings.Join(strings.Fields(input), " ")
+}
+
+// checkMetaHeaders will check if the metadata from header/url is the same with the one from signed headers
+func checkMetaHeaders(signedHeadersMap http.Header, r *http.Request) APIErrorCode {
+	// check values from http header
+	for k, val := range r.Header {
+		if stringsHasPrefixFold(k, "X-Amz-Meta-") {
+			if signedHeadersMap.Get(k) == val[0] {
+				continue
+			}
+			return ErrUnsignedHeaders
+		}
+	}
+
+	return ErrNone
 }

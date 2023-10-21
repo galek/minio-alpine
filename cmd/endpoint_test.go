@@ -37,9 +37,9 @@ func TestNewEndpoint(t *testing.T) {
 		expectedType     EndpointType
 		expectedErr      error
 	}{
-		{"/foo", Endpoint{URL: &url.URL{Path: rootSlashFoo}, IsLocal: true}, PathEndpointType, nil},
-		{"https://example.org/path", Endpoint{URL: u2, IsLocal: false}, URLEndpointType, nil},
-		{"http://192.168.253.200/path", Endpoint{URL: u4, IsLocal: false}, URLEndpointType, nil},
+		{"/foo", Endpoint{&url.URL{Path: rootSlashFoo}, true, -1, -1, -1}, PathEndpointType, nil},
+		{"https://example.org/path", Endpoint{u2, false, -1, -1, -1}, URLEndpointType, nil},
+		{"http://192.168.253.200/path", Endpoint{u4, false, -1, -1, -1}, URLEndpointType, nil},
 		{"", Endpoint{}, -1, fmt.Errorf("empty or root endpoint is not supported")},
 		{SlashSeparator, Endpoint{}, -1, fmt.Errorf("empty or root endpoint is not supported")},
 		{`\`, Endpoint{}, -1, fmt.Errorf("empty or root endpoint is not supported")},
@@ -372,7 +372,7 @@ func TestGetLocalPeer(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		zendpoints := mustGetPoolEndpoints(testCase.endpointArgs...)
+		zendpoints := mustGetPoolEndpoints(0, testCase.endpointArgs...)
 		if !zendpoints[0].Endpoints[0].IsLocal {
 			if err := zendpoints[0].Endpoints.UpdateIsLocal(); err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
@@ -405,7 +405,7 @@ func TestGetRemotePeers(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		zendpoints := mustGetPoolEndpoints(testCase.endpointArgs...)
+		zendpoints := mustGetPoolEndpoints(0, testCase.endpointArgs...)
 		if !zendpoints[0].Endpoints[0].IsLocal {
 			if err := zendpoints[0].Endpoints.UpdateIsLocal(); err != nil {
 				t.Errorf("error: expected = <nil>, got = %v", err)

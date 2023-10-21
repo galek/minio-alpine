@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7"
 	minioClient "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/replication"
@@ -42,8 +43,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	sreplication "github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/logger"
-	bktpolicy "github.com/minio/pkg/bucket/policy"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v2/policy"
 )
 
 const (
@@ -365,7 +365,7 @@ func (c *SiteReplicationSys) getSiteStatuses(ctx context.Context, sites ...madmi
 			PeerSite:     v,
 			DeploymentID: info.DeploymentID,
 			Empty:        len(buckets) == 0,
-			self:         info.DeploymentID == globalDeploymentID,
+			self:         info.DeploymentID == globalDeploymentID(),
 		})
 	}
 	return
@@ -410,7 +410,7 @@ func (c *SiteReplicationSys) AddPeerClusters(ctx context.Context, psites []madmi
 		}
 	}
 	if selfIdx == -1 {
-		return madmin.ReplicateAddStatus{}, errSRBackendIssue(fmt.Errorf("global deployment ID %s mismatch, expected one of %s", globalDeploymentID, deploymentIDsSet))
+		return madmin.ReplicateAddStatus{}, errSRBackendIssue(fmt.Errorf("global deployment ID %s mismatch, expected one of %s", globalDeploymentID(), deploymentIDsSet))
 	}
 	if !currDeploymentIDsSet.IsEmpty() {
 		// If current cluster is already SR enabled and no new site being added ,fail.
@@ -569,7 +569,7 @@ func (c *SiteReplicationSys) AddPeerClusters(ctx context.Context, psites []madmi
 func (c *SiteReplicationSys) PeerJoinReq(ctx context.Context, arg madmin.SRPeerJoinReq) error {
 	var ourName string
 	for d, p := range arg.Peers {
-		if d == globalDeploymentID {
+		if d == globalDeploymentID() {
 			ourName = p.Name
 			break
 		}
@@ -645,6 +645,57 @@ func (c *SiteReplicationSys) validateIDPSettings(ctx context.Context, peers []Pe
 		}
 	}
 	return true, nil
+}
+
+// Netperf for site-replication net perf
+func (c *SiteReplicationSys) Netperf(ctx context.Context, duration time.Duration) (results madmin.SiteNetPerfResult, err error) {
+	infos, err := globalSiteReplicationSys.GetClusterInfo(ctx)
+	if err != nil {
+		return results, err
+	}
+	var wg sync.WaitGroup
+	var resultsMu sync.RWMutex
+	for _, info := range infos.Sites {
+		info := info
+		// will call siteNetperf, means call others's adminAPISiteReplicationDevNull
+		if globalDeploymentID() == info.DeploymentID {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				result := madmin.SiteNetPerfNodeResult{}
+				cli, err := globalSiteReplicationSys.getAdminClient(ctx, info.DeploymentID)
+				if err != nil {
+					result.Error = err.Error()
+				} else {
+					result = siteNetperf(ctx, duration)
+					result.Endpoint = cli.GetEndpointURL().String()
+				}
+				resultsMu.Lock()
+				results.NodeResults = append(results.NodeResults, result)
+				resultsMu.Unlock()
+				return
+			}()
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(ctx, duration+10*time.Second)
+			defer cancel()
+			result := perfNetRequest(
+				ctx,
+				info.DeploymentID,
+				adminPathPrefix+adminAPIVersionPrefix+adminAPISiteReplicationNetPerf,
+				nil,
+			)
+			resultsMu.Lock()
+			results.NodeResults = append(results.NodeResults, result)
+			resultsMu.Unlock()
+			return
+		}()
+	}
+	wg.Wait()
+	return
 }
 
 // GetClusterInfo - returns site replication information.
@@ -883,12 +934,13 @@ func (c *SiteReplicationSys) PeerBucketConfigureReplHandler(ctx context.Context,
 			targets = targetsPtr.Targets
 		}
 		targetARN := ""
-		var updateTgt bool
+		var updateTgt, updateBW bool
 		var targetToUpdate madmin.BucketTarget
 		for _, target := range targets {
 			if target.Arn == ruleARN {
 				targetARN = ruleARN
-				if target.URL().String() != peer.Endpoint {
+				updateBW = peer.DefaultBandwidth.Limit != 0 && target.BandwidthLimit == 0
+				if (target.URL().String() != peer.Endpoint) || updateBW {
 					updateTgt = true
 					targetToUpdate = target
 				}
@@ -905,6 +957,9 @@ func (c *SiteReplicationSys) PeerBucketConfigureReplHandler(ctx context.Context,
 			}
 			if !peer.SyncState.Empty() {
 				targetToUpdate.ReplicationSync = (peer.SyncState == madmin.SyncEnabled)
+			}
+			if updateBW {
+				targetToUpdate.BandwidthLimit = int64(peer.DefaultBandwidth.Limit)
 			}
 			err := globalBucketTargetSys.SetTarget(ctx, bucket, &targetToUpdate, true)
 			if err != nil {
@@ -938,6 +993,8 @@ func (c *SiteReplicationSys) PeerBucketConfigureReplHandler(ctx context.Context,
 				Type:            madmin.ReplicationService,
 				Region:          "",
 				ReplicationSync: peer.SyncState == madmin.SyncEnabled,
+				DeploymentID:    d,
+				BandwidthLimit:  int64(peer.DefaultBandwidth.Limit),
 			}
 			var exists bool // true if ARN already exists
 			bucketTarget.Arn, exists = globalBucketTargetSys.getRemoteARN(bucket, &bucketTarget, peer.DeploymentID)
@@ -1033,7 +1090,7 @@ func (c *SiteReplicationSys) PeerBucketConfigureReplHandler(ctx context.Context,
 	defer c.RUnlock()
 	errMap := make(map[string]error, len(c.state.Peers))
 	for d, peer := range c.state.Peers {
-		if d == globalDeploymentID {
+		if d == globalDeploymentID() {
 			continue
 		}
 		errMap[d] = configurePeerFn(d, peer)
@@ -1116,7 +1173,7 @@ func (c *SiteReplicationSys) IAMChangeHook(ctx context.Context, item madmin.SRIA
 
 // PeerAddPolicyHandler - copies IAM policy to local. A nil policy argument,
 // causes the named policy to be deleted.
-func (c *SiteReplicationSys) PeerAddPolicyHandler(ctx context.Context, policyName string, p *iampolicy.Policy, updatedAt time.Time) error {
+func (c *SiteReplicationSys) PeerAddPolicyHandler(ctx context.Context, policyName string, p *policy.Policy, updatedAt time.Time) error {
 	var err error
 	// skip overwrite of local update if peer sent stale info
 	if !updatedAt.IsZero() {
@@ -1209,10 +1266,10 @@ func (c *SiteReplicationSys) PeerSvcAccChangeHandler(ctx context.Context, change
 	}
 	switch {
 	case change.Create != nil:
-		var sp *iampolicy.Policy
+		var sp *policy.Policy
 		var err error
 		if len(change.Create.SessionPolicy) > 0 {
-			sp, err = iampolicy.ParseConfig(bytes.NewReader(change.Create.SessionPolicy))
+			sp, err = policy.ParseConfig(bytes.NewReader(change.Create.SessionPolicy))
 			if err != nil {
 				return wrapSRErr(err)
 			}
@@ -1238,10 +1295,10 @@ func (c *SiteReplicationSys) PeerSvcAccChangeHandler(ctx context.Context, change
 		}
 
 	case change.Update != nil:
-		var sp *iampolicy.Policy
+		var sp *policy.Policy
 		var err error
 		if len(change.Update.SessionPolicy) > 0 {
-			sp, err = iampolicy.ParseConfig(bytes.NewReader(change.Update.SessionPolicy))
+			sp, err = policy.ParseConfig(bytes.NewReader(change.Update.SessionPolicy))
 			if err != nil {
 				return wrapSRErr(err)
 			}
@@ -1405,8 +1462,77 @@ func (c *SiteReplicationSys) PeerBucketVersioningHandler(ctx context.Context, bu
 	return nil
 }
 
+// PeerBucketMetadataUpdateHandler - merges the bucket metadata, save and ping other nodes
+func (c *SiteReplicationSys) PeerBucketMetadataUpdateHandler(ctx context.Context, item madmin.SRBucketMeta) error {
+	objectAPI := newObjectLayerFn()
+	if objectAPI == nil {
+		return errSRObjectLayerNotReady
+	}
+
+	if item.Bucket == "" || item.UpdatedAt.IsZero() {
+		return wrapSRErr(errInvalidArgument)
+	}
+
+	meta, err := readBucketMetadata(ctx, objectAPI, item.Bucket)
+	if err != nil {
+		return wrapSRErr(err)
+	}
+
+	if meta.Created.After(item.UpdatedAt) {
+		return nil
+	}
+
+	if item.Policy != nil {
+		meta.PolicyConfigJSON = item.Policy
+		meta.PolicyConfigUpdatedAt = item.UpdatedAt
+	}
+
+	if item.Versioning != nil {
+		configData, err := base64.StdEncoding.DecodeString(*item.Versioning)
+		if err != nil {
+			return wrapSRErr(err)
+		}
+		meta.VersioningConfigXML = configData
+		meta.VersioningConfigUpdatedAt = item.UpdatedAt
+	}
+
+	if item.Tags != nil {
+		configData, err := base64.StdEncoding.DecodeString(*item.Tags)
+		if err != nil {
+			return wrapSRErr(err)
+		}
+		meta.TaggingConfigXML = configData
+		meta.TaggingConfigUpdatedAt = item.UpdatedAt
+	}
+
+	if item.ObjectLockConfig != nil {
+		configData, err := base64.StdEncoding.DecodeString(*item.ObjectLockConfig)
+		if err != nil {
+			return wrapSRErr(err)
+		}
+		meta.ObjectLockConfigXML = configData
+		meta.ObjectLockConfigUpdatedAt = item.UpdatedAt
+	}
+
+	if item.SSEConfig != nil {
+		configData, err := base64.StdEncoding.DecodeString(*item.SSEConfig)
+		if err != nil {
+			return wrapSRErr(err)
+		}
+		meta.EncryptionConfigXML = configData
+		meta.EncryptionConfigUpdatedAt = item.UpdatedAt
+	}
+
+	if item.Quota != nil {
+		meta.QuotaConfigJSON = item.Quota
+		meta.QuotaConfigUpdatedAt = item.UpdatedAt
+	}
+
+	return globalBucketMetadataSys.save(ctx, meta)
+}
+
 // PeerBucketPolicyHandler - copies/deletes policy to local cluster.
-func (c *SiteReplicationSys) PeerBucketPolicyHandler(ctx context.Context, bucket string, policy *bktpolicy.Policy, updatedAt time.Time) error {
+func (c *SiteReplicationSys) PeerBucketPolicyHandler(ctx context.Context, bucket string, policy *policy.BucketPolicy, updatedAt time.Time) error {
 	// skip overwrite if local update is newer than peer update.
 	if !updatedAt.IsZero() {
 		if _, updateTm, err := globalBucketMetadataSys.GetPolicyConfig(bucket); err == nil && updateTm.After(updatedAt) {
@@ -1986,7 +2112,7 @@ func (c *SiteReplicationSys) concDo(selfActionFn func() error, peerActionFn func
 	for i := range depIDs {
 		go func(i int) {
 			defer wg.Done()
-			if depIDs[i] == globalDeploymentID {
+			if depIDs[i] == globalDeploymentID() {
 				if selfActionFn != nil {
 					errs[i] = selfActionFn()
 				}
@@ -1999,6 +2125,13 @@ func (c *SiteReplicationSys) concDo(selfActionFn func() error, peerActionFn func
 	errMap := make(map[string]error, len(c.state.Peers))
 	for i, depID := range depIDs {
 		errMap[depID] = errs[i]
+		if errs[i] != nil && minio.IsNetworkOrHostDown(errs[i], true) {
+			ep := c.state.Peers[depID].Endpoint
+			epURL, _ := url.Parse(ep)
+			if !globalBucketTargetSys.isOffline(epURL) {
+				globalBucketTargetSys.markOffline(epURL)
+			}
+		}
 	}
 	return c.newConcErr(errMap, actionName)
 }
@@ -2060,11 +2193,11 @@ func (c *SiteReplicationSys) RemovePeerCluster(ctx context.Context, objectAPI Ob
 
 	for _, v := range info.Sites {
 		wg.Add(1)
-		if v.DeploymentID == globalDeploymentID {
+		if v.DeploymentID == globalDeploymentID() {
 			go func() {
 				defer wg.Done()
 				err := c.RemoveRemoteTargetsForEndpoint(ctx, objectAPI, rmvEndpoints, false)
-				errs[globalDeploymentID] = err
+				errs[globalDeploymentID()] = err
 			}()
 			continue
 		}
@@ -2076,7 +2209,7 @@ func (c *SiteReplicationSys) RemovePeerCluster(ctx context.Context, objectAPI Ob
 				return
 			}
 			// set the requesting site's deploymentID for verification of peer request
-			rreq.RequestingDepID = globalDeploymentID
+			rreq.RequestingDepID = globalDeploymentID()
 			if _, err = admClient.SRPeerRemove(ctx, rreq); err != nil {
 				if errors.Is(err, errMissingSRConfig) {
 					// ignore if peer is already removed.
@@ -2090,7 +2223,7 @@ func (c *SiteReplicationSys) RemovePeerCluster(ctx context.Context, objectAPI Ob
 	wg.Wait()
 
 	errdID := ""
-	selfTgtsDeleted := errs[globalDeploymentID] == nil // true if all remote targets and replication config cleared successfully on local cluster
+	selfTgtsDeleted := errs[globalDeploymentID()] == nil // true if all remote targets and replication config cleared successfully on local cluster
 
 	for dID, err := range errs {
 		if err != nil {
@@ -2178,7 +2311,7 @@ func (c *SiteReplicationSys) InternalRemoveReq(ctx context.Context, objectAPI Ob
 
 	for _, p := range c.state.Peers {
 		peerMap[p.Name] = p
-		if p.DeploymentID == globalDeploymentID {
+		if p.DeploymentID == globalDeploymentID() {
 			ourName = p.Name
 		}
 		updatedPeers[p.DeploymentID] = p
@@ -2194,7 +2327,7 @@ func (c *SiteReplicationSys) InternalRemoveReq(ctx context.Context, objectAPI Ob
 		if !ok {
 			return errMissingSRConfig
 		}
-		if info.DeploymentID == globalDeploymentID {
+		if info.DeploymentID == globalDeploymentID() {
 			unlinkSelf = true
 			continue
 		}
@@ -2391,6 +2524,7 @@ func (c *SiteReplicationSys) SiteReplicationStatus(ctx context.Context, objAPI O
 		MaxPolicies:  sinfo.MaxPolicies,
 		Sites:        sinfo.Sites,
 		StatsSummary: sinfo.StatsSummary,
+		Metrics:      sinfo.Metrics,
 	}
 	info.BucketStats = make(map[string]map[string]madmin.SRBucketStatsSummary, len(sinfo.Sites))
 	info.PolicyStats = make(map[string]map[string]madmin.SRPolicyStatsSummary)
@@ -2474,13 +2608,19 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 			if err != nil {
 				return err
 			}
-			sris[depIdx[globalDeploymentID]] = srInfo
+			sris[depIdx[globalDeploymentID()]] = srInfo
 			return nil
 		},
 		func(deploymentID string, p madmin.PeerInfo) error {
 			admClient, err := c.getAdminClient(ctx, deploymentID)
 			if err != nil {
-				return err
+				switch err.(type) {
+				case RemoteTargetConnectionErr:
+					sris[depIdx[deploymentID]] = madmin.SRInfo{}
+					return nil
+				default:
+					return err
+				}
 			}
 			srInfo, err := admClient.SRMetaInfo(ctx, opts)
 			if err != nil {
@@ -2491,7 +2631,6 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 		},
 		replicationStatus,
 	)
-
 	if err := errors.Unwrap(metaInfoConcErr); err != nil {
 		return info, errSRBackendIssue(err)
 	}
@@ -2753,10 +2892,10 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 	if opts.Policies || opts.Entity == madmin.SRPolicyEntity {
 		// collect IAM policy replication status across sites
 		for p, pslc := range policyStats {
-			var policies []*iampolicy.Policy
+			var policies []*policy.Policy
 			uPolicyCount := 0
 			for _, ps := range pslc {
-				plcy, err := iampolicy.ParseConfig(bytes.NewReader([]byte(ps.SRIAMPolicy.Policy)))
+				plcy, err := policy.ParseConfig(bytes.NewReader([]byte(ps.SRIAMPolicy.Policy)))
 				if err != nil {
 					continue
 				}
@@ -2797,7 +2936,7 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 		for b, slc := range bucketStats {
 			tagSet := set.NewStringSet()
 			olockConfigSet := set.NewStringSet()
-			policies := make([]*bktpolicy.Policy, numSites)
+			policies := make([]*policy.BucketPolicy, numSites)
 			replCfgs := make([]*sreplication.Config, numSites)
 			quotaCfgs := make([]*madmin.BucketQuota, numSites)
 			sseCfgSet := set.NewStringSet()
@@ -2847,7 +2986,7 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 					}
 				}
 				if len(s.Policy) > 0 {
-					plcy, err := bktpolicy.ParseConfig(bytes.NewReader(s.Policy), b)
+					plcy, err := policy.ParseBucketPolicyConfig(bytes.NewReader(s.Policy), b)
 					if err != nil {
 						continue
 					}
@@ -2967,6 +3106,14 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 		}
 	}
 
+	if opts.Metrics {
+		m, err := globalSiteReplicationSys.getSiteMetrics(ctx)
+		if err != nil {
+			return info, err
+		}
+		info.Metrics = m
+	}
+
 	// maximum buckets users etc seen across sites
 	info.MaxBuckets = len(bucketStats)
 	info.MaxUsers = len(userInfoStats)
@@ -2990,12 +3137,12 @@ func isReplicated(cntReplicated, total int, valSet set.StringSet) bool {
 
 // isIAMPolicyReplicated returns true if count of replicated IAM policies matches total
 // number of sites and IAM policies are identical.
-func isIAMPolicyReplicated(cntReplicated, total int, policies []*iampolicy.Policy) bool {
+func isIAMPolicyReplicated(cntReplicated, total int, policies []*policy.Policy) bool {
 	if cntReplicated > 0 && cntReplicated != total {
 		return false
 	}
 	// check if policies match between sites
-	var prev *iampolicy.Policy
+	var prev *policy.Policy
 	for i, p := range policies {
 		if i == 0 {
 			prev = p
@@ -3098,7 +3245,7 @@ func isBktQuotaCfgReplicated(total int, quotaCfgs []*madmin.BucketQuota) bool {
 
 // isBktPolicyReplicated returns true if count of replicated bucket policies matches total
 // number of sites and bucket policies are identical.
-func isBktPolicyReplicated(total int, policies []*bktpolicy.Policy) bool {
+func isBktPolicyReplicated(total int, policies []*policy.BucketPolicy) bool {
 	numPolicies := 0
 	for _, p := range policies {
 		if p == nil {
@@ -3110,7 +3257,7 @@ func isBktPolicyReplicated(total int, policies []*bktpolicy.Policy) bool {
 		return false
 	}
 	// check if policies match between sites
-	var prev *bktpolicy.Policy
+	var prev *policy.BucketPolicy
 	for i, p := range policies {
 		if p == nil {
 			continue
@@ -3207,7 +3354,7 @@ func (c *SiteReplicationSys) SiteReplicationMetaInfo(ctx context.Context, objAPI
 	if !c.enabled {
 		return info, nil
 	}
-	info.DeploymentID = globalDeploymentID
+	info.DeploymentID = globalDeploymentID()
 	if opts.Buckets || opts.Entity == madmin.SRBucketEntity {
 		var (
 			buckets []BucketInfo
@@ -3464,17 +3611,17 @@ func (c *SiteReplicationSys) EditPeerCluster(ctx context.Context, peer madmin.Pe
 		admClient *madmin.AdminClient
 	)
 
-	if globalDeploymentID == peer.DeploymentID && !peer.SyncState.Empty() {
-		return madmin.ReplicateEditStatus{}, errSRInvalidRequest(fmt.Errorf("A peer cluster, rather than the local cluster (endpoint=%s, deployment-id=%s) needs to be specified while setting a 'sync' replication mode", peer.Endpoint, peer.DeploymentID))
+	if globalDeploymentID() == peer.DeploymentID && !peer.SyncState.Empty() && !peer.DefaultBandwidth.IsSet {
+		return madmin.ReplicateEditStatus{}, errSRInvalidRequest(fmt.Errorf("a peer cluster, rather than the local cluster (endpoint=%s, deployment-id=%s) needs to be specified while setting a 'sync' replication mode", peer.Endpoint, peer.DeploymentID))
 	}
 
 	for _, v := range sites.Sites {
 		if peer.DeploymentID == v.DeploymentID {
 			found = true
-			if !peer.SyncState.Empty() && peer.Endpoint == "" { // peer.Endpoint may be "" if only sync state is being updated
+			if (!peer.SyncState.Empty() || peer.DefaultBandwidth.IsSet) && peer.Endpoint == "" { // peer.Endpoint may be "" if only sync state/bandwidth is being updated
 				break
 			}
-			if peer.Endpoint == v.Endpoint && peer.SyncState.Empty() {
+			if peer.Endpoint == v.Endpoint && peer.SyncState.Empty() && !peer.DefaultBandwidth.IsSet {
 				return madmin.ReplicateEditStatus{}, errSRInvalidRequest(fmt.Errorf("Endpoint %s entered for deployment id %s already configured in site replication", v.Endpoint, v.DeploymentID))
 			}
 			admClient, err = c.getAdminClientWithEndpoint(ctx, v.DeploymentID, peer.Endpoint)
@@ -3495,59 +3642,65 @@ func (c *SiteReplicationSys) EditPeerCluster(ctx context.Context, peer madmin.Pe
 	if !found {
 		return madmin.ReplicateEditStatus{}, errSRInvalidRequest(fmt.Errorf("%s not found in existing replicated sites", peer.DeploymentID))
 	}
+	var state srState
+	c.RLock()
 	pi := c.state.Peers[peer.DeploymentID]
+	state = c.state
+	c.RUnlock()
 	prevPeerInfo := pi
 	if !peer.SyncState.Empty() { // update replication to peer to be sync/async
 		pi.SyncState = peer.SyncState
-		c.state.Peers[peer.DeploymentID] = pi
 	}
 	if peer.Endpoint != "" { // `admin replicate update` requested an endpoint change
 		pi.Endpoint = peer.Endpoint
 	}
 
-	if admClient != nil {
-		errs := make(map[string]error, len(c.state.Peers))
-		var wg sync.WaitGroup
+	if peer.DefaultBandwidth.IsSet {
+		pi.DefaultBandwidth = peer.DefaultBandwidth
+		pi.DefaultBandwidth.UpdatedAt = UTCNow()
+	}
+	state.Peers[peer.DeploymentID] = pi
 
-		for i, v := range sites.Sites {
-			if v.DeploymentID == globalDeploymentID {
-				c.state.Peers[peer.DeploymentID] = pi
-				continue
-			}
-			wg.Add(1)
-			go func(pi madmin.PeerInfo, i int) {
-				defer wg.Done()
-				v := sites.Sites[i]
-				admClient, err := c.getAdminClient(ctx, v.DeploymentID)
-				if v.DeploymentID == peer.DeploymentID {
-					admClient, err = c.getAdminClientWithEndpoint(ctx, v.DeploymentID, peer.Endpoint)
-				}
-				if err != nil {
-					errs[v.DeploymentID] = errSRPeerResp(fmt.Errorf("unable to create admin client for %s: %w", v.Name, err))
-					return
-				}
-				if err = admClient.SRPeerEdit(ctx, pi); err != nil {
-					errs[v.DeploymentID] = errSRPeerResp(fmt.Errorf("unable to update peer %s: %w", v.Name, err))
-					return
-				}
-			}(pi, i)
+	errs := make(map[string]error, len(state.Peers))
+	var wg sync.WaitGroup
+
+	for dID, v := range state.Peers {
+		if v.DeploymentID == globalDeploymentID() {
+			continue
 		}
-
-		wg.Wait()
-		for dID, err := range errs {
-			if err != nil {
-				return madmin.ReplicateEditStatus{}, errSRPeerResp(fmt.Errorf("unable to update peer %s: %w", c.state.Peers[dID].Name, err))
+		wg.Add(1)
+		go func(pi madmin.PeerInfo, dID string) {
+			defer wg.Done()
+			admClient, err := c.getAdminClient(ctx, dID)
+			if dID == peer.DeploymentID {
+				admClient, err = c.getAdminClientWithEndpoint(ctx, dID, pi.Endpoint)
 			}
+			if err != nil {
+				errs[dID] = errSRPeerResp(fmt.Errorf("unable to create admin client for %s: %w", pi.Name, err))
+				return
+			}
+			if err = admClient.SRPeerEdit(ctx, pi); err != nil {
+				errs[dID] = errSRPeerResp(fmt.Errorf("unable to update peer %s: %w", pi.Name, err))
+				return
+			}
+		}(pi, dID)
+	}
+
+	wg.Wait()
+	for dID, err := range errs {
+		if err != nil {
+			return madmin.ReplicateEditStatus{}, errSRPeerResp(fmt.Errorf("unable to update peer %s: %w", state.Peers[dID].Name, err))
 		}
 	}
 
 	// we can now save the cluster replication configuration state.
-	if err = c.saveToDisk(ctx, c.state); err != nil {
+	if err = c.saveToDisk(ctx, state); err != nil {
 		return madmin.ReplicateEditStatus{
 			Status:    madmin.ReplicateAddStatusPartial,
 			ErrDetail: fmt.Sprintf("unable to save cluster-replication state on local: %v", err),
 		}, nil
 	}
+
 	if err = c.updateTargetEndpoints(ctx, prevPeerInfo, pi); err != nil {
 		return madmin.ReplicateEditStatus{
 			Status:    madmin.ReplicateAddStatusPartial,
@@ -3590,6 +3743,9 @@ func (c *SiteReplicationSys) updateTargetEndpoints(ctx context.Context, prevInfo
 				bucketTarget := target
 				bucketTarget.Secure = ep.Scheme == "https"
 				bucketTarget.Endpoint = ep.Host
+				if peer.DefaultBandwidth.IsSet && target.BandwidthLimit == 0 {
+					bucketTarget.BandwidthLimit = int64(peer.DefaultBandwidth.Limit)
+				}
 				if !peer.SyncState.Empty() {
 					bucketTarget.ReplicationSync = (peer.SyncState == madmin.SyncEnabled)
 				}
@@ -3626,9 +3782,17 @@ func (c *SiteReplicationSys) PeerEditReq(ctx context.Context, arg madmin.PeerInf
 		p := c.state.Peers[i]
 		if p.DeploymentID == arg.DeploymentID {
 			p.Endpoint = arg.Endpoint
+			if arg.DefaultBandwidth.IsSet {
+				if arg.DefaultBandwidth.UpdatedAt.After(p.DefaultBandwidth.UpdatedAt) {
+					p.DefaultBandwidth = arg.DefaultBandwidth
+				}
+			}
+			if !arg.SyncState.Empty() {
+				p.SyncState = arg.SyncState
+			}
 			c.state.Peers[arg.DeploymentID] = p
 		}
-		if p.DeploymentID == globalDeploymentID {
+		if p.DeploymentID == globalDeploymentID() {
 			ourName = p.Name
 		}
 	}
@@ -3720,6 +3884,7 @@ type srStatusInfo struct {
 	// GroupStats map of group to slice of deployment IDs with stats. This is populated only if there are
 	// mismatches or if a specific bucket's stats are requested
 	GroupStats map[string]map[string]srGroupStatsSummary
+	Metrics    madmin.SRMetricsSummary
 }
 
 // SRBucketDeleteOp - type of delete op
@@ -3828,7 +3993,7 @@ func (c *SiteReplicationSys) healTagMetadata(ctx context.Context, objAPI ObjectL
 		if isBucketMetadataEqual(latestTaggingConfig, bStatus.meta.Tags) {
 			continue
 		}
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketTaggingConfig, latestTaggingConfigBytes); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to heal tagging metadata from peer site %s : %w", latestPeerName, err))
 			}
@@ -3892,7 +4057,7 @@ func (c *SiteReplicationSys) healBucketPolicies(ctx context.Context, objAPI Obje
 		if strings.EqualFold(string(latestIAMPolicy), string(bStatus.meta.Policy)) {
 			continue
 		}
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketPolicyConfig, latestIAMPolicy); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to heal bucket policy metadata from peer site %s : %w", latestPeerName, err))
 			}
@@ -3967,7 +4132,7 @@ func (c *SiteReplicationSys) healBucketQuotaConfig(ctx context.Context, objAPI O
 		if isBucketMetadataEqual(latestQuotaConfig, bStatus.meta.QuotaConfig) {
 			continue
 		}
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketQuotaConfigFile, latestQuotaConfigBytes); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to heal quota metadata from peer site %s : %w", latestPeerName, err))
 			}
@@ -4042,7 +4207,7 @@ func (c *SiteReplicationSys) healVersioningMetadata(ctx context.Context, objAPI 
 		if isBucketMetadataEqual(latestVersioningConfig, bStatus.meta.Versioning) {
 			continue
 		}
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, latestVersioningConfigBytes); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to heal versioning metadata from peer site %s : %w", latestPeerName, err))
 			}
@@ -4117,7 +4282,7 @@ func (c *SiteReplicationSys) healSSEMetadata(ctx context.Context, objAPI ObjectL
 		if isBucketMetadataEqual(latestSSEConfig, bStatus.meta.SSEConfig) {
 			continue
 		}
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketSSEConfig, latestSSEConfigBytes); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to heal sse metadata from peer site %s : %w", latestPeerName, err))
 			}
@@ -4192,7 +4357,7 @@ func (c *SiteReplicationSys) healOLockConfigMetadata(ctx context.Context, objAPI
 		if isBucketMetadataEqual(latestObjLockConfig, bStatus.meta.ObjectLockConfig) {
 			continue
 		}
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			if _, err := globalBucketMetadataSys.Update(ctx, bucket, objectLockConfig, latestObjLockConfigBytes); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to heal objectlock config metadata from peer site %s : %w", latestPeerName, err))
 			}
@@ -4280,7 +4445,7 @@ func (c *SiteReplicationSys) healBucket(ctx context.Context, objAPI ObjectLayer,
 	bStatus := info.BucketStats[bucket][latestID].meta
 	isMakeBucket := len(missingB) > 0
 	deleteOp := NoOp
-	if latestID != globalDeploymentID {
+	if latestID != globalDeploymentID() {
 		return nil
 	}
 	if lastUpdate.Equal(bStatus.DeletedAt) {
@@ -4314,7 +4479,7 @@ func (c *SiteReplicationSys) healBucket(ctx context.Context, objAPI ObjectLayer,
 		}
 		for _, dID := range missingB {
 			peerName := info.Sites[dID].Name
-			if dID == globalDeploymentID {
+			if dID == globalDeploymentID() {
 				err := c.PeerBucketMakeWithVersioningHandler(ctx, bucket, opts)
 				if err != nil {
 					return c.annotateErr(makeBucketWithVersion, fmt.Errorf("error healing bucket for site replication %w from %s -> %s",
@@ -4347,7 +4512,7 @@ func (c *SiteReplicationSys) healBucket(ctx context.Context, objAPI ObjectLayer,
 	if deleteOp == Purge {
 		for _, dID := range missingB {
 			peerName := info.Sites[dID].Name
-			if dID == globalDeploymentID {
+			if dID == globalDeploymentID() {
 				c.purgeDeletedBucket(ctx, objAPI, bucket)
 			} else {
 				admClient, err := c.getAdminClient(ctx, dID)
@@ -4364,7 +4529,7 @@ func (c *SiteReplicationSys) healBucket(ctx context.Context, objAPI ObjectLayer,
 	if deleteOp == MarkDelete {
 		for _, dID := range withB {
 			peerName := info.Sites[dID].Name
-			if dID == globalDeploymentID {
+			if dID == globalDeploymentID() {
 				err := c.PeerBucketDeleteHandler(ctx, bucket, DeleteBucketOptions{
 					Force: true,
 				})
@@ -4520,14 +4685,14 @@ func (c *SiteReplicationSys) healPolicies(ctx context.Context, objAPI ObjectLaye
 			latestPolicyStat = ss
 		}
 	}
-	if latestID != globalDeploymentID {
+	if latestID != globalDeploymentID() {
 		// heal only from the site with latest info.
 		return nil
 	}
 	latestPeerName = info.Sites[latestID].Name
 	// heal policy of peers if peer does not have it.
 	for dID, pStatus := range ps {
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			continue
 		}
 		if !pStatus.PolicyMismatch && pStatus.HasPolicy {
@@ -4574,14 +4739,14 @@ func (c *SiteReplicationSys) healUserPolicies(ctx context.Context, objAPI Object
 			latestUserStat = ss
 		}
 	}
-	if latestID != globalDeploymentID {
+	if latestID != globalDeploymentID() {
 		// heal only from the site with latest info.
 		return nil
 	}
 	latestPeerName = info.Sites[latestID].Name
 	// heal policy of peers if peer does not have it.
 	for dID, pStatus := range us {
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			continue
 		}
 		if !pStatus.PolicyMismatch && pStatus.HasPolicyMapping {
@@ -4635,14 +4800,14 @@ func (c *SiteReplicationSys) healGroupPolicies(ctx context.Context, objAPI Objec
 			latestGroupStat = ss
 		}
 	}
-	if latestID != globalDeploymentID {
+	if latestID != globalDeploymentID() {
 		// heal only from the site with latest info.
 		return nil
 	}
 	latestPeerName = info.Sites[latestID].Name
 	// heal policy of peers if peer does not have it.
 	for dID, pStatus := range gs {
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			continue
 		}
 		if !pStatus.PolicyMismatch && pStatus.HasPolicyMapping {
@@ -4697,13 +4862,13 @@ func (c *SiteReplicationSys) healUsers(ctx context.Context, objAPI ObjectLayer, 
 			latestUserStat = ss
 		}
 	}
-	if latestID != globalDeploymentID {
+	if latestID != globalDeploymentID() {
 		// heal only from the site with latest info.
 		return nil
 	}
 	latestPeerName = info.Sites[latestID].Name
 	for dID, uStatus := range us {
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			continue
 		}
 		if !uStatus.UserInfoMismatch {
@@ -4843,13 +5008,13 @@ func (c *SiteReplicationSys) healGroups(ctx context.Context, objAPI ObjectLayer,
 			latestGroupStat = ss
 		}
 	}
-	if latestID != globalDeploymentID {
+	if latestID != globalDeploymentID() {
 		// heal only from the site with latest info.
 		return nil
 	}
 	latestPeerName = info.Sites[latestID].Name
 	for dID, gStatus := range gs {
-		if dID == globalDeploymentID {
+		if dID == globalDeploymentID() {
 			continue
 		}
 		if !gStatus.GroupDescMismatch {
@@ -4948,7 +5113,7 @@ func (c *SiteReplicationSys) getPeerForUpload(deplID string) (pi srPeerInfo, loc
 				PeerInfo:    site,
 				EndpointURL: ep,
 			}
-			return pi, site.DeploymentID == globalDeploymentID
+			return pi, site.DeploymentID == globalDeploymentID()
 		}
 	}
 	return pi, true
@@ -4965,7 +5130,7 @@ func (c *SiteReplicationSys) startResync(ctx context.Context, objAPI ObjectLayer
 		return res, errSRObjectLayerNotReady
 	}
 
-	if peer.DeploymentID == globalDeploymentID {
+	if peer.DeploymentID == globalDeploymentID() {
 		return res, errSRResyncToSelf
 	}
 	if _, ok := c.state.Peers[peer.DeploymentID]; !ok {
@@ -4992,8 +5157,7 @@ func (c *SiteReplicationSys) startResync(ctx context.Context, objAPI ObjectLayer
 		}
 	}()
 
-	globalSiteResyncMetrics.updateState(rs)
-	if err := saveSiteResyncMetadata(ctx, rs, objAPI); err != nil {
+	if err := globalSiteResyncMetrics.updateState(rs); err != nil {
 		return res, err
 	}
 
@@ -5080,7 +5244,7 @@ func (c *SiteReplicationSys) cancelResync(ctx context.Context, objAPI ObjectLaye
 	if objAPI == nil {
 		return res, errSRObjectLayerNotReady
 	}
-	if peer.DeploymentID == globalDeploymentID {
+	if peer.DeploymentID == globalDeploymentID() {
 		return res, errSRResyncToSelf
 	}
 	if _, ok := c.state.Peers[peer.DeploymentID]; !ok {
@@ -5243,6 +5407,9 @@ func loadSiteResyncMetadata(ctx context.Context, objAPI ObjectLayer, dID string)
 
 // save resync status of peer to resync/depl-id.meta
 func saveSiteResyncMetadata(ctx context.Context, ss SiteResyncStatus, objectAPI ObjectLayer) error {
+	if objectAPI == nil {
+		return errSRObjectLayerNotReady
+	}
 	data := make([]byte, 4, ss.Msgsize()+4)
 
 	// Initialize the resync meta header.
@@ -5258,4 +5425,89 @@ func saveSiteResyncMetadata(ctx context.Context, ss SiteResyncStatus, objectAPI 
 
 func getSRResyncFilePath(dID string) string {
 	return pathJoin(siteResyncPrefix, dID+".meta")
+}
+
+func (c *SiteReplicationSys) getDeplIDForEndpoint(ep string) (dID string, err error) {
+	if ep == "" {
+		return dID, fmt.Errorf("no deployment id found for endpoint %s", ep)
+	}
+	c.RLock()
+	defer c.RUnlock()
+	if !c.enabled {
+		return dID, errSRNotEnabled
+	}
+	for _, peer := range c.state.Peers {
+		if ep == peer.Endpoint {
+			return peer.DeploymentID, nil
+		}
+	}
+	return dID, fmt.Errorf("no deployment id found for endpoint %s", ep)
+}
+
+func (c *SiteReplicationSys) getSiteMetrics(ctx context.Context) (madmin.SRMetricsSummary, error) {
+	if !c.isEnabled() {
+		return madmin.SRMetricsSummary{}, errSRNotEnabled
+	}
+	peerSMetricsList := globalNotificationSys.GetClusterSiteMetrics(ctx)
+	var sm madmin.SRMetricsSummary
+	sm.Metrics = make(map[string]madmin.SRMetric)
+
+	for _, peer := range peerSMetricsList {
+		sm.ActiveWorkers.Avg += peer.ActiveWorkers.Avg
+		sm.ActiveWorkers.Curr += peer.ActiveWorkers.Curr
+		if peer.ActiveWorkers.Max > sm.ActiveWorkers.Max {
+			sm.ActiveWorkers.Max += peer.ActiveWorkers.Max
+		}
+		sm.Queued.Avg.Bytes += peer.Queued.Avg.Bytes
+		sm.Queued.Avg.Count += peer.Queued.Avg.Count
+		sm.Queued.Curr.Bytes += peer.Queued.Curr.Bytes
+		sm.Queued.Curr.Count += peer.Queued.Curr.Count
+		if peer.Queued.Max.Count > sm.Queued.Max.Count {
+			sm.Queued.Max.Bytes = peer.Queued.Max.Bytes
+			sm.Queued.Max.Count = peer.Queued.Max.Count
+		}
+		sm.ReplicaCount += peer.ReplicaCount
+		sm.ReplicaSize += peer.ReplicaSize
+		for dID, v := range peer.Metrics {
+			v2, ok := sm.Metrics[dID]
+			if !ok {
+				v2 = madmin.SRMetric{}
+				v2.Failed.ErrCounts = make(map[string]int)
+			}
+
+			// use target endpoint metrics from node which has been up the longest
+			if v2.LastOnline.After(v.LastOnline) || v2.LastOnline.IsZero() {
+				v2.Endpoint = v.Endpoint
+				v2.LastOnline = v.LastOnline
+				v2.Latency = v.Latency
+				v2.Online = v.Online
+				v2.TotalDowntime = v.TotalDowntime
+				v2.DeploymentID = v.DeploymentID
+			}
+			v2.ReplicatedCount += v.ReplicatedCount
+			v2.ReplicatedSize += v.ReplicatedSize
+			v2.Failed = v2.Failed.Add(v.Failed)
+			for k, v := range v.Failed.ErrCounts {
+				v2.Failed.ErrCounts[k] += v
+			}
+			if v2.XferStats == nil {
+				v2.XferStats = make(map[replication.MetricName]replication.XferStats)
+			}
+			for rm, x := range v.XferStats {
+				x2, ok := v2.XferStats[replication.MetricName(rm)]
+				if !ok {
+					x2 = replication.XferStats{}
+				}
+				x2.AvgRate += x.Avg
+				x2.CurrRate += x.Curr
+				if x.Peak > x2.PeakRate {
+					x2.PeakRate = x.Peak
+				}
+				v2.XferStats[replication.MetricName(rm)] = x2
+			}
+			sm.Metrics[dID] = v2
+		}
+	}
+	sm.Uptime = UTCNow().Unix() - globalBootTime.Unix()
+	return sm, nil
 }

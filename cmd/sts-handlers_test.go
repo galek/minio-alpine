@@ -611,6 +611,8 @@ func (s *TestSuiteIAM) TestSTSForRoot(c *check) {
 	}
 	userAdmClient.SetCustomTransport(s.TestSuiteCommon.client.Transport)
 
+	time.Sleep(2 * time.Second) // wait for listbuckets cache to be invalidated
+
 	accInfo, err := userAdmClient.AccountInfo(ctx, madmin.AccountOpts{})
 	if err != nil {
 		c.Fatalf("root user STS should be able to get account info: %v", err)
@@ -660,7 +662,7 @@ func (s *TestSuiteIAM) SetUpLDAP(c *check, serverAddr string) {
 }
 
 const (
-	EnvTestLDAPServer = "LDAP_TEST_SERVER"
+	EnvTestLDAPServer = "_MINIO_LDAP_TEST_SERVER"
 )
 
 func TestIAMWithLDAPServerSuite(t *testing.T) {
@@ -1379,8 +1381,8 @@ var testAppParams = OpenIDClientAppParams{
 }
 
 const (
-	EnvTestOpenIDServer  = "OPENID_TEST_SERVER"
-	EnvTestOpenIDServer2 = "OPENID_TEST_SERVER_2"
+	EnvTestOpenIDServer  = "_MINIO_OPENID_TEST_SERVER"
+	EnvTestOpenIDServer2 = "_MINIO_OPENID_TEST_SERVER_2"
 )
 
 // SetUpOpenIDs - sets up one or more OpenID test servers using the test OpenID

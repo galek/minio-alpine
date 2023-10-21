@@ -65,6 +65,8 @@ const (
 	DeleteRestoredAction
 	// DeleteRestoredVersionAction deletes a particular version that was temporarily restored
 	DeleteRestoredVersionAction
+	// DeleteAllVersionsAction deletes all versions when an object expires
+	DeleteAllVersionsAction
 
 	// ActionCount must be the last action and shouldn't be used as a regular action.
 	ActionCount
@@ -80,12 +82,17 @@ func (a Action) DeleteVersioned() bool {
 	return a == DeleteVersionAction || a == DeleteRestoredVersionAction
 }
 
+// DeleteAll - Returns true if the action demands deleting all versions of an object
+func (a Action) DeleteAll() bool {
+	return a == DeleteAllVersionsAction
+}
+
 // Delete - Returns true if action demands delete on all objects (including restored)
 func (a Action) Delete() bool {
 	if a.DeleteRestored() {
 		return true
 	}
-	return a == DeleteVersionAction || a == DeleteAction
+	return a == DeleteVersionAction || a == DeleteAction || a == DeleteAllVersionsAction
 }
 
 // Lifecycle - Configuration for bucket lifecycle.
@@ -149,7 +156,8 @@ func (lc Lifecycle) HasActiveRules(prefix string) bool {
 		}
 
 		if len(prefix) > 0 && len(rule.GetPrefix()) > 0 {
-			// If recursive, we can skip this rule if it doesn't match the tested prefix.
+			// we can skip this rule if it doesn't match the tested
+			// prefix.
 			if !strings.HasPrefix(prefix, rule.GetPrefix()) && !strings.HasPrefix(rule.GetPrefix(), prefix) {
 				continue
 			}
@@ -164,13 +172,13 @@ func (lc Lifecycle) HasActiveRules(prefix string) bool {
 		if !rule.NoncurrentVersionTransition.IsNull() {
 			return true
 		}
-		if rule.Expiration.IsNull() && rule.Transition.IsNull() {
-			continue
-		}
 		if !rule.Expiration.IsDateNull() && rule.Expiration.Date.Before(time.Now().UTC()) {
 			return true
 		}
 		if !rule.Expiration.IsDaysNull() {
+			return true
+		}
+		if rule.Expiration.DeleteMarker.val {
 			return true
 		}
 		if !rule.Transition.IsDateNull() && rule.Transition.Date.Before(time.Now().UTC()) {
@@ -254,7 +262,7 @@ func (lc Lifecycle) FilterRules(obj ObjectOpts) []Rule {
 		if !strings.HasPrefix(obj.Name, rule.GetPrefix()) {
 			continue
 		}
-		if !rule.Filter.TestTags(obj.UserTags) {
+		if !obj.DeleteMarker && !rule.Filter.TestTags(obj.UserTags) {
 			continue
 		}
 		rules = append(rules, rule)
@@ -324,6 +332,23 @@ func (lc Lifecycle) eval(obj ObjectOpts, now time.Time) Event {
 	}
 
 	for _, rule := range lc.FilterRules(obj) {
+		if obj.IsLatest && rule.Expiration.DeleteAll.val {
+			if !rule.Expiration.IsDaysNull() {
+				// Specifying the Days tag will automatically perform all versions cleanup
+				// once the latest object is old enough to satisfy the age criteria.
+				// This is a MinIO only extension.
+				if expectedExpiry := ExpectedExpiryTime(obj.ModTime, int(rule.Expiration.Days)); now.IsZero() || now.After(expectedExpiry) {
+					events = append(events, Event{
+						Action: DeleteAllVersionsAction,
+						RuleID: rule.ID,
+						Due:    expectedExpiry,
+					})
+					// No other conflicting actions apply to an all version expired object.
+					break
+				}
+			}
+		}
+
 		if obj.ExpiredObjectDeleteMarker() {
 			if rule.Expiration.DeleteMarker.val {
 				// Indicates whether MinIO will remove a delete marker with no noncurrent versions.

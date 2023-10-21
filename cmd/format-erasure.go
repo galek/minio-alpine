@@ -33,7 +33,7 @@ import (
 	"github.com/minio/minio/internal/config/storageclass"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/sync/errgroup"
+	"github.com/minio/pkg/v2/sync/errgroup"
 )
 
 const (
@@ -275,7 +275,7 @@ func formatErasureMigrateV2ToV3(data []byte, export, version string) ([]byte, er
 
 	tmpOld := pathJoin(export, minioMetaTmpDeletedBucket, mustGetUUID())
 	if err := renameAll(pathJoin(export, minioMetaMultipartBucket),
-		tmpOld); err != nil && err != errFileNotFound {
+		tmpOld, export); err != nil && err != errFileNotFound {
 		logger.LogIf(GlobalContext, fmt.Errorf("unable to rename (%s -> %s) %w, drive may be faulty please investigate",
 			pathJoin(export, minioMetaMultipartBucket),
 			tmpOld,
@@ -663,14 +663,14 @@ func closeStorageDisks(storageDisks ...StorageAPI) {
 
 // Initialize storage disks for each endpoint.
 // Errors are returned for each endpoint with matching index.
-func initStorageDisksWithErrors(endpoints Endpoints, healthCheck bool) ([]StorageAPI, []error) {
+func initStorageDisksWithErrors(endpoints Endpoints, opts storageOpts) ([]StorageAPI, []error) {
 	// Bootstrap disks.
 	storageDisks := make([]StorageAPI, len(endpoints))
 	g := errgroup.WithNErrs(len(endpoints))
 	for index := range endpoints {
 		index := index
 		g.Go(func() (err error) {
-			storageDisks[index], err = newStorageAPI(endpoints[index], healthCheck)
+			storageDisks[index], err = newStorageAPI(endpoints[index], opts)
 			return err
 		}, index)
 	}

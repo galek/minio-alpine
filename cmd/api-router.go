@@ -27,7 +27,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/wildcard"
+	"github.com/minio/pkg/v2/wildcard"
 	"github.com/rs/cors"
 )
 
@@ -61,18 +61,6 @@ func newObjectLayerFn() ObjectLayer {
 	return globalObjectAPI
 }
 
-func newCachedObjectLayerFn() CacheObjectLayer {
-	globalObjLayerMutex.RLock()
-	defer globalObjLayerMutex.RUnlock()
-	return globalCacheObjectAPI
-}
-
-func setCacheObjectLayer(c CacheObjectLayer) {
-	globalObjLayerMutex.Lock()
-	globalCacheObjectAPI = c
-	globalObjLayerMutex.Unlock()
-}
-
 func setObjectLayer(o ObjectLayer) {
 	globalObjLayerMutex.Lock()
 	globalObjectAPI = o
@@ -82,7 +70,6 @@ func setObjectLayer(o ObjectLayer) {
 // objectAPIHandler implements and provides http handlers for S3 API.
 type objectAPIHandlers struct {
 	ObjectAPI func() ObjectLayer
-	CacheAPI  func() CacheObjectLayer
 }
 
 // getHost tries its best to return the request host.
@@ -189,7 +176,6 @@ func registerAPIRouter(router *mux.Router) {
 	// Initialize API.
 	api := objectAPIHandlers{
 		ObjectAPI: newObjectLayerFn,
-		CacheAPI:  newCachedObjectLayerFn,
 	}
 
 	// API Router
@@ -461,9 +447,15 @@ func registerAPIRouter(router *mux.Router) {
 
 		// MinIO extension API for replication.
 		//
-		// GetBucketReplicationMetrics
+		router.Methods(http.MethodGet).HandlerFunc(
+			collectAPIStats("getbucketreplicationmetrics", maxClients(gz(httpTraceAll(api.GetBucketReplicationMetricsV2Handler))))).Queries("replication-metrics", "2")
+		// deprecated handler
 		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("getbucketreplicationmetrics", maxClients(gz(httpTraceAll(api.GetBucketReplicationMetricsHandler))))).Queries("replication-metrics", "")
+
+		// ValidateBucketReplicationCreds
+		router.Methods(http.MethodGet).HandlerFunc(
+			collectAPIStats("checkbucketreplicationconfiguration", maxClients(gz(httpTraceAll(api.ValidateBucketReplicationCredsHandler))))).Queries("replication-check", "")
 
 		// Register rejected bucket APIs
 		for _, r := range rejectedBucketAPIs {
@@ -520,14 +512,9 @@ func corsHandler(handler http.Handler) http.Handler {
 		"x-amz*",
 		"*",
 	}
-
-	return cors.New(cors.Options{
+	opts := cors.Options{
 		AllowOriginFunc: func(origin string) bool {
-			allowedOrigins := globalAPIConfig.getCorsAllowOrigins()
-			if len(allowedOrigins) == 0 {
-				allowedOrigins = []string{"*"}
-			}
-			for _, allowedOrigin := range allowedOrigins {
+			for _, allowedOrigin := range globalAPIConfig.getCorsAllowOrigins() {
 				if wildcard.MatchSimple(allowedOrigin, origin) {
 					return true
 				}
@@ -546,5 +533,6 @@ func corsHandler(handler http.Handler) http.Handler {
 		AllowedHeaders:   commonS3Headers,
 		ExposedHeaders:   commonS3Headers,
 		AllowCredentials: true,
-	}).Handler(handler)
+	}
+	return cors.New(opts).Handler(handler)
 }

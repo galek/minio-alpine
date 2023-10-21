@@ -116,11 +116,11 @@ func (d *naughtyDisk) NSScanner(ctx context.Context, cache dataUsageCache, updat
 	return d.disk.NSScanner(ctx, cache, updates, scanMode)
 }
 
-func (d *naughtyDisk) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
+func (d *naughtyDisk) DiskInfo(ctx context.Context, metrics bool) (info DiskInfo, err error) {
 	if err := d.calcError(); err != nil {
 		return info, err
 	}
-	return d.disk.DiskInfo(ctx)
+	return d.disk.DiskInfo(ctx, metrics)
 }
 
 func (d *naughtyDisk) MakeVolBulk(ctx context.Context, volumes ...string) (err error) {
@@ -246,11 +246,11 @@ func (d *naughtyDisk) WriteMetadata(ctx context.Context, volume, path string, fi
 	return d.disk.WriteMetadata(ctx, volume, path, fi)
 }
 
-func (d *naughtyDisk) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo) (err error) {
+func (d *naughtyDisk) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo, opts UpdateMetadataOpts) (err error) {
 	if err := d.calcError(); err != nil {
 		return err
 	}
-	return d.disk.UpdateMetadata(ctx, volume, path, fi)
+	return d.disk.UpdateMetadata(ctx, volume, path, fi, opts)
 }
 
 func (d *naughtyDisk) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) (err error) {

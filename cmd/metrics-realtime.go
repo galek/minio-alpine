@@ -19,10 +19,14 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/disk"
+	"github.com/minio/minio/internal/net"
+	c "github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/load"
 )
 
 type collectMetricsOpts struct {
@@ -35,12 +39,6 @@ type collectMetricsOpts struct {
 func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m madmin.RealtimeMetrics) {
 	if types == madmin.MetricsNone {
 		return
-	}
-
-	if len(opts.hosts) > 0 {
-		if _, ok := opts.hosts[globalMinioAddr]; !ok {
-			return
-		}
 	}
 
 	if types.Contains(madmin.MetricsDisk) {
@@ -68,6 +66,46 @@ func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m ma
 	}
 	if types.Contains(madmin.MetricsSiteResync) {
 		m.Aggregated.SiteResync = globalSiteResyncMetrics.report(opts.depID)
+	}
+	if types.Contains(madmin.MetricNet) {
+		m.Aggregated.Net = &madmin.NetMetrics{
+			CollectedAt:   UTCNow(),
+			InterfaceName: globalInternodeInterface,
+		}
+		netStats, err := net.GetInterfaceNetStats(globalInternodeInterface)
+		if err != nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v  (nicstats)", globalMinioAddr, err.Error()))
+		} else {
+			m.Aggregated.Net.NetStats = netStats
+		}
+	}
+	if types.Contains(madmin.MetricsMem) {
+		m.Aggregated.Mem = &madmin.MemMetrics{
+			CollectedAt: UTCNow(),
+		}
+		m.Aggregated.Mem.Info = madmin.GetMemInfo(GlobalContext, globalMinioAddr)
+	}
+	if types.Contains(madmin.MetricsCPU) {
+		m.Aggregated.CPU = &madmin.CPUMetrics{
+			CollectedAt: UTCNow(),
+		}
+		cm, err := c.Times(false)
+		if err != nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v  (cputimes)", globalMinioAddr, err.Error()))
+		} else {
+			// not collecting per-cpu stats, so there will be only one element
+			if len(cm) == 1 {
+				m.Aggregated.CPU.TimesStat = &cm[0]
+			} else {
+				m.Errors = append(m.Errors, fmt.Sprintf("%s: Expected one CPU stat, got %d", globalMinioAddr, len(cm)))
+			}
+		}
+		loadStat, err := load.Avg()
+		if err != nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v (loadStat)", globalMinioAddr, err.Error()))
+		} else {
+			m.Aggregated.CPU.LoadStat = loadStat
+		}
 	}
 	// Add types...
 

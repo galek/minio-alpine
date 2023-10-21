@@ -97,7 +97,8 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 func delServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV string) error {
 	historyFile := pathJoin(minioConfigHistoryPrefix, uuidKV+kvPrefix)
 	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, historyFile, ObjectOptions{
-		DeletePrefix: true,
+		DeletePrefix:       true,
+		DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
 	})
 	return err
 }
@@ -196,10 +197,10 @@ func NewConfigSys() *ConfigSys {
 
 // Initialize and load config from remote etcd or local config directory
 func initConfig(objAPI ObjectLayer) (err error) {
-	bootstrapTrace("load the configuration")
+	bootstrapTraceMsg("load the configuration")
 	defer func() {
 		if err != nil {
-			bootstrapTrace(fmt.Sprintf("loading configuration failed: %v", err))
+			bootstrapTraceMsg(fmt.Sprintf("loading configuration failed: %v", err))
 		}
 	}()
 
@@ -212,7 +213,7 @@ func initConfig(objAPI ObjectLayer) (err error) {
 		return err
 	}
 
-	bootstrapTrace("lookup the configuration")
+	bootstrapTraceMsg("lookup the configuration")
 
 	// Override any values from ENVs.
 	lookupConfigs(srvCfg, objAPI)

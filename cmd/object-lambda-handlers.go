@@ -22,7 +22,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/klauspost/compress/gzhttp"
@@ -30,7 +29,7 @@ import (
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v2/policy"
 
 	"github.com/minio/minio/internal/auth"
 	levent "github.com/minio/minio/internal/config/lambda/event"
@@ -71,11 +70,8 @@ func getLambdaEventData(bucket, object string, cred auth.Credentials, r *http.Re
 			reqParams.Set(k, v)
 		}
 	}
-	extraHeaders := http.Header{}
-	if rng := r.Header.Get(xhttp.Range); rng != "" {
-		extraHeaders.Set(xhttp.Range, r.Header.Get(xhttp.Range))
-	}
 
+	extraHeaders := http.Header{}
 	u, err := clnt.PresignHeader(r.Context(), http.MethodGet, bucket, object, duration, reqParams, extraHeaders)
 	if err != nil {
 		return levent.Event{}, err
@@ -182,7 +178,7 @@ func StatusCode(text string) int {
 func fwdHeadersToS3(h http.Header, w http.ResponseWriter) {
 	const trim = "x-amz-fwd-header-"
 	for k, v := range h {
-		if strings.HasPrefix(strings.ToLower(k), trim) {
+		if stringsHasPrefixFold(k, trim) {
 			w.Header()[k[len(trim):]] = v
 		}
 	}

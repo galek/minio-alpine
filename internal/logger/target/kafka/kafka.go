@@ -27,23 +27,27 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/Shopify/sarama"
-	saramatls "github.com/Shopify/sarama/tools/tls"
-	"github.com/tidwall/gjson"
+	"github.com/IBM/sarama"
+	saramatls "github.com/IBM/sarama/tools/tls"
 
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v2/net"
 )
 
 // the suffix for the configured queue dir where the logs will be persisted.
 const kafkaLoggerExtension = ".kafka.log"
+
+const (
+	statusClosed = iota
+	statusOffline
+	statusOnline
+)
 
 // Config - kafka target arguments.
 type Config struct {
@@ -104,6 +108,8 @@ func (k Config) pingBrokers() (err error) {
 
 // Target - Kafka target.
 type Target struct {
+	status int32
+
 	totalMessages  int64
 	failedMessages int64
 
@@ -241,17 +247,16 @@ func (h *Target) send(entry interface{}) error {
 	if err != nil {
 		return err
 	}
-	requestID := gjson.GetBytes(logJSON, "requestID").Str
-	if requestID == "" {
-		// unsupported data structure
-		return fmt.Errorf("unsupported data structure: %s must be either audit.Entry or log.Entry", reflect.TypeOf(entry))
-	}
 	msg := sarama.ProducerMessage{
 		Topic: h.kconfig.Topic,
-		Key:   sarama.StringEncoder(requestID),
 		Value: sarama.ByteEncoder(logJSON),
 	}
 	_, _, err = h.producer.SendMessage(&msg)
+	if err != nil {
+		atomic.StoreInt32(&h.status, statusOffline)
+	} else {
+		atomic.StoreInt32(&h.status, statusOnline)
+	}
 	return err
 }
 
@@ -287,9 +292,20 @@ func (h *Target) init() error {
 	sconfig.Net.TLS.Config.ClientAuth = h.kconfig.TLS.ClientAuth
 	sconfig.Net.TLS.Config.RootCAs = h.kconfig.TLS.RootCAs
 
-	sconfig.Producer.RequiredAcks = sarama.WaitForAll
-	sconfig.Producer.Retry.Max = 10
+	// These settings are needed to ensure that kafka client doesn't hang on brokers
+	// refer https://github.com/IBM/sarama/issues/765#issuecomment-254333355
+	sconfig.Producer.Retry.Max = 2
+	sconfig.Producer.Retry.Backoff = (10 * time.Second)
 	sconfig.Producer.Return.Successes = true
+	sconfig.Producer.Return.Errors = true
+	sconfig.Producer.RequiredAcks = 1
+	sconfig.Producer.Timeout = (10 * time.Second)
+	sconfig.Net.ReadTimeout = (10 * time.Second)
+	sconfig.Net.DialTimeout = (10 * time.Second)
+	sconfig.Net.WriteTimeout = (10 * time.Second)
+	sconfig.Metadata.Retry.Max = 1
+	sconfig.Metadata.Retry.Backoff = (10 * time.Second)
+	sconfig.Metadata.RefreshFrequency = (15 * time.Minute)
 
 	h.config = sconfig
 
@@ -304,15 +320,13 @@ func (h *Target) init() error {
 	}
 
 	h.producer = producer
+	atomic.StoreInt32(&h.status, statusOnline)
 	return nil
 }
 
 // IsOnline returns true if the target is online.
 func (h *Target) IsOnline(_ context.Context) bool {
-	if err := h.initKafkaOnce.Do(h.init); err != nil {
-		return false
-	}
-	return h.kconfig.pingBrokers() == nil
+	return atomic.LoadInt32(&h.status) == statusOnline
 }
 
 // Send log message 'e' to kafka target.
@@ -330,6 +344,12 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 
 	select {
 	case h.logCh <- entry:
+	case <-ctx.Done():
+		// return error only for context timedout.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ctx.Err()
+		}
+		return nil
 	default:
 		// log channel is full, do not wait and return
 		// an error immediately to the caller
@@ -341,8 +361,8 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 }
 
 // SendFromStore - reads the log from store and sends it to kafka.
-func (h *Target) SendFromStore(key string) (err error) {
-	auditEntry, err := h.store.Get(key)
+func (h *Target) SendFromStore(key store.Key) (err error) {
+	auditEntry, err := h.store.Get(key.Name)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -356,7 +376,7 @@ func (h *Target) SendFromStore(key string) (err error) {
 		return
 	}
 	// Delete the event from store.
-	return h.store.Del(key)
+	return h.store.Del(key.Name)
 }
 
 // Cancel - cancels the target
@@ -390,6 +410,7 @@ func New(config Config) *Target {
 	target := &Target{
 		logCh:   make(chan interface{}, config.QueueSize),
 		kconfig: config,
+		status:  statusOffline,
 	}
 	return target
 }

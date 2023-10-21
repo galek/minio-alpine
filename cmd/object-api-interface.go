@@ -35,8 +35,11 @@ import (
 // CheckPreconditionFn returns true if precondition check failed.
 type CheckPreconditionFn func(o ObjectInfo) bool
 
-// EvalMetadataFn validates input objInfo and returns an updated metadata
-type EvalMetadataFn func(o *ObjectInfo) error
+// EvalMetadataFn validates input objInfo and GetObjectInfo error and returns an updated metadata and replication decision if any
+type EvalMetadataFn func(o *ObjectInfo, gerr error) (ReplicateDecision, error)
+
+// EvalRetentionBypassFn validates input objInfo and GetObjectInfo error and returns an error if retention bypass is not allowed.
+type EvalRetentionBypassFn func(o ObjectInfo, gerr error) error
 
 // GetObjectInfoFn is the signature of GetObjectInfo function.
 type GetObjectInfoFn func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error)
@@ -52,6 +55,7 @@ type ObjectOptions struct {
 
 	DeleteMarker            bool // Is only set in DELETE operations for delete marker replication
 	CheckDMReplicationReady bool // Is delete marker ready to be replicated - set only during HEAD
+	Tagging                 bool // Is only in GET/HEAD operations to return tagging metadata along with regular metadata and body.
 
 	UserDefined         map[string]string   // only set in case of POST/PUT operations
 	PartNumber          int                 // only useful in case of GetObject/HeadObject
@@ -74,6 +78,7 @@ type ObjectOptions struct {
 	ReplicationSourceLegalholdTimestamp time.Time // set if MinIOSourceObjectLegalholdTimestamp received
 	ReplicationSourceRetentionTimestamp time.Time // set if MinIOSourceObjectRetentionTimestamp received
 	DeletePrefix                        bool      // set true to enforce a prefix deletion, only application for DeleteObject API,
+	DeletePrefixObject                  bool      // set true when object's erasure set is resolvable by object name (using getHashedSetIndex)
 
 	Speedtest bool // object call specifically meant for SpeedTest code, set to 'true' when invoked by SpeedtestHandler.
 
@@ -92,6 +97,8 @@ type ObjectOptions struct {
 
 	WalkFilter      func(info FileInfo) bool // return WalkFilter returns 'true/false'
 	WalkMarker      string                   // set to skip until this object
+	WalkLatestOnly  bool                     // returns only latest versions for all matching objects
+	WalkAskDisks    string                   // dictates how many disks are being listed
 	PrefixEnabledFn func(prefix string) bool // function which returns true if versioning is enabled on prefix
 
 	// IndexCB will return any index created but the compression.
@@ -100,7 +107,8 @@ type ObjectOptions struct {
 
 	InclFreeVersions bool
 
-	MetadataChg bool // is true if it is a metadata update operation.
+	MetadataChg           bool                  // is true if it is a metadata update operation.
+	EvalRetentionBypassFn EvalRetentionBypassFn // only set for enforcing retention bypass on DeleteObject.
 }
 
 // ExpirationOptions represents object options for object expiration at objectLayer.
@@ -138,6 +146,7 @@ type DeleteBucketOptions struct {
 // BucketOptions provides options for ListBuckets and GetBucketInfo call.
 type BucketOptions struct {
 	Deleted bool // true only when site replication is enabled
+	Cached  bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
 }
 
 // SetReplicaStatus sets replica status and timestamp for delete operations in ObjectOptions
@@ -180,6 +189,16 @@ func (o *ObjectOptions) PutReplicationState() (r ReplicationState) {
 	r.ReplicationStatusInternal = rstatus
 	r.Targets = replicationStatusesMap(rstatus)
 	return
+}
+
+// SetEvalMetadataFn sets the metadata evaluation function
+func (o *ObjectOptions) SetEvalMetadataFn(f EvalMetadataFn) {
+	o.EvalMetadataFn = f
+}
+
+// SetEvalRetentionBypassFn sets the retention bypass function
+func (o *ObjectOptions) SetEvalRetentionBypassFn(f EvalRetentionBypassFn) {
+	o.EvalRetentionBypassFn = f
 }
 
 // ObjectLayer implements primitives for object API layer.
@@ -233,7 +252,8 @@ type ObjectLayer interface {
 	AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error
 	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error)
 
-	SetDriveCounts() []int // list of erasure stripe size for each pool in order.
+	GetDisks(poolIdx, setIdx int) ([]StorageAPI, error) // return the disks belonging to pool and set.
+	SetDriveCounts() []int                              // list of erasure stripe size for each pool in order.
 
 	// Healing operations.
 	HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error)

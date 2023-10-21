@@ -29,8 +29,9 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v2/net"
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/config/dns"
@@ -71,7 +72,7 @@ const (
 // and must not set by clients
 func containsReservedMetadata(header http.Header) bool {
 	for key := range header {
-		if strings.HasPrefix(strings.ToLower(key), ReservedMetadataPrefixLower) {
+		if stringsHasPrefixFold(key, ReservedMetadataPrefix) {
 			return true
 		}
 	}
@@ -87,7 +88,7 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 		length := len(key) + len(header.Get(key))
 		size += length
 		for _, prefix := range userMetadataKeyPrefixes {
-			if strings.HasPrefix(strings.ToLower(key), prefix) {
+			if stringsHasPrefixFold(key, prefix) {
 				usersize += length
 				break
 			}
@@ -100,7 +101,7 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 }
 
 // Limits body and header to specific allowed maximum limits as per S3/MinIO API requirements.
-func setRequestLimitHandler(h http.Handler) http.Handler {
+func setRequestLimitMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
 
@@ -147,11 +148,11 @@ func guessIsBrowserReq(r *http.Request) bool {
 		globalBrowserEnabled && aType == authTypeAnonymous
 }
 
-func setBrowserRedirectHandler(h http.Handler) http.Handler {
+func setBrowserRedirectMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		read := r.Method == http.MethodGet || r.Method == http.MethodHead
 		// Re-direction is handled specifically for browser requests.
-		if guessIsBrowserReq(r) && read {
+		if guessIsBrowserReq(r) && read && globalBrowserRedirect {
 			// Fetch the redirect location if any.
 			if u := getRedirectLocation(r); u != nil {
 				// Employ a temporary re-direct.
@@ -206,7 +207,7 @@ func getRedirectLocation(r *http.Request) *xnet.URL {
 }
 
 // guessIsHealthCheckReq - returns true if incoming request looks
-// like healthcheck request
+// like healthCheck request
 func guessIsHealthCheckReq(req *http.Request) bool {
 	if req == nil {
 		return false
@@ -229,7 +230,9 @@ func guessIsMetricsReq(req *http.Request) bool {
 	return (aType == authTypeAnonymous || aType == authTypeJWT) &&
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsPathLegacy ||
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ClusterPath ||
-		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath ||
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2BucketPath ||
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ResourcePath
 }
 
 // guessIsRPCReq - returns true if the request is for an RPC endpoint.
@@ -325,7 +328,7 @@ func hasMultipleAuth(r *http.Request) bool {
 
 // requestValidityHandler validates all the incoming paths for
 // any malicious requests.
-func setRequestValidityHandler(h http.Handler) http.Handler {
+func setRequestValidityMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
 
@@ -399,6 +402,17 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrAllAccessDisabled), r.URL)
 				return
 			}
+		} else {
+			// Validate bucket names if it is not empty
+			if bucketName != "" && s3utils.CheckValidBucketNameStrict(bucketName) != nil {
+				if ok {
+					tc.FuncName = "handler.ValidRequest"
+					tc.ResponseRecorder.LogErrBody = true
+				}
+				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidBucketName), r.URL)
+				return
+			}
 		}
 		// Deny SSE-C requests if not made over TLS
 		if !globalIsTLS && (crypto.SSEC.IsRequested(r.Header) || crypto.SSECopy.IsRequested(r.Header)) {
@@ -425,11 +439,16 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 	})
 }
 
-// setBucketForwardingHandler middleware forwards the path style requests
+// setBucketForwardingMiddleware middleware forwards the path style requests
 // on a bucket to the right bucket location, bucket to IP configuration
 // is obtained from centralized etcd configuration service.
-func setBucketForwardingHandler(h http.Handler) http.Handler {
+func setBucketForwardingMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := w.Header().Get("Access-Control-Allow-Origin"); origin == "null" {
+			// This is a workaround change to ensure that "Origin: null"
+			// incoming request to a response back as "*" instead of "null"
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
 		if globalDNSConfig == nil || !globalBucketFederation ||
 			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
 			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) {
@@ -493,13 +512,12 @@ func setBucketForwardingHandler(h http.Handler) http.Handler {
 	})
 }
 
-// addCustomHeaders adds various HTTP(S) response headers.
+// addCustomHeadersMiddleware adds various HTTP(S) response headers.
 // Security Headers enable various security protections behaviors in the client's browser.
-func addCustomHeaders(h http.Handler) http.Handler {
+func addCustomHeadersMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := w.Header()
 		header.Set("X-XSS-Protection", "1; mode=block")                                // Prevents against XSS attacks
-		header.Set("Content-Security-Policy", "block-all-mixed-content")               // prevent mixed (HTTP / HTTPS content)
 		header.Set("X-Content-Type-Options", "nosniff")                                // Prevent mime-sniff
 		header.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains") // HSTS mitigates variants of MITM attacks
 
@@ -540,9 +558,9 @@ func setCriticalErrorHandler(h http.Handler) http.Handler {
 	})
 }
 
-// setUploadForwardingHandler middleware forwards multiparts requests
+// setUploadForwardingMiddleware middleware forwards multiparts requests
 // in a site replication setup to peer that initiated the upload
-func setUploadForwardingHandler(h http.Handler) http.Handler {
+func setUploadForwardingMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !globalSiteReplicationSys.isEnabled() ||
 			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||

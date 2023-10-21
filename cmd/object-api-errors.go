@@ -348,15 +348,6 @@ func (e InvalidUploadIDKeyCombination) Error() string {
 	return fmt.Sprintf("Invalid combination of uploadID marker '%s' and marker '%s'", e.UploadIDMarker, e.KeyMarker)
 }
 
-// InvalidMarkerPrefixCombination - invalid marker and prefix combination.
-type InvalidMarkerPrefixCombination struct {
-	Marker, Prefix string
-}
-
-func (e InvalidMarkerPrefixCombination) Error() string {
-	return fmt.Sprintf("Invalid combination of marker '%s' and prefix '%s'", e.Marker, e.Prefix)
-}
-
 // BucketPolicyNotFound - no bucket policy found.
 type BucketPolicyNotFound GenericError
 
@@ -733,5 +724,17 @@ func isErrMethodNotAllowed(err error) bool {
 
 func isErrInvalidRange(err error) bool {
 	_, ok := err.(InvalidRange)
+	return ok
+}
+
+// ReplicationPermissionCheck - Check if error type is ReplicationPermissionCheck.
+type ReplicationPermissionCheck struct{}
+
+func (e ReplicationPermissionCheck) Error() string {
+	return "Replication permission validation requests cannot be completed"
+}
+
+func isReplicationPermissionCheck(err error) bool {
+	_, ok := err.(ReplicationPermissionCheck)
 	return ok
 }

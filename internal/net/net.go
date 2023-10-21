@@ -1,7 +1,4 @@
-//go:build !windows
-// +build !windows
-
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,40 +15,27 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package cmd
+package net
 
 import (
-	"errors"
-	"io"
-	"os"
-	"time"
+	"fmt"
 
-	"github.com/djherbis/atime"
+	"github.com/prometheus/procfs"
 )
 
-// Return error if Atime is disabled on the O/S
-func checkAtimeSupport(dir string) (err error) {
-	file, err := os.CreateTemp(dir, "prefix")
+// GetInterfaceNetStats - get procfs.NetDevLine by interfaceName
+func GetInterfaceNetStats(interf string) (procfs.NetDevLine, error) {
+	proc, err := procfs.Self()
 	if err != nil {
-		return
+		return procfs.NetDevLine{}, err
 	}
-	defer os.Remove(file.Name())
-	defer file.Close()
-	finfo1, err := os.Stat(file.Name())
+	netDev, err := proc.NetDev()
 	if err != nil {
-		return
+		return procfs.NetDevLine{}, err
 	}
-	// add a sleep to ensure atime change is detected
-	time.Sleep(10 * time.Millisecond)
-
-	if _, err = io.Copy(io.Discard, file); err != nil {
-		return
+	ndl, ok := netDev[interf]
+	if !ok {
+		return procfs.NetDevLine{}, fmt.Errorf("%v interface not found", interf)
 	}
-
-	finfo2, err := os.Stat(file.Name())
-
-	if atime.Get(finfo2).Equal(atime.Get(finfo1)) {
-		return errors.New("Atime not supported")
-	}
-	return
+	return ndl, nil
 }

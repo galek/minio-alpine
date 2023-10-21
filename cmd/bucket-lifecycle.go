@@ -41,8 +41,8 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/s3select"
-	"github.com/minio/pkg/env"
-	"github.com/minio/pkg/workers"
+	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v2/workers"
 )
 
 const (
@@ -280,8 +280,10 @@ func (t *transitionState) worker(objectAPI ObjectLayer) {
 			}
 			atomic.AddInt32(&t.activeTasks, 1)
 			if err := transitionObject(t.ctx, objectAPI, task.objInfo, newLifecycleAuditEvent(task.src, task.event)); err != nil {
-				logger.LogIf(t.ctx, fmt.Errorf("Transition to %s failed for %s/%s version:%s with %w",
-					task.event.StorageClass, task.objInfo.Bucket, task.objInfo.Name, task.objInfo.VersionID, err))
+				if !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
+					logger.LogIf(t.ctx, fmt.Errorf("Transition to %s failed for %s/%s version:%s with %w",
+						task.event.StorageClass, task.objInfo.Bucket, task.objInfo.Name, task.objInfo.VersionID, err))
+				}
 			} else {
 				ts := tierStats{
 					TotalSize:   uint64(task.objInfo.Size),
@@ -403,13 +405,11 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		TierName:  oi.TransitionedObject.Tier,
 	}
 	if err := globalTierJournal.AddEntry(entry); err != nil {
-		logger.LogIf(ctx, err)
 		return err
 	}
 	// Delete metadata on source, now that data in remote tier has been
 	// marked for deletion.
 	if _, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts); err != nil {
-		logger.LogIf(ctx, err)
 		return err
 	}
 
@@ -444,7 +444,7 @@ func genTransitionObjName(bucket string) (string, error) {
 		return "", err
 	}
 	us := u.String()
-	obj := fmt.Sprintf("%s/%s/%s/%s/%s", globalDeploymentID, bucket, us[0:2], us[2:4], us)
+	obj := fmt.Sprintf("%s/%s/%s/%s/%s", globalDeploymentID(), bucket, us[0:2], us[2:4], us)
 	return obj, nil
 }
 
@@ -691,7 +691,7 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 
 	if rreq.Type == SelectRestoreRequest {
 		for _, v := range rreq.OutputLocation.S3.UserMetadata {
-			if !strings.HasPrefix(strings.ToLower(v.Name), "x-amz-meta") {
+			if !stringsHasPrefixFold(v.Name, "x-amz-meta") {
 				meta["x-amz-meta-"+v.Name] = v.Value
 				continue
 			}

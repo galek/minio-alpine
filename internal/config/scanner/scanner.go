@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v2/env"
 )
 
 // Compression environment variables
@@ -85,18 +85,21 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 		return cfg, err
 	}
 
-	// Stick to loading deprecated config/env if they are already set
-	if kvs.Get(Delay) != "" && kvs.Get(MaxWait) != "" && kvs.Get(Cycle) != "" {
-		return lookupDeprecatedScannerConfig(kvs)
+	// Stick to loading deprecated config/env if they are already set, and the Speed value
+	// has not been changed from its "default" value, if it has been changed honor new settings.
+	if kvs.GetWithDefault(Speed, DefaultKVS) == "default" {
+		if kvs.Get(Delay) != "" && kvs.Get(MaxWait) != "" {
+			return lookupDeprecatedScannerConfig(kvs)
+		}
 	}
 
 	switch speed := env.Get(EnvSpeed, kvs.GetWithDefault(Speed, DefaultKVS)); speed {
 	case "fastest":
-		cfg.Delay, cfg.MaxWait, cfg.Cycle = 0, 0, 0
+		cfg.Delay, cfg.MaxWait, cfg.Cycle = 0, 0, time.Second
 	case "fast":
 		cfg.Delay, cfg.MaxWait, cfg.Cycle = 1, 100*time.Millisecond, time.Minute
 	case "default":
-		cfg.Delay, cfg.MaxWait, cfg.Cycle = 2, 5*time.Second, time.Minute
+		cfg.Delay, cfg.MaxWait, cfg.Cycle = 2, time.Second, time.Minute
 	case "slow":
 		cfg.Delay, cfg.MaxWait, cfg.Cycle = 10, 15*time.Second, time.Minute
 	case "slowest":
@@ -124,7 +127,11 @@ func lookupDeprecatedScannerConfig(kvs config.KVS) (cfg Config, err error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.Cycle, err = time.ParseDuration(env.Get(EnvCycle, kvs.GetWithDefault(Cycle, DefaultKVS)))
+	cycle := env.Get(EnvCycle, kvs.GetWithDefault(Cycle, DefaultKVS))
+	if cycle == "" {
+		cycle = "1m"
+	}
+	cfg.Cycle, err = time.ParseDuration(cycle)
 	if err != nil {
 		return cfg, err
 	}

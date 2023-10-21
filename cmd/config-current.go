@@ -27,7 +27,6 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
-	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/config/callhome"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/config/dns"
@@ -46,15 +45,13 @@ import (
 	"github.com/minio/minio/internal/config/subnet"
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v2/env"
 )
 
 func initHelp() {
 	kvs := map[string]config.KVS{
 		config.EtcdSubSys:           etcd.DefaultKVS,
-		config.CacheSubSys:          cache.DefaultKVS,
 		config.CompressionSubSys:    compress.DefaultKVS,
 		config.IdentityLDAPSubSys:   xldap.DefaultKVS,
 		config.IdentityOpenIDSubSys: openid.DefaultKVS,
@@ -209,10 +206,6 @@ func initHelp() {
 			Key:         config.EtcdSubSys,
 			Description: "persist IAM assets externally to etcd",
 		},
-		config.HelpKV{
-			Key:         config.CacheSubSys,
-			Description: "[DEPRECATED] add caching storage tier",
-		},
 	}
 
 	if globalIsErasure {
@@ -232,7 +225,6 @@ func initHelp() {
 		config.APISubSys:            api.Help,
 		config.StorageClassSubSys:   storageclass.Help,
 		config.EtcdSubSys:           etcd.Help,
-		config.CacheSubSys:          cache.Help,
 		config.CompressionSubSys:    compress.Help,
 		config.HealSubSys:           heal.Help,
 		config.ScannerSubSys:        scanner.Help,
@@ -301,10 +293,6 @@ func validateSubSysConfig(ctx context.Context, s config.Config, subSys string, o
 			if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount); err != nil {
 				return err
 			}
-		}
-	case config.CacheSubSys:
-		if _, err := cache.LookupConfig(s[config.CacheSubSys][config.Default]); err != nil {
-			return err
 		}
 	case config.CompressionSubSys:
 		if _, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default]); err != nil {
@@ -386,7 +374,7 @@ func validateSubSysConfig(ctx context.Context, s config.Config, subSys string, o
 		}
 	default:
 		if config.LoggerSubSystems.Contains(subSys) {
-			if err := logger.ValidateSubSysConfig(s, subSys); err != nil {
+			if err := logger.ValidateSubSysConfig(ctx, s, subSys); err != nil {
 				return err
 			}
 		}
@@ -440,7 +428,7 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
 	}
 	if err == nil && dnsURL != "" {
-		bootstrapTrace("initialize remote bucket DNS store")
+		bootstrapTraceMsg("initialize remote bucket DNS store")
 		globalDNSConfig, err = dns.NewOperatorDNS(dnsURL,
 			dns.Authentication(dnsUser, dnsPass),
 			dns.RootCAs(globalRootCAs))
@@ -455,7 +443,7 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 	}
 
 	if etcdCfg.Enabled {
-		bootstrapTrace("initialize etcd store")
+		bootstrapTraceMsg("initialize etcd store")
 		globalEtcdClient, err = etcd.New(etcdCfg)
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
@@ -493,20 +481,6 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 		logger.LogIf(ctx, fmt.Errorf("Invalid site configuration: %w", err))
 	}
 
-	globalCacheConfig, err = cache.LookupConfig(s[config.CacheSubSys][config.Default])
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to setup cache: %w", err))
-	}
-
-	if globalCacheConfig.Enabled {
-		if cacheEncKey := env.Get(cache.EnvCacheEncryptionKey, ""); cacheEncKey != "" {
-			globalCacheKMS, err = kms.Parse(cacheEncKey)
-			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("Unable to setup encryption cache: %w", err))
-			}
-		}
-	}
-
 	globalAutoEncryption = crypto.LookupAutoEncryption() // Enable auto-encryption if enabled
 	if globalAutoEncryption && GlobalKMS == nil {
 		logger.Fatal(errors.New("no KMS configured"), "MINIO_KMS_AUTO_ENCRYPTION requires a valid KMS configuration")
@@ -514,19 +488,19 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 
 	transport := NewHTTPTransport()
 
-	bootstrapTrace("initialize the event notification targets")
+	bootstrapTraceMsg("initialize the event notification targets")
 	globalNotifyTargetList, err = notify.FetchEnabledTargets(GlobalContext, s, transport)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
 	}
 
-	bootstrapTrace("initialize the lambda targets")
+	bootstrapTraceMsg("initialize the lambda targets")
 	globalLambdaTargetList, err = lambda.FetchEnabledTargets(GlobalContext, s, transport)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize lambda target(s): %w", err))
 	}
 
-	bootstrapTrace("applying the dynamic configuration")
+	bootstrapTraceMsg("applying the dynamic configuration")
 	// Apply dynamic config values
 	if err := applyDynamicConfig(ctx, objAPI, s); err != nil {
 		logger.LogIf(ctx, err)
@@ -575,7 +549,7 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 		scannerCycle.Store(scannerCfg.Cycle)
 		logger.LogIf(ctx, scannerSleeper.Update(scannerCfg.Delay, scannerCfg.MaxWait))
 	case config.LoggerWebhookSubSys:
-		loggerCfg, err := logger.LookupConfigForSubSys(s, config.LoggerWebhookSubSys)
+		loggerCfg, err := logger.LookupConfigForSubSys(ctx, s, config.LoggerWebhookSubSys)
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("Unable to load logger webhook config: %w", err))
 		}
@@ -592,7 +566,7 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 			logger.LogIf(ctx, fmt.Errorf("Unable to update logger webhook config: %v", errs))
 		}
 	case config.AuditWebhookSubSys:
-		loggerCfg, err := logger.LookupConfigForSubSys(s, config.AuditWebhookSubSys)
+		loggerCfg, err := logger.LookupConfigForSubSys(ctx, s, config.AuditWebhookSubSys)
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("Unable to load audit webhook config: %w", err))
 		}
@@ -610,7 +584,7 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 			logger.LogIf(ctx, fmt.Errorf("Unable to update audit webhook targets: %v", errs))
 		}
 	case config.AuditKafkaSubSys:
-		loggerCfg, err := logger.LookupConfigForSubSys(s, config.AuditKafkaSubSys)
+		loggerCfg, err := logger.LookupConfigForSubSys(ctx, s, config.AuditKafkaSubSys)
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("Unable to load audit kafka config: %w", err))
 		}
@@ -786,13 +760,13 @@ func getValidConfig(objAPI ObjectLayer) (config.Config, error) {
 // from env if found and valid
 // data is optional. If nil it will be loaded from backend.
 func loadConfig(objAPI ObjectLayer, data []byte) error {
-	bootstrapTrace("load the configuration")
+	bootstrapTraceMsg("load the configuration")
 	srvCfg, err := readServerConfig(GlobalContext, objAPI, data)
 	if err != nil {
 		return err
 	}
 
-	bootstrapTrace("lookup the configuration")
+	bootstrapTraceMsg("lookup the configuration")
 	// Override any values from ENVs.
 	lookupConfigs(srvCfg, objAPI)
 

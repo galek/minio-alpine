@@ -56,13 +56,12 @@ import (
 	ioutilx "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/message/audit"
-	"github.com/minio/minio/internal/mcontext"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/certs"
-	"github.com/minio/pkg/env"
-	pkgAudit "github.com/minio/pkg/logger/message/audit"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v2/certs"
+	"github.com/minio/pkg/v2/env"
+	pkgAudit "github.com/minio/pkg/v2/logger/message/audit"
+	xnet "github.com/minio/pkg/v2/net"
 	"golang.org/x/oauth2"
 )
 
@@ -156,6 +155,8 @@ func ErrorRespToObjectError(err error, params ...string) error {
 		err = InvalidUploadID{}
 	case "EntityTooSmall":
 		err = PartTooSmall{}
+	case "ReplicationPermissionCheck":
+		err = ReplicationPermissionCheck{}
 	}
 
 	if minioErr.StatusCode == http.StatusMethodNotAllowed {
@@ -344,7 +345,7 @@ func getProfileData() (map[string][]byte, error) {
 }
 
 func setDefaultProfilerRates() {
-	runtime.MemProfileRate = 4096      // 512K -> 4K - Must be constant throughout application lifetime.
+	runtime.MemProfileRate = 128 << 10 // 512KB -> 128K - Must be constant throughout application lifetime.
 	runtime.SetMutexProfileFraction(0) // Disable until needed
 	runtime.SetBlockProfileRate(0)     // Disable until needed
 }
@@ -557,8 +558,13 @@ func ToS3ETag(etag string) string {
 
 // GetDefaultConnSettings returns default HTTP connection settings.
 func GetDefaultConnSettings() xhttp.ConnSettings {
+	lookupHost := globalDNSCache.LookupHost
+	if IsKubernetes() || IsDocker() {
+		lookupHost = nil
+	}
+
 	return xhttp.ConnSettings{
-		DNSCache:    globalDNSCache,
+		LookupHost:  lookupHost,
 		DialTimeout: rest.DefaultTimeout,
 		RootCAs:     globalRootCAs,
 		TCPOptions:  globalTCPOptions,
@@ -568,8 +574,13 @@ func GetDefaultConnSettings() xhttp.ConnSettings {
 // NewInternodeHTTPTransport returns a transport for internode MinIO
 // connections.
 func NewInternodeHTTPTransport() func() http.RoundTripper {
+	lookupHost := globalDNSCache.LookupHost
+	if IsKubernetes() || IsDocker() {
+		lookupHost = nil
+	}
+
 	return xhttp.ConnSettings{
-		DNSCache:         globalDNSCache,
+		LookupHost:       lookupHost,
 		DialTimeout:      rest.DefaultTimeout,
 		RootCAs:          globalRootCAs,
 		CipherSuites:     fips.TLSCiphers(),
@@ -582,8 +593,13 @@ func NewInternodeHTTPTransport() func() http.RoundTripper {
 // NewCustomHTTPProxyTransport is used only for proxied requests, specifically
 // only supports HTTP/1.1
 func NewCustomHTTPProxyTransport() func() *http.Transport {
+	lookupHost := globalDNSCache.LookupHost
+	if IsKubernetes() || IsDocker() {
+		lookupHost = nil
+	}
+
 	return xhttp.ConnSettings{
-		DNSCache:         globalDNSCache,
+		LookupHost:       lookupHost,
 		DialTimeout:      rest.DefaultTimeout,
 		RootCAs:          globalRootCAs,
 		CipherSuites:     fips.TLSCiphers(),
@@ -596,8 +612,13 @@ func NewCustomHTTPProxyTransport() func() *http.Transport {
 // NewHTTPTransportWithClientCerts returns a new http configuration
 // used while communicating with the cloud backends.
 func NewHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transport {
+	lookupHost := globalDNSCache.LookupHost
+	if IsKubernetes() || IsDocker() {
+		lookupHost = nil
+	}
+
 	s := xhttp.ConnSettings{
-		DNSCache:    globalDNSCache,
+		LookupHost:  lookupHost,
 		DialTimeout: defaultDialTimeout,
 		RootCAs:     globalRootCAs,
 		TCPOptions:  globalTCPOptions,
@@ -609,8 +630,7 @@ func NewHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transpo
 		defer cancel()
 		transport, err := s.NewHTTPTransportWithClientCerts(ctx, clientCert, clientKey)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("failed to load client key and cert, please check your endpoint configuration: %s",
-				err.Error()))
+			logger.LogIf(ctx, fmt.Errorf("Unable to load client key and cert, please check your client certificate configuration: %w", err))
 		}
 		return transport
 	}
@@ -629,9 +649,14 @@ const defaultDialTimeout = 5 * time.Second
 
 // NewHTTPTransportWithTimeout allows setting a timeout.
 func NewHTTPTransportWithTimeout(timeout time.Duration) *http.Transport {
+	lookupHost := globalDNSCache.LookupHost
+	if IsKubernetes() || IsDocker() {
+		lookupHost = nil
+	}
+
 	return xhttp.ConnSettings{
 		DialContext: newCustomDialContext(),
-		DNSCache:    globalDNSCache,
+		LookupHost:  lookupHost,
 		DialTimeout: defaultDialTimeout,
 		RootCAs:     globalRootCAs,
 		TCPOptions:  globalTCPOptions,
@@ -639,10 +664,8 @@ func NewHTTPTransportWithTimeout(timeout time.Duration) *http.Transport {
 	}.NewHTTPTransportWithTimeout(timeout)
 }
 
-type dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-
 // newCustomDialContext setups a custom dialer for any external communication and proxies.
-func newCustomDialContext() dialContext {
+func newCustomDialContext() xhttp.DialContext {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		dialer := &net.Dialer{
 			Timeout:   15 * time.Second,
@@ -664,45 +687,19 @@ func newCustomDialContext() dialContext {
 
 // NewRemoteTargetHTTPTransport returns a new http configuration
 // used while communicating with the remote replication targets.
-func NewRemoteTargetHTTPTransport() func() *http.Transport {
+func NewRemoteTargetHTTPTransport(insecure bool) func() *http.Transport {
+	lookupHost := globalDNSCache.LookupHost
+	if IsKubernetes() || IsDocker() {
+		lookupHost = nil
+	}
+
 	return xhttp.ConnSettings{
 		DialContext: newCustomDialContext(),
-		DNSCache:    globalDNSCache,
+		LookupHost:  lookupHost,
 		RootCAs:     globalRootCAs,
 		TCPOptions:  globalTCPOptions,
 		EnableHTTP2: false,
-	}.NewRemoteTargetHTTPTransport()
-}
-
-// Load the json (typically from disk file).
-func jsonLoad(r io.ReadSeeker, data interface{}) error {
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	return json.NewDecoder(r).Decode(data)
-}
-
-// Save to disk file in json format.
-func jsonSave(f interface {
-	io.WriteSeeker
-	Truncate(int64) error
-}, data interface{},
-) error {
-	b, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	if err = f.Truncate(0); err != nil {
-		return err
-	}
-	if _, err = f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	_, err = f.Write(b)
-	if err != nil {
-		return err
-	}
-	return nil
+	}.NewRemoteTargetHTTPTransport(insecure)
 }
 
 // ceilFrac takes a numerator and denominator representing a fraction
@@ -817,7 +814,7 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 	bucket := vars["bucket"]
 	object := likelyUnescapeGeneric(vars["object"], url.PathUnescape)
 	reqInfo := &logger.ReqInfo{
-		DeploymentID: globalDeploymentID,
+		DeploymentID: globalDeploymentID(),
 		RequestID:    reqID,
 		RemoteHost:   handlers.GetSourceIP(r),
 		Host:         getHostName(r),
@@ -828,14 +825,7 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 		VersionID:    strings.TrimSpace(r.Form.Get(xhttp.VersionID)),
 	}
 
-	ctx := context.WithValue(r.Context(),
-		mcontext.ContextTraceKey,
-		&mcontext.TraceCtxt{
-			AmzReqID: reqID,
-		},
-	)
-
-	return logger.SetReqInfo(ctx, reqInfo)
+	return logger.SetReqInfo(r.Context(), reqInfo)
 }
 
 // Used for registering with rest handlers (have a look at registerStorageRESTHandlers for usage example)
@@ -1058,7 +1048,7 @@ func auditLogInternal(ctx context.Context, opts AuditLogOptions) {
 	if len(logger.AuditTargets()) == 0 {
 		return
 	}
-	entry := audit.NewEntry(globalDeploymentID)
+	entry := audit.NewEntry(globalDeploymentID())
 	entry.Trigger = opts.Event
 	entry.Event = opts.Event
 	entry.Error = opts.Error
@@ -1258,4 +1248,10 @@ func unwrapAll(err error) error {
 		}
 		err = werr
 	}
+}
+
+// stringsHasPrefixFold tests whether the string s begins with prefix ignoring case.
+func stringsHasPrefixFold(s, prefix string) bool {
+	// Test match with case first.
+	return len(s) >= len(prefix) && (s[0:len(prefix)] == prefix || strings.EqualFold(s[0:len(prefix)], prefix))
 }

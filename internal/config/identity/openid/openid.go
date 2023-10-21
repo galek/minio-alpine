@@ -36,8 +36,8 @@ import (
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/identity/openid/provider"
 	"github.com/minio/minio/internal/hash/sha256"
-	iampolicy "github.com/minio/pkg/iam/policy"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v2/net"
+	"github.com/minio/pkg/v2/policy"
 )
 
 // OpenID keys and envs.
@@ -89,7 +89,7 @@ var (
 		},
 		config.KV{
 			Key:   ClaimName,
-			Value: iampolicy.PolicyName,
+			Value: policy.PolicyName,
 		},
 		config.KV{
 			Key:   ClaimUserinfo,
@@ -243,11 +243,8 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		// parameters are non-empty.
 		var (
 			cfgEnableVal        = getCfgVal(config.Enable)
-			isExplicitlyEnabled = false
+			isExplicitlyEnabled = cfgEnableVal != ""
 		)
-		if cfgEnableVal != "" {
-			isExplicitlyEnabled = true
-		}
 
 		var enabled bool
 		if isExplicitlyEnabled {
@@ -310,9 +307,9 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		}
 
 		// Check if claim name is the non-default value and role policy is set.
-		if p.ClaimName != iampolicy.PolicyName && p.RolePolicy != "" {
+		if p.ClaimName != policy.PolicyName && p.RolePolicy != "" {
 			// In the unlikely event that the user specifies
-			// `iampolicy.PolicyName` as the claim name explicitly and sets
+			// `policy.PolicyName` as the claim name explicitly and sets
 			// a role policy, this check is thwarted, but we will be using
 			// the role policy anyway.
 			return c, config.Errorf("Role Policy (=`%s`) and Claim Name (=`%s`) cannot both be set", p.RolePolicy, p.ClaimName)
@@ -423,17 +420,21 @@ func (r *Config) GetConfigInfo(s config.Config, cfgName string) ([]madmin.IDPCfg
 
 	res := make([]madmin.IDPCfgInfo, 0, len(kvsrcs)+1)
 	for _, kvsrc := range kvsrcs {
-		// skip default values.
+		// skip returning default config values.
 		if kvsrc.Src == config.ValueSourceDef {
 			if kvsrc.Key != madmin.EnableKey {
 				continue
 			}
-			// set an explicit on/off from live configuration.
-			kvsrc.Value = "off"
-			if _, ok := r.ProviderCfgs[cfgName]; ok {
-				if r.Enabled {
-					kvsrc.Value = "on"
-				}
+			// for EnableKey we set an explicit on/off from live configuration
+			// if it is present.
+			if _, ok := r.ProviderCfgs[cfgName]; !ok {
+				// No live config is present
+				continue
+			}
+			if r.Enabled {
+				kvsrc.Value = "on"
+			} else {
+				kvsrc.Value = "off"
 			}
 		}
 		res = append(res, madmin.IDPCfgInfo{

@@ -33,7 +33,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v2/env"
 )
 
 const (
@@ -153,14 +153,18 @@ func (b *bootstrapRESTServer) VerifyHandler(w http.ResponseWriter, r *http.Reque
 
 // registerBootstrapRESTHandlers - register bootstrap rest router.
 func registerBootstrapRESTHandlers(router *mux.Router) {
+	h := func(f http.HandlerFunc) http.HandlerFunc {
+		return collectInternodeStats(httpTraceHdrs(f))
+	}
+
 	server := &bootstrapRESTServer{}
 	subrouter := router.PathPrefix(bootstrapRESTPrefix).Subrouter()
 
 	subrouter.Methods(http.MethodPost).Path(bootstrapRESTVersionPrefix + bootstrapRESTMethodHealth).HandlerFunc(
-		httpTraceHdrs(server.HealthHandler))
+		h(server.HealthHandler))
 
 	subrouter.Methods(http.MethodPost).Path(bootstrapRESTVersionPrefix + bootstrapRESTMethodVerify).HandlerFunc(
-		httpTraceHdrs(server.VerifyHandler))
+		h(server.VerifyHandler))
 }
 
 // client to talk to bootstrap NEndpoints.
@@ -217,7 +221,7 @@ func verifyServerSystemConfig(ctx context.Context, endpointServerPools EndpointS
 	for onlineServers < len(clnts)/2 {
 		for _, clnt := range clnts {
 			if err := clnt.Verify(ctx, srcCfg); err != nil {
-				bootstrapTrace(fmt.Sprintf("clnt.Verify: %v, endpoint: %v", err, clnt.endpoint))
+				bootstrapTraceMsg(fmt.Sprintf("clnt.Verify: %v, endpoint: %v", err, clnt.endpoint))
 				if !isNetworkError(err) {
 					logger.LogOnceIf(ctx, fmt.Errorf("%s has incorrect configuration: %w", clnt.String(), err), clnt.String())
 					incorrectConfigs = append(incorrectConfigs, fmt.Errorf("%s has incorrect configuration: %w", clnt.String(), err))

@@ -29,7 +29,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v2/policy"
 )
 
 // EventNotifier - notifies external systems about events in MinIO.
@@ -210,6 +210,9 @@ type eventArgs struct {
 func (args eventArgs) ToEvent(escape bool) event.Event {
 	eventTime := UTCNow()
 	uniqueID := fmt.Sprintf("%X", eventTime.UnixNano())
+	if !args.Object.ModTime.IsZero() {
+		uniqueID = fmt.Sprintf("%X", args.Object.ModTime.UnixNano())
+	}
 
 	respElements := map[string]string{
 		"x-amz-request-id": args.RespElements["requestId"],
@@ -223,7 +226,7 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 	}
 
 	// Add deployment as part of response elements.
-	respElements["x-minio-deployment-id"] = globalDeploymentID
+	respElements["x-minio-deployment-id"] = globalDeploymentID()
 	if args.RespElements["content-length"] != "" {
 		respElements["content-length"] = args.RespElements["content-length"]
 	}
@@ -268,7 +271,7 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 		newEvent.S3.Object.ContentType = args.Object.ContentType
 		newEvent.S3.Object.UserMetadata = make(map[string]string, len(args.Object.UserDefined))
 		for k, v := range args.Object.UserDefined {
-			if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+			if stringsHasPrefixFold(strings.ToLower(k), ReservedMetadataPrefixLower) {
 				continue
 			}
 			newEvent.S3.Object.UserMetadata[k] = v

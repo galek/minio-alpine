@@ -23,10 +23,10 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/minio/console/restapi"
+	"github.com/minio/dnscache"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -34,11 +34,10 @@ import (
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
-	"github.com/rs/dnscache"
+	"go.uber.org/atomic"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/auth"
-	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/config/callhome"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/config/dns"
@@ -52,8 +51,8 @@ import (
 	levent "github.com/minio/minio/internal/config/lambda/event"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/pubsub"
-	"github.com/minio/pkg/certs"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v2/certs"
+	xnet "github.com/minio/pkg/v2/net"
 )
 
 // minio configuration related constants.
@@ -152,6 +151,9 @@ var (
 	// and it is automatically deduced.
 	globalBrowserRedirectURL *xnet.URL
 
+	// Disable redirect, default is enabled.
+	globalBrowserRedirect bool
+
 	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
 	globalInplaceUpdateDisabled = false
 
@@ -193,7 +195,7 @@ var (
 	globalBucketSSEConfigSys *BucketSSEConfigSys
 	globalBucketTargetSys    *BucketTargetSys
 	// globalAPIConfig controls S3 API requests throttling,
-	// healthcheck readiness deadlines and cors settings.
+	// healthCheck readiness deadlines and cors settings.
 	globalAPIConfig = apiConfig{listQuorum: "strict", rootAccess: true}
 
 	globalStorageClass storageclass.Config
@@ -270,12 +272,6 @@ var (
 	globalBucketQuotaSys      *BucketQuotaSys
 	globalBucketVersioningSys *BucketVersioningSys
 
-	// Disk cache drives
-	globalCacheConfig cache.Config
-
-	// Initialized KMS configuration for disk cache
-	globalCacheKMS kms.KMS
-
 	// Allocated etcd endpoint for config and bucket DNS.
 	globalEtcdClient *etcd.Client
 
@@ -317,7 +313,14 @@ var (
 	globalAuthZPlugin *polplugin.AuthZPlugin
 
 	// Deployment ID - unique per deployment
-	globalDeploymentID string
+	globalDeploymentIDPtr atomic.Pointer[string]
+	globalDeploymentID    = func() string {
+		ptr := globalDeploymentIDPtr.Load()
+		if ptr == nil {
+			return ""
+		}
+		return *ptr
+	}
 
 	globalAllHealState *allHealState
 
@@ -346,7 +349,7 @@ var (
 
 	globalTierConfigMgr *TierConfigMgr
 
-	globalTierJournal *tierJournal
+	globalTierJournal *TierJournal
 
 	globalConsoleSrv *restapi.Server
 
@@ -370,6 +373,7 @@ var (
 	// Used for collecting stats for netperf
 	globalNetPerfMinDuration     = time.Second * 10
 	globalNetPerfRX              netPerfRX
+	globalSiteNetPerfRX          netPerfRX
 	globalObjectPerfBucket       = "minio-perf-test-tmp-bucket"
 	globalObjectPerfUserMetadata = "X-Amz-Meta-Minio-Object-Perf" // Clients can set this to bypass S3 API service freeze. Used by object pref tests.
 
@@ -392,6 +396,18 @@ var (
 	// Is _MINIO_DISABLE_API_FREEZE_ON_BOOT set?
 	globalDisableFreezeOnBoot bool
 
+	// Contains NIC interface name used for internode communication
+	globalInternodeInterface     string
+	globalInternodeInterfaceOnce sync.Once
+
+	// Set last client perf extra time (get lock, and validate)
+	globalLastClientPerfExtraTime int64
+
+	// Captures all batch jobs metrics globally
+	globalBatchJobsMetrics batchJobMetrics
+
+	// Indicates if server was started as `--address ":0"`
+	globalDynamicAPIPort bool
 	// Add new variable global values here.
 )
 

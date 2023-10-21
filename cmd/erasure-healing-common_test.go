@@ -20,7 +20,6 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -233,7 +232,12 @@ func TestListOnlineDisks(t *testing.T) {
 	object := "object"
 	data := bytes.Repeat([]byte("a"), smallFileThreshold*16)
 	z := obj.(*erasureServerPools)
-	erasureDisks := z.serverPools[0].sets[0].getDisks()
+
+	erasureDisks, err := z.GetDisks(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for i, test := range testCases {
 		test := test
 		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
@@ -405,7 +409,12 @@ func TestListOnlineDisksSmallObjects(t *testing.T) {
 	object := "object"
 	data := bytes.Repeat([]byte("a"), smallFileThreshold/2)
 	z := obj.(*erasureServerPools)
-	erasureDisks := z.serverPools[0].sets[0].getDisks()
+
+	erasureDisks, err := z.GetDisks(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for i, test := range testCases {
 		test := test
 		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
@@ -416,7 +425,7 @@ func TestListOnlineDisksSmallObjects(t *testing.T) {
 			}
 
 			partsMetadata, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", true)
-			_, err = getLatestFileInfo(ctx, partsMetadata, z.serverPools[0].sets[0].defaultParityCount, errs)
+			fi, err := getLatestFileInfo(ctx, partsMetadata, z.serverPools[0].sets[0].defaultParityCount, errs)
 			if err != nil {
 				t.Fatalf("Failed to getLatestFileInfo %v", err)
 			}
@@ -473,11 +482,6 @@ func TestListOnlineDisksSmallObjects(t *testing.T) {
 					break
 				}
 
-			}
-			partsMetadata, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", true)
-			fi, err := getLatestFileInfo(ctx, partsMetadata, z.serverPools[0].sets[0].defaultParityCount, errs)
-			if !errors.Is(err, errErasureReadQuorum) {
-				t.Fatalf("Failed to getLatestFileInfo, expected %v, got %v", errErasureReadQuorum, err)
 			}
 
 			rQuorum := len(errs) - z.serverPools[0].sets[0].defaultParityCount
@@ -616,7 +620,7 @@ func TestDisksWithAllParts(t *testing.T) {
 	diskFailures[15] = "part.1"
 
 	for diskIndex, partName := range diskFailures {
-		for i := range partsMetadata[diskIndex].Erasure.Checksums {
+		for i := range partsMetadata[diskIndex].Parts {
 			if fmt.Sprintf("part.%d", i+1) == partName {
 				filePath := pathJoin(erasureDisks[diskIndex].String(), bucket, object, partsMetadata[diskIndex].DataDir, partName)
 				f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_SYNC, 0)

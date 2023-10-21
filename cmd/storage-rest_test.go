@@ -26,7 +26,7 @@ import (
 	"testing"
 
 	"github.com/minio/mux"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v2/net"
 )
 
 // Storage REST server, storageRESTReceiver and StorageRESTClient are
@@ -39,7 +39,7 @@ func testStorageAPIDiskInfo(t *testing.T, storage StorageAPI) {
 	}
 
 	for i, testCase := range testCases {
-		_, err := storage.DiskInfo(context.Background())
+		_, err := storage.DiskInfo(context.Background(), true)
 		expectErr := (err != nil)
 
 		if expectErr != testCase.expectErr {

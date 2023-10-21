@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,7 +18,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -32,6 +31,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
+	"github.com/valyala/bytebufferpool"
 )
 
 // WalkDirOptions provides options for WalkDir operations.
@@ -69,15 +69,21 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 		return err
 	}
 
-	// Stat a volume entry.
-	if err = Access(volumeDir); err != nil {
-		if osIsNotExist(err) {
-			return errVolumeNotFound
-		} else if isSysErrIO(err) {
-			return errFaultyDisk
+	if !skipAccessChecks(opts.Bucket) {
+		// Stat a volume entry.
+		if err = Access(volumeDir); err != nil {
+			if osIsNotExist(err) {
+				return errVolumeNotFound
+			} else if isSysErrIO(err) {
+				return errFaultyDisk
+			}
+			return err
 		}
-		return err
 	}
+
+	s.RLock()
+	legacy := s.formatLegacy
+	s.RUnlock()
 
 	// Use a small block size to start sending quickly
 	w := newMetacacheWriter(wr, 16<<10)
@@ -98,6 +104,15 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 			objsReturned++
 		}
 	}
+	send := func(entry metaCacheEntry) error {
+		objReturned(entry.metadata)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out <- entry:
+		}
+		return nil
+	}
 
 	// Fast exit track to check if we are listing an object with
 	// a trailing slash, this will avoid to list the object content.
@@ -105,15 +120,17 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 		metadata, err := s.readMetadata(ctx, pathJoin(volumeDir,
 			opts.BaseDir[:len(opts.BaseDir)-1]+globalDirSuffix,
 			xlStorageFormatFile))
+		diskHealthCheckOK(ctx, err)
 		if err == nil {
 			// if baseDir is already a directory object, consider it
 			// as part of the list call, this is AWS S3 specific
 			// behavior.
-			out <- metaCacheEntry{
+			if err := send(metaCacheEntry{
 				name:     opts.BaseDir,
 				metadata: metadata,
+			}); err != nil {
+				return err
 			}
-			objReturned(metadata)
 		} else {
 			st, sterr := Lstat(pathJoin(volumeDir, opts.BaseDir, xlStorageFormatFile))
 			if sterr == nil && st.Mode().IsRegular() {
@@ -127,7 +144,12 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 
 	scanDir = func(current string) error {
 		// Skip forward, if requested...
-		var sb bytes.Buffer
+		sb := bytebufferpool.Get()
+		defer func() {
+			sb.Reset()
+			bytebufferpool.Put(sb)
+		}()
+
 		forward := ""
 		if len(opts.ForwardTo) > 0 && strings.HasPrefix(opts.ForwardTo, current) {
 			forward = strings.TrimPrefix(opts.ForwardTo, current)
@@ -143,19 +165,25 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 			return nil
 		}
 
-		s.walkMu.Lock()
+		if s.walkMu != nil {
+			s.walkMu.Lock()
+		}
 		entries, err := s.ListDir(ctx, opts.Bucket, current, -1)
-		s.walkMu.Unlock()
+		if s.walkMu != nil {
+			s.walkMu.Unlock()
+		}
 		if err != nil {
 			// Folder could have gone away in-between
 			if err != errVolumeNotFound && err != errFileNotFound {
 				logger.LogOnceIf(ctx, err, "metacache-walk-scan-dir")
 			}
 			if opts.ReportNotFound && err == errFileNotFound && current == opts.BaseDir {
-				return errFileNotFound
+				err = errFileNotFound
+			} else {
+				err = nil
 			}
-			// Forward some errors?
-			return nil
+			diskHealthCheckOK(ctx, err)
+			return err
 		}
 		diskHealthCheckOK(ctx, err)
 		if len(entries) == 0 {
@@ -202,9 +230,13 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 			// If root was an object return it as such.
 			if HasSuffix(entry, xlStorageFormatFile) {
 				var meta metaCacheEntry
-				s.walkReadMu.Lock()
-				meta.metadata, err = s.readMetadata(ctx, pathJoinBuf(&sb, volumeDir, current, entry))
-				s.walkReadMu.Unlock()
+				if s.walkReadMu != nil {
+					s.walkReadMu.Lock()
+				}
+				meta.metadata, err = s.readMetadata(ctx, pathJoinBuf(sb, volumeDir, current, entry))
+				if s.walkReadMu != nil {
+					s.walkReadMu.Unlock()
+				}
 				diskHealthCheckOK(ctx, err)
 				if err != nil {
 					// It is totally possible that xl.meta was overwritten
@@ -217,19 +249,15 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 				}
 				meta.name = strings.TrimSuffix(entry, xlStorageFormatFile)
 				meta.name = strings.TrimSuffix(meta.name, SlashSeparator)
-				meta.name = pathJoinBuf(&sb, current, meta.name)
+				meta.name = pathJoinBuf(sb, current, meta.name)
 				meta.name = decodeDirObject(meta.name)
 
-				objReturned(meta.metadata)
-				out <- meta
-				return nil
+				return send(meta)
 			}
 			// Check legacy.
-			if HasSuffix(entry, xlStorageFormatFileV1) {
+			if HasSuffix(entry, xlStorageFormatFileV1) && legacy {
 				var meta metaCacheEntry
-				s.walkReadMu.Lock()
-				meta.metadata, err = xioutil.ReadFile(pathJoinBuf(&sb, volumeDir, current, entry))
-				s.walkReadMu.Unlock()
+				meta.metadata, err = xioutil.ReadFile(pathJoinBuf(sb, volumeDir, current, entry))
 				diskHealthCheckOK(ctx, err)
 				if err != nil {
 					if !IsErrIgnored(err, io.EOF, io.ErrUnexpectedEOF) {
@@ -239,11 +267,9 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 				}
 				meta.name = strings.TrimSuffix(entry, xlStorageFormatFileV1)
 				meta.name = strings.TrimSuffix(meta.name, SlashSeparator)
-				meta.name = pathJoinBuf(&sb, current, meta.name)
-				objReturned(meta.metadata)
+				meta.name = pathJoinBuf(sb, current, meta.name)
 
-				out <- meta
-				return nil
+				return send(meta)
 			}
 			// Skip all other files.
 		}
@@ -272,7 +298,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 			if contextCanceled(ctx) {
 				return ctx.Err()
 			}
-			meta := metaCacheEntry{name: pathJoinBuf(&sb, current, entry)}
+			meta := metaCacheEntry{name: pathJoinBuf(sb, current, entry)}
 
 			// If directory entry on stack before this, pop it now.
 			for len(dirStack) > 0 && dirStack[len(dirStack)-1] < meta.name {
@@ -295,9 +321,13 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 				meta.name = meta.name[:len(meta.name)-1] + globalDirSuffixWithSlash
 			}
 
-			s.walkReadMu.Lock()
-			meta.metadata, err = s.readMetadata(ctx, pathJoinBuf(&sb, volumeDir, meta.name, xlStorageFormatFile))
-			s.walkReadMu.Unlock()
+			if s.walkReadMu != nil {
+				s.walkReadMu.Lock()
+			}
+			meta.metadata, err = s.readMetadata(ctx, pathJoinBuf(sb, volumeDir, meta.name, xlStorageFormatFile))
+			if s.walkReadMu != nil {
+				s.walkReadMu.Unlock()
+			}
 			diskHealthCheckOK(ctx, err)
 			switch {
 			case err == nil:
@@ -305,24 +335,26 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 				if isDirObj {
 					meta.name = strings.TrimSuffix(meta.name, globalDirSuffixWithSlash) + slashSeparator
 				}
-				objReturned(meta.metadata)
-
-				out <- meta
+				if err := send(meta); err != nil {
+					return err
+				}
 			case osIsNotExist(err), isSysErrIsDir(err):
-				meta.metadata, err = xioutil.ReadFile(pathJoinBuf(&sb, volumeDir, meta.name, xlStorageFormatFileV1))
-				diskHealthCheckOK(ctx, err)
-				if err == nil {
-					// It was an object
-					objReturned(meta.metadata)
-
-					out <- meta
-					continue
+				if legacy {
+					meta.metadata, err = xioutil.ReadFile(pathJoinBuf(sb, volumeDir, meta.name, xlStorageFormatFileV1))
+					diskHealthCheckOK(ctx, err)
+					if err == nil {
+						// It was an object
+						if err := send(meta); err != nil {
+							return err
+						}
+						continue
+					}
 				}
 
 				// NOT an object, append to stack (with slash)
 				// If dirObject, but no metadata (which is unexpected) we skip it.
 				if !isDirObj {
-					if !isDirEmpty(pathJoinBuf(&sb, volumeDir, meta.name)) {
+					if !isDirEmpty(pathJoinBuf(sb, volumeDir, meta.name)) {
 						dirStack = append(dirStack, meta.name+slashSeparator)
 					}
 				}

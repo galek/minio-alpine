@@ -30,9 +30,10 @@ import (
 	"github.com/minio/cli"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/console"
-	"github.com/minio/pkg/trie"
-	"github.com/minio/pkg/words"
+	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v2/trie"
+	"github.com/minio/pkg/v2/words"
 )
 
 // GlobalFlags - global flags for minio.
@@ -191,7 +192,7 @@ func Main(args []string) {
 	// Set the minio app name.
 	appName := filepath.Base(args[0])
 
-	if os.Getenv("_MINIO_DEBUG_NO_EXIT") != "" {
+	if env.Get("_MINIO_DEBUG_NO_EXIT", "") != "" {
 		freeze := func(_ int) {
 			// Infinite blocking op
 			<-make(chan struct{})

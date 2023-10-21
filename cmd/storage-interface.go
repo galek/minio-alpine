@@ -65,7 +65,7 @@ type StorageAPI interface {
 	// returns 'nil' once healing is complete or if the disk
 	// has never been replaced.
 	Healing() *healingTracker
-	DiskInfo(ctx context.Context) (info DiskInfo, err error)
+	DiskInfo(ctx context.Context, metrics bool) (info DiskInfo, err error)
 	NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode) (dataUsageCache, error)
 
 	// Volume operations.
@@ -82,7 +82,7 @@ type StorageAPI interface {
 	DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error
 	DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions) []error
 	WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error
-	UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo) error
+	UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo, opts UpdateMetadataOpts) error
 	ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (FileInfo, error)
 	ReadXL(ctx context.Context, volume, path string, readData bool) (RawFileInfo, error)
 	RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) (uint64, error)
@@ -169,7 +169,7 @@ func (p *unrecognizedDisk) GetDiskID() (string, error) {
 func (p *unrecognizedDisk) SetDiskID(id string) {
 }
 
-func (p *unrecognizedDisk) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
+func (p *unrecognizedDisk) DiskInfo(ctx context.Context, _ bool) (info DiskInfo, err error) {
 	return info, errDiskNotFound
 }
 
@@ -252,7 +252,7 @@ func (p *unrecognizedDisk) DeleteVersion(ctx context.Context, volume, path strin
 	return errDiskNotFound
 }
 
-func (p *unrecognizedDisk) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo) (err error) {
+func (p *unrecognizedDisk) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo, opts UpdateMetadataOpts) (err error) {
 	return errDiskNotFound
 }
 

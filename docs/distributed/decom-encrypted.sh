@@ -19,7 +19,7 @@ export MINIO_KMS_SECRET_KEY=my-minio-key:OSMM+vkKUTCvQs9YL/CVMIMt43HFhkUpqJxTmGl
 (minio server /tmp/xl/{1...10}/disk{0...1} 2>&1 >/dev/null) &
 pid=$!
 
-sleep 2
+sleep 10
 
 export MC_HOST_myminio="http://minioadmin:minioadmin@localhost:9000/"
 
@@ -30,7 +30,7 @@ export MC_HOST_myminio="http://minioadmin:minioadmin@localhost:9000/"
 ./mc admin policy create myminio/ lake ./docs/distributed/rw.json
 
 ./mc admin policy attach myminio/ rw --user=minio123
-./mc admin policy attach myminio/ lake,rw --user=minio12345
+./mc admin policy attach myminio/ lake --user=minio12345
 
 ./mc mb -l myminio/versioned
 
@@ -51,7 +51,7 @@ kill $pid
 (minio server /tmp/xl/{1...10}/disk{0...1} /tmp/xl/{11...30}/disk{0...3} 2>&1 >/tmp/expanded.log) &
 pid=$!
 
-sleep 2
+sleep 10
 
 expanded_user_count=$(./mc admin user list myminio/ | wc -l)
 expanded_policy_count=$(./mc admin policy list myminio/ | wc -l)
@@ -90,7 +90,7 @@ kill $pid
 (minio server /tmp/xl/{11...30}/disk{0...3} 2>&1 >/dev/null) &
 pid=$!
 
-sleep 2
+sleep 10
 
 decom_user_count=$(./mc admin user list myminio/ | wc -l)
 decom_policy_count=$(./mc admin policy list myminio/ | wc -l)

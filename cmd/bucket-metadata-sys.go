@@ -21,7 +21,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"sync"
 	"time"
 
@@ -36,8 +35,8 @@ import (
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
-	"github.com/minio/pkg/sync/errgroup"
+	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v2/sync/errgroup"
 )
 
 // BucketMetadataSys captures all bucket metadata for a given cluster.
@@ -152,14 +151,27 @@ func (sys *BucketMetadataSys) updateAndParse(ctx context.Context, bucket string,
 		return updatedAt, fmt.Errorf("Unknown bucket %s metadata update requested %s", bucket, configFile)
 	}
 
-	if err := meta.Save(ctx, objAPI); err != nil {
-		return updatedAt, err
+	err = sys.save(ctx, meta)
+	return updatedAt, err
+}
+
+func (sys *BucketMetadataSys) save(ctx context.Context, meta BucketMetadata) error {
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		return errServerNotInitialized
 	}
 
-	sys.Set(bucket, meta)
-	globalNotificationSys.LoadBucketMetadata(bgContext(ctx), bucket) // Do not use caller context here
+	if isMinioMetaBucketName(meta.Name) {
+		return errInvalidArgument
+	}
 
-	return updatedAt, nil
+	if err := meta.Save(ctx, objAPI); err != nil {
+		return err
+	}
+
+	sys.Set(meta.Name, meta)
+	globalNotificationSys.LoadBucketMetadata(bgContext(ctx), meta.Name) // Do not use caller context here
+	return nil
 }
 
 // Delete delete the bucket metadata for the specified bucket.
@@ -298,7 +310,7 @@ func (sys *BucketMetadataSys) CreatedAt(bucket string) (time.Time, error) {
 
 // GetPolicyConfig returns configured bucket policy
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetPolicyConfig(bucket string) (*policy.Policy, time.Time, error) {
+func (sys *BucketMetadataSys) GetPolicyConfig(bucket string) (*policy.BucketPolicy, time.Time, error) {
 	meta, _, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
@@ -489,6 +501,8 @@ func (sys *BucketMetadataSys) concurrentLoad(ctx context.Context, buckets []Buck
 func (sys *BucketMetadataSys) refreshBucketsMetadataLoop(ctx context.Context) {
 	const bucketMetadataRefresh = 15 * time.Minute
 
+	sleeper := newDynamicSleeper(2, 150*time.Millisecond, false)
+
 	t := time.NewTimer(bucketMetadataRefresh)
 	defer t.Stop()
 	for {
@@ -512,13 +526,16 @@ func (sys *BucketMetadataSys) refreshBucketsMetadataLoop(ctx context.Context) {
 			sys.RemoveStaleBuckets(diskBuckets)
 
 			for _, bucket := range buckets {
+				wait := sleeper.Timer(ctx)
+
 				err := sys.loadBucketMetadata(ctx, bucket)
 				if err != nil {
 					logger.LogIf(ctx, err)
+					wait() // wait to proceed to next entry.
 					continue
 				}
-				// Check if there is a spare procs, wait 100ms instead
-				waitForLowIO(runtime.GOMAXPROCS(0), 100*time.Millisecond, currentHTTPIO)
+
+				wait() // wait to proceed to next entry.
 			}
 
 			t.Reset(bucketMetadataRefresh)

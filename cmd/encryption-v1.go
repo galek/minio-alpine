@@ -478,10 +478,7 @@ func EncryptRequest(content io.Reader, r *http.Request, bucket, object string, m
 func decryptObjectMeta(key []byte, bucket, object string, metadata map[string]string) ([]byte, error) {
 	switch kind, _ := crypto.IsEncrypted(metadata); kind {
 	case crypto.S3:
-		var KMS kms.KMS = GlobalKMS
-		if isCacheEncrypted(metadata) {
-			KMS = globalCacheKMS
-		}
+		KMS := GlobalKMS
 		if KMS == nil {
 			return nil, errKMSNotConfigured
 		}
@@ -728,7 +725,7 @@ func (d *DecryptBlocksReader) Read(p []byte) (int, error) {
 // DecryptedSize returns the size of the object after decryption in bytes.
 // It returns an error if the object is not encrypted or marked as encrypted
 // but has an invalid size.
-func (o *ObjectInfo) DecryptedSize() (int64, error) {
+func (o ObjectInfo) DecryptedSize() (int64, error) {
 	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
 		return 0, errors.New("Cannot compute decrypted size of an unencrypted object")
 	}

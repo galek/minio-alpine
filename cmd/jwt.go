@@ -28,7 +28,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v2/policy"
 )
 
 const (
@@ -46,6 +46,8 @@ var (
 	errAccessKeyDisabled  = errors.New("The access key you provided is disabled")
 	errAuthentication     = errors.New("Authentication failed, check your access credentials")
 	errNoAuthToken        = errors.New("JWT token missing")
+	errSkewedAuthTime     = errors.New("Skewed authenticationdate/time")
+	errMalformedAuth      = errors.New("Malformed authentication input")
 )
 
 // cachedAuthenticateNode will cache authenticateNode results for given values up to ttl.
@@ -146,7 +148,7 @@ func metricsRequestAuthenticate(req *http.Request) (*xjwt.MapClaims, []string, b
 		}
 
 		// Now check if we have a sessionPolicy.
-		if _, ok = eclaims[iampolicy.SessionPolicyName]; ok {
+		if _, ok = eclaims[policy.SessionPolicyName]; ok {
 			owner = false
 		} else {
 			owner = globalActiveCred.AccessKey == ucred.ParentUser

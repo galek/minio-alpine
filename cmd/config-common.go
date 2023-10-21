@@ -61,7 +61,8 @@ type objectDeleter interface {
 
 func deleteConfig(ctx context.Context, objAPI objectDeleter, configFile string) error {
 	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, configFile, ObjectOptions{
-		DeletePrefix: true,
+		DeletePrefix:       true,
+		DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
 	})
 	if err != nil && isErrObjectNotFound(err) {
 		return errConfigNotFound
@@ -70,7 +71,7 @@ func deleteConfig(ctx context.Context, objAPI objectDeleter, configFile string) 
 }
 
 func saveConfigWithOpts(ctx context.Context, store objectIO, configFile string, data []byte, opts ObjectOptions) error {
-	hashReader, err := hash.NewReader(bytes.NewReader(data), int64(len(data)), "", getSHA256Hash(data), int64(len(data)))
+	hashReader, err := hash.NewReader(ctx, bytes.NewReader(data), int64(len(data)), "", getSHA256Hash(data), int64(len(data)))
 	if err != nil {
 		return err
 	}

@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,7 +32,7 @@ import (
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/sync/errgroup"
+	"github.com/minio/pkg/v2/sync/errgroup"
 	"github.com/minio/sio"
 )
 
@@ -41,17 +40,6 @@ import (
 const minIOErasureUpgraded = "x-minio-internal-erasure-upgraded"
 
 const erasureAlgorithm = "rs-vandermonde"
-
-// AddChecksumInfo adds a checksum of a part.
-func (e *ErasureInfo) AddChecksumInfo(ckSumInfo ChecksumInfo) {
-	for i, sum := range e.Checksums {
-		if sum.PartNumber == ckSumInfo.PartNumber {
-			e.Checksums[i] = ckSumInfo
-			return
-		}
-	}
-	e.Checksums = append(e.Checksums, ckSumInfo)
-}
 
 // GetChecksumInfo - get checksum of a part.
 func (e ErasureInfo) GetChecksumInfo(partNumber int) (ckSum ChecksumInfo) {
@@ -61,7 +49,7 @@ func (e ErasureInfo) GetChecksumInfo(partNumber int) (ckSum ChecksumInfo) {
 			return sum
 		}
 	}
-	return ChecksumInfo{}
+	return ChecksumInfo{Algorithm: DefaultBitrotAlgorithm}
 }
 
 // ShardFileSize - returns final erasure size from original size.
@@ -350,8 +338,11 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 			for _, part := range meta.Parts {
 				fmt.Fprintf(h, "part.%d", part.Number)
 			}
-			fmt.Fprintf(h, "%v+%v", meta.Erasure.DataBlocks, meta.Erasure.ParityBlocks)
-			fmt.Fprintf(h, "%v", meta.Erasure.Distribution)
+
+			if !meta.Deleted && meta.Size != 0 {
+				fmt.Fprintf(h, "%v+%v", meta.Erasure.DataBlocks, meta.Erasure.ParityBlocks)
+				fmt.Fprintf(h, "%v", meta.Erasure.Distribution)
+			}
 
 			// ILM transition fields
 			fmt.Fprint(h, meta.TransitionStatus)
@@ -362,8 +353,6 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 			// Server-side replication fields
 			fmt.Fprintf(h, "%v", meta.MarkDeleted)
 			fmt.Fprint(h, meta.Metadata[string(meta.ReplicationState.ReplicaStatus)])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.ReplicationTimeStamp.Format(http.TimeFormat)])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.ReplicaTimeStamp.Format(http.TimeFormat)])
 			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.ReplicationStatusInternal])
 			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.VersionPurgeStatusInternal])
 
@@ -393,14 +382,39 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 		return FileInfo{}, errErasureReadQuorum
 	}
 
+	// Find the successor mod time in quorum, otherwise leave the
+	// candidate's successor modTime as found
+	succModTimeMap := make(map[time.Time]int)
+	var candidate FileInfo
+	var found bool
 	for i, hash := range metaHashes {
 		if hash == maxHash {
 			if metaArr[i].IsValid() {
-				return metaArr[i], nil
+				if !found {
+					candidate = metaArr[i]
+					found = true
+				}
+				succModTimeMap[metaArr[i].SuccessorModTime]++
 			}
 		}
 	}
+	var succModTime time.Time
+	var smodTimeQuorum bool
+	for smodTime, count := range succModTimeMap {
+		if count >= quorum {
+			smodTimeQuorum = true
+			succModTime = smodTime
+			break
+		}
+	}
 
+	if found {
+		if smodTimeQuorum {
+			candidate.SuccessorModTime = succModTime
+			candidate.IsLatest = succModTime.IsZero()
+		}
+		return candidate, nil
+	}
 	return FileInfo{}, errErasureReadQuorum
 }
 
@@ -499,7 +513,8 @@ func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int)
 			parities[index] = -1
 			continue
 		}
-		if metadata.Deleted {
+		// Delete marker or zero byte objects take highest parity.
+		if metadata.Deleted || metadata.Size == 0 {
 			parities[index] = len(partsMetadata) / 2
 		} else {
 			parities[index] = metadata.Erasure.ParityBlocks

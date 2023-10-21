@@ -20,7 +20,9 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -58,9 +60,8 @@ import (
 	"github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
-	iampolicy "github.com/minio/pkg/iam/policy"
-	"github.com/minio/pkg/sync/errgroup"
+	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v2/sync/errgroup"
 )
 
 const (
@@ -365,10 +366,10 @@ func (api objectAPIHandlers) ListBucketsHandler(w http.ResponseWriter, r *http.R
 		// Use the following trick to filter in place
 		// https://github.com/golang/go/wiki/SliceTricks#filter-in-place
 		for _, bucketInfo := range bucketsInfo {
-			if globalIAMSys.IsAllowed(iampolicy.Args{
+			if globalIAMSys.IsAllowed(policy.Args{
 				AccountName:     cred.AccessKey,
 				Groups:          cred.Groups,
-				Action:          iampolicy.ListBucketAction,
+				Action:          policy.ListBucketAction,
 				BucketName:      bucketInfo.Name,
 				ConditionValues: getConditionValues(r, "", cred),
 				IsOwner:         owner,
@@ -377,10 +378,10 @@ func (api objectAPIHandlers) ListBucketsHandler(w http.ResponseWriter, r *http.R
 			}) {
 				bucketsInfo[n] = bucketInfo
 				n++
-			} else if globalIAMSys.IsAllowed(iampolicy.Args{
+			} else if globalIAMSys.IsAllowed(policy.Args{
 				AccountName:     cred.AccessKey,
 				Groups:          cred.Groups,
-				Action:          iampolicy.GetBucketLocationAction,
+				Action:          policy.GetBucketLocationAction,
 				BucketName:      bucketInfo.Name,
 				ConditionValues: getConditionValues(r, "", cred),
 				IsOwner:         owner,
@@ -473,9 +474,6 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	}
 
 	deleteObjectsFn := objectAPI.DeleteObjects
-	if api.CacheAPI() != nil {
-		deleteObjectsFn = api.CacheAPI().DeleteObjects
-	}
 
 	// Return Malformed XML as S3 spec if the number of objects is empty
 	if len(deleteObjectsReq.Objects) == 0 || len(deleteObjectsReq.Objects) > maxDeleteList {
@@ -485,9 +483,6 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 
 	objectsToDelete := map[ObjectToDelete]int{}
 	getObjectInfoFn := objectAPI.GetObjectInfo
-	if api.CacheAPI() != nil {
-		getObjectInfoFn = api.CacheAPI().GetObjectInfo
-	}
 
 	var (
 		hasLockEnabled bool
@@ -578,8 +573,8 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			}
 		}
 		if object.VersionID != "" && hasLockEnabled {
-			if apiErrCode := enforceRetentionBypassForDelete(ctx, r, bucket, object, goi, gerr); apiErrCode != ErrNone {
-				apiErr := errorCodes.ToAPIErr(apiErrCode)
+			if err := enforceRetentionBypassForDelete(ctx, r, bucket, object, goi, gerr); err != nil {
+				apiErr := toAPIError(ctx, err)
 				deleteResults[index].errInfo = DeleteError{
 					Code:      apiErr.Code,
 					Message:   apiErr.Description,
@@ -715,7 +710,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		if os == nil { // skip objects that weren't deleted due to invalid versionID etc.
 			continue
 		}
-		logger.LogIf(ctx, os.Sweep())
+		os.Sweep()
 	}
 }
 
@@ -768,8 +763,8 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 
 	if objectLockEnabled {
 		// Creating a bucket with locking requires the user having more permissions
-		for _, action := range []iampolicy.Action{iampolicy.PutBucketObjectLockConfigurationAction, iampolicy.PutBucketVersioningAction} {
-			if !globalIAMSys.IsAllowed(iampolicy.Args{
+		for _, action := range []policy.Action{policy.PutBucketObjectLockConfigurationAction, policy.PutBucketVersioningAction} {
+			if !globalIAMSys.IsAllowed(policy.Args{
 				AccountName:     cred.AccessKey,
 				Groups:          cred.Groups,
 				Action:          action,
@@ -793,7 +788,7 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 
 	// check if client is attempting to create more buckets, complain about it.
 	if currBuckets := globalBucketMetadataSys.Count(); currBuckets+1 > maxBuckets {
-		logger.LogIf(ctx, fmt.Errorf("An attempt to create %d buckets beyond recommended %d", currBuckets+1, maxBuckets))
+		logger.LogIf(ctx, fmt.Errorf("Please avoid creating more buckets %d beyond recommended %d", currBuckets+1, maxBuckets))
 	}
 
 	opts := MakeBucketOptions{
@@ -1044,11 +1039,14 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		break
 	}
 
-	if _, ok := formValues["Key"]; !ok {
+	if keyName, ok := formValues["Key"]; !ok {
 		apiErr := errorCodes.ToAPIErr(ErrMalformedPOSTRequest)
 		apiErr.Description = fmt.Sprintf("%s (%v)", apiErr.Description, errors.New("The name of the uploaded key is missing"))
 		writeErrorResponse(ctx, w, apiErr, r.URL)
 		return
+	} else if fileName == "" && len(keyName) >= 1 {
+		// if we can't get fileName. We use keyName[0] to fileName
+		fileName = keyName[0]
 	}
 
 	if fileName == "" {
@@ -1101,10 +1099,10 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 	if len(fanOutEntries) > 0 {
 		// Once signature is validated, check if the user has
 		// explicit permissions for the user.
-		if !globalIAMSys.IsAllowed(iampolicy.Args{
+		if !globalIAMSys.IsAllowed(policy.Args{
 			AccountName:     cred.AccessKey,
 			Groups:          cred.Groups,
-			Action:          iampolicy.PutObjectFanOutAction,
+			Action:          policy.PutObjectFanOutAction,
 			ConditionValues: getConditionValues(r, "", cred),
 			BucketName:      bucket,
 			ObjectName:      object,
@@ -1117,10 +1115,10 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 	} else {
 		// Once signature is validated, check if the user has
 		// explicit permissions for the user.
-		if !globalIAMSys.IsAllowed(iampolicy.Args{
+		if !globalIAMSys.IsAllowed(policy.Args{
 			AccountName:     cred.AccessKey,
 			Groups:          cred.Groups,
-			Action:          iampolicy.PutObjectAction,
+			Action:          policy.PutObjectAction,
 			ConditionValues: getConditionValues(r, "", cred),
 			BucketName:      bucket,
 			ObjectName:      object,
@@ -1138,9 +1136,8 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	hashReader, err := hash.NewReader(reader, fileSize, "", "", fileSize)
+	hashReader, err := hash.NewReader(ctx, reader, fileSize, "", "", fileSize)
 	if err != nil {
-		logger.LogIf(ctx, err)
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -1253,7 +1250,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 				return
 			}
 			// do not try to verify encrypted content/
-			hashReader, err = hash.NewReader(reader, -1, "", "", -1)
+			hashReader, err = hash.NewReader(ctx, reader, -1, "", "", -1)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
@@ -1288,16 +1285,24 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		// instead of "copying" from source, we need the stream to be seekable
 		// to ensure that we can make fan-out calls concurrently.
 		buf := bytebufferpool.Get()
-		defer bytebufferpool.Put(buf)
+		defer func() {
+			buf.Reset()
+			bytebufferpool.Put(buf)
+		}()
+
+		md5w := md5.New()
 
 		// Maximum allowed fan-out object size.
 		const maxFanOutSize = 16 << 20
 
-		n, err := io.Copy(buf, ioutil.HardLimitReader(pReader, maxFanOutSize))
+		n, err := io.Copy(io.MultiWriter(buf, md5w), ioutil.HardLimitReader(pReader, maxFanOutSize))
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
+
+		// Set the correct hex md5sum for the fan-out stream.
+		fanOutOpts.MD5Hex = hex.EncodeToString(md5w.Sum(nil))
 
 		concurrentSize := 100
 		if runtime.GOMAXPROCS(0) < concurrentSize {
@@ -1491,7 +1496,7 @@ func (api objectAPIHandlers) GetBucketPolicyStatusHandler(w http.ResponseWriter,
 	}
 
 	// Check if anonymous (non-owner) has access to list objects.
-	readable := globalPolicySys.IsAllowed(policy.Args{
+	readable := globalPolicySys.IsAllowed(policy.BucketPolicyArgs{
 		Action:          policy.ListBucketAction,
 		BucketName:      bucket,
 		ConditionValues: getConditionValues(r, "", auth.AnonymousCredentials),
@@ -1499,7 +1504,7 @@ func (api objectAPIHandlers) GetBucketPolicyStatusHandler(w http.ResponseWriter,
 	})
 
 	// Check if anonymous (non-owner) has access to upload objects.
-	writable := globalPolicySys.IsAllowed(policy.Args{
+	writable := globalPolicySys.IsAllowed(policy.BucketPolicyArgs{
 		Action:          policy.PutObjectAction,
 		BucketName:      bucket,
 		ConditionValues: getConditionValues(r, "", auth.AnonymousCredentials),
@@ -1614,10 +1619,14 @@ func (api objectAPIHandlers) DeleteBucketHandler(w http.ResponseWriter, r *http.
 		}
 	}
 
-	deleteBucket := objectAPI.DeleteBucket
+	// Return an error if the bucket does not exist
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil && !forceDelete {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
 
 	// Attempt to delete bucket.
-	if err := deleteBucket(ctx, bucket, DeleteBucketOptions{
+	if err := objectAPI.DeleteBucket(ctx, bucket, DeleteBucketOptions{
 		Force:      forceDelete,
 		SRDeleteOp: getSRBucketDeleteOp(globalSiteReplicationSys.isEnabled()),
 	}); err != nil {

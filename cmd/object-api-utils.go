@@ -47,8 +47,9 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/trie"
-	"github.com/minio/pkg/wildcard"
+	"github.com/minio/pkg/v2/trie"
+	"github.com/minio/pkg/v2/wildcard"
+	"github.com/valyala/bytebufferpool"
 	"golang.org/x/exp/slices"
 )
 
@@ -233,25 +234,25 @@ func pathsJoinPrefix(prefix string, elem ...string) (paths []string) {
 
 // pathJoin - like path.Join() but retains trailing SlashSeparator of the last element
 func pathJoin(elem ...string) string {
-	trailingSlash := ""
-	if len(elem) > 0 {
-		if hasSuffixByte(elem[len(elem)-1], SlashSeparatorChar) {
-			trailingSlash = SlashSeparator
-		}
-	}
-	return path.Join(elem...) + trailingSlash
+	sb := bytebufferpool.Get()
+	defer func() {
+		sb.Reset()
+		bytebufferpool.Put(sb)
+	}()
+
+	return pathJoinBuf(sb, elem...)
 }
 
 // pathJoinBuf - like path.Join() but retains trailing SlashSeparator of the last element.
 // Provide a string builder to reduce allocation.
-func pathJoinBuf(dst *bytes.Buffer, elem ...string) string {
+func pathJoinBuf(dst *bytebufferpool.ByteBuffer, elem ...string) string {
 	trailingSlash := len(elem) > 0 && hasSuffixByte(elem[len(elem)-1], SlashSeparatorChar)
 	dst.Reset()
 	added := 0
 	for _, e := range elem {
 		if added > 0 || e != "" {
 			if added > 0 {
-				dst.WriteRune(SlashSeparatorChar)
+				dst.WriteByte(SlashSeparatorChar)
 			}
 			dst.WriteString(e)
 			added += len(e)
@@ -266,7 +267,7 @@ func pathJoinBuf(dst *bytes.Buffer, elem ...string) string {
 		return s
 	}
 	if trailingSlash {
-		dst.WriteRune(SlashSeparatorChar)
+		dst.WriteByte(SlashSeparatorChar)
 	}
 	return dst.String()
 }
@@ -341,6 +342,15 @@ func mustGetUUID() string {
 	return u.String()
 }
 
+// mustGetUUIDBytes - get a random UUID as 16 bytes unencoded.
+func mustGetUUIDBytes() []byte {
+	u, err := uuid.NewRandom()
+	if err != nil {
+		logger.CriticalIf(GlobalContext, err)
+	}
+	return u[:]
+}
+
 // Create an s3 compatible MD5sum for complete multipart transaction.
 func getCompleteMultipartMD5(parts []CompletePart) string {
 	var finalMD5Bytes []byte
@@ -402,7 +412,7 @@ func extractETag(metadata map[string]string) string {
 // to do case insensitive checks.
 func HasPrefix(s string, prefix string) bool {
 	if runtime.GOOS == globalWindowsOSName {
-		return strings.HasPrefix(strings.ToLower(s), strings.ToLower(prefix))
+		return stringsHasPrefixFold(s, prefix)
 	}
 	return strings.HasPrefix(s, prefix)
 }
@@ -506,7 +516,10 @@ func (o *ObjectInfo) IsCompressedOK() (bool, error) {
 }
 
 // GetActualSize - returns the actual size of the stored object
-func (o *ObjectInfo) GetActualSize() (int64, error) {
+func (o ObjectInfo) GetActualSize() (int64, error) {
+	if o.ActualSize != nil {
+		return *o.ActualSize, nil
+	}
 	if o.IsCompressed() {
 		sizeStr, ok := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
 		if !ok {
@@ -1146,7 +1159,7 @@ func getDiskInfos(ctx context.Context, disks ...StorageAPI) []*DiskInfo {
 		if disk == nil {
 			continue
 		}
-		if di, err := disk.DiskInfo(ctx); err == nil {
+		if di, err := disk.DiskInfo(ctx, false); err == nil {
 			res[i] = &di
 		}
 	}
@@ -1166,7 +1179,7 @@ func hasSpaceFor(di []*DiskInfo, size int64) (bool, error) {
 	var total uint64
 	var nDisks int
 	for _, disk := range di {
-		if disk == nil || disk.Total == 0 || (disk.FreeInodes < diskMinInodes && disk.UsedInodes > 0) {
+		if disk == nil || disk.Total == 0 {
 			// Disk offline, no inodes or something else is wrong.
 			continue
 		}
@@ -1175,15 +1188,19 @@ func hasSpaceFor(di []*DiskInfo, size int64) (bool, error) {
 		available += disk.Total - disk.Used
 	}
 
-	if nDisks < len(di)/2 {
+	if nDisks < len(di)/2 || nDisks <= 0 {
 		return false, fmt.Errorf("not enough online disks to calculate the available space, expected (%d)/(%d)", (len(di)/2)+1, nDisks)
 	}
 
 	// Check we have enough on each disk, ignoring diskFillFraction.
 	perDisk := size / int64(nDisks)
 	for _, disk := range di {
-		if disk == nil || disk.Total == 0 || (disk.FreeInodes < diskMinInodes && disk.UsedInodes > 0) {
+		if disk == nil || disk.Total == 0 {
 			continue
+		}
+		if disk.FreeInodes < diskMinInodes && disk.UsedInodes > 0 {
+			// We have an inode count, but not enough inodes.
+			return false, nil
 		}
 		if int64(disk.Free) <= perDisk {
 			return false, nil

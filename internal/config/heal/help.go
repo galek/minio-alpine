@@ -29,7 +29,7 @@ var (
 	Help = config.HelpKVS{
 		config.HelpKV{
 			Key:         Bitrot,
-			Description: `perform bitrot scan on disks when checking objects during scanner` + defaultHelpPostfix(Bitrot),
+			Description: `perform bitrot scan on drives when checking objects during scanner` + defaultHelpPostfix(Bitrot),
 			Optional:    true,
 			Type:        "on|off",
 		},
@@ -42,6 +42,12 @@ var (
 		config.HelpKV{
 			Key:         IOCount,
 			Description: `maximum IO requests allowed between objects to slow down heal operation` + defaultHelpPostfix(IOCount),
+			Optional:    true,
+			Type:        "int",
+		},
+		config.HelpKV{
+			Key:         DriveWorkers,
+			Description: `the number of workers per drive to heal a new disk replacement` + defaultHelpPostfix(DriveWorkers),
 			Optional:    true,
 			Type:        "int",
 		},

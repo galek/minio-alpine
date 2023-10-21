@@ -19,8 +19,6 @@ package cmd
 
 import (
 	"bufio"
-	"context"
-	"encoding/xml"
 	"io"
 	"net/http"
 	"net/url"
@@ -48,8 +46,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/bucket/policy"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v2/policy"
 	"github.com/minio/sio"
 )
 
@@ -147,13 +144,10 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		metadata[xhttp.AmzObjectTagging] = objTags
 	}
 
-	retPerms := isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, iampolicy.PutObjectRetentionAction)
-	holdPerms := isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, iampolicy.PutObjectLegalHoldAction)
+	retPerms := isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.PutObjectRetentionAction)
+	holdPerms := isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.PutObjectLegalHoldAction)
 
 	getObjectInfo := objectAPI.GetObjectInfo
-	if api.CacheAPI() != nil {
-		getObjectInfo = api.CacheAPI().GetObjectInfo
-	}
 
 	retentionMode, retentionDate, legalHold, s3Err := checkPutObjectLockAllowed(ctx, r, bucket, object, getObjectInfo, retPerms, holdPerms)
 	if s3Err == ErrNone && retentionMode.Valid() {
@@ -167,9 +161,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return
 	}
-	if dsc := mustReplicate(ctx, bucket, object, getMustReplicateOptions(ObjectInfo{
-		UserDefined: metadata,
-	}, replication.ObjectReplicationType, ObjectOptions{})); dsc.ReplicateAny() {
+	if dsc := mustReplicate(ctx, bucket, object, getMustReplicateOptions(metadata, "", "", replication.ObjectReplicationType, ObjectOptions{})); dsc.ReplicateAny() {
 		metadata[ReservedMetadataPrefixLower+ReplicationTimestamp] = UTCNow().Format(time.RFC3339Nano)
 		metadata[ReservedMetadataPrefixLower+ReplicationStatus] = dsc.PendingStatus()
 	}
@@ -194,7 +186,9 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	if !opts.MTime.IsZero() && opts.PreserveETag != "" {
+	if opts.PreserveETag != "" ||
+		r.Header.Get(xhttp.IfMatch) != "" ||
+		r.Header.Get(xhttp.IfNoneMatch) != "" {
 		opts.CheckPrecondFn = func(oi ObjectInfo) bool {
 			if _, err := DecryptObjectInfo(&oi, r); err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -213,9 +207,6 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 	}
 
 	newMultipartUpload := objectAPI.NewMultipartUpload
-	if api.CacheAPI() != nil {
-		newMultipartUpload = api.CacheAPI().NewMultipartUpload
-	}
 
 	res, err := newMultipartUpload(ctx, bucket, object, opts)
 	if err != nil {
@@ -332,9 +323,6 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 	}
 
 	getObjectNInfo := objectAPI.GetObjectNInfo
-	if api.CacheAPI() != nil {
-		getObjectNInfo = api.CacheAPI().GetObjectNInfo
-	}
 
 	// Get request range.
 	var rs *HTTPRangeSpec
@@ -359,7 +347,6 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 			return true
 		}
 		if parseRangeErr != nil {
-			logger.LogIf(ctx, parseRangeErr)
 			writeCopyPartErr(ctx, w, parseRangeErr, r.URL)
 			// Range header mismatch is pre-condition like failure
 			// so return true to indicate Range precondition failed.
@@ -451,7 +438,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 	}
 
 	actualPartSize = length
-	var reader io.Reader = etag.NewReader(gr, nil)
+	var reader io.Reader = etag.NewReader(ctx, gr, nil, nil)
 
 	mi, err := objectAPI.GetMultipartInfo(ctx, dstBucket, dstObject, uploadID, dstOpts)
 	if err != nil {
@@ -474,7 +461,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		length = -1
 	}
 
-	srcInfo.Reader, err = hash.NewReader(reader, length, "", "", actualPartSize)
+	srcInfo.Reader, err = hash.NewReader(ctx, reader, length, "", "", actualPartSize)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -529,7 +516,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 			wantSize = info.EncryptedSize()
 		}
 
-		srcInfo.Reader, err = hash.NewReader(reader, wantSize, "", "", actualPartSize)
+		srcInfo.Reader, err = hash.NewReader(ctx, reader, wantSize, "", "", actualPartSize)
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -546,9 +533,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 
 	srcInfo.PutObjReader = pReader
 	copyObjectPart := objectAPI.CopyObjectPart
-	if api.CacheAPI() != nil {
-		copyObjectPart = api.CacheAPI().CopyObjectPart
-	}
+
 	// Copy source object to destination, if source and destination
 	// object is same then only metadata is updated.
 	partInfo, err := copyObjectPart(ctx, srcBucket, srcObject, dstBucket, dstObject, uploadID, partID,
@@ -655,7 +640,7 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		reader    io.Reader = r.Body
 		s3Error   APIErrorCode
 	)
-	if s3Error = isPutActionAllowed(ctx, rAuthType, bucket, object, r, iampolicy.PutObjectAction); s3Error != ErrNone {
+	if s3Error = isPutActionAllowed(ctx, rAuthType, bucket, object, r, policy.PutObjectAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -718,7 +703,7 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 	_, isCompressed := mi.UserDefined[ReservedMetadataPrefix+"compression"]
 	var idxCb func() []byte
 	if isCompressed {
-		actualReader, err := hash.NewReader(reader, size, md5hex, sha256hex, actualSize)
+		actualReader, err := hash.NewReader(ctx, reader, size, md5hex, sha256hex, actualSize)
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -739,7 +724,7 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		sha256hex = ""
 	}
 
-	hashReader, err := hash.NewReader(reader, size, md5hex, sha256hex, actualSize)
+	hashReader, err := hash.NewReader(ctx, reader, size, md5hex, sha256hex, actualSize)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -801,7 +786,7 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 			wantSize = info.EncryptedSize()
 		}
 		// do not try to verify encrypted content
-		hashReader, err = hash.NewReader(etag.Wrap(reader, hashReader), wantSize, "", "", actualSize)
+		hashReader, err = hash.NewReader(ctx, etag.Wrap(reader, hashReader), wantSize, "", "", actualSize)
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -825,9 +810,6 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 	opts.IndexCB = idxCb
 
 	putObjectPart := objectAPI.PutObjectPart
-	if api.CacheAPI() != nil {
-		putObjectPart = api.CacheAPI().PutObjectPart
-	}
 
 	partInfo, err := putObjectPart(ctx, bucket, object, uploadID, partID, pReader, opts)
 	if err != nil {
@@ -938,27 +920,6 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 	}
 
 	completeMultiPartUpload := objectAPI.CompleteMultipartUpload
-	if api.CacheAPI() != nil {
-		completeMultiPartUpload = api.CacheAPI().CompleteMultipartUpload
-	}
-	// This code is specifically to handle the requirements for slow
-	// complete multipart upload operations on FS mode.
-	writeErrorResponseWithoutXMLHeader := func(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
-		switch err.Code {
-		case "SlowDown", "XMinioServerNotInitialized", "XMinioReadQuorum", "XMinioWriteQuorum":
-			// Set retxry-after header to indicate user-agents to retry request after 120secs.
-			// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
-			w.Header().Set(xhttp.RetryAfter, "120")
-		}
-
-		// Generate error response.
-		errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path,
-			w.Header().Get(xhttp.AmzRequestID), globalDeploymentID)
-		encodedErrorResponse, _ := xml.Marshal(errorResponse)
-		setCommonHeaders(w)
-		w.Header().Set(xhttp.ContentType, string(mimeXML))
-		w.Write(encodedErrorResponse)
-	}
 
 	versioned := globalBucketVersioningSys.PrefixEnabled(bucket, object)
 	suspended := globalBucketVersioningSys.PrefixSuspended(bucket, object)
@@ -971,13 +932,13 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 		}
 	}
 
-	setEventStreamHeaders(w)
-
 	opts, err := completeMultipartOpts(ctx, r, bucket, object)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+	opts.Versioned = versioned
+	opts.VersionSuspended = suspended
 
 	// First, we compute the ETag of the multipart object.
 	// The ETag of a multi-part object is always:
@@ -998,34 +959,10 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 	multipartETag := etag.Multipart(completeETags...)
 	opts.UserDefined["etag"] = multipartETag.String()
 
-	w = &whiteSpaceWriter{ResponseWriter: w, Flusher: w.(http.Flusher)}
-	completeDoneCh := sendWhiteSpace(ctx, w)
 	objInfo, err := completeMultiPartUpload(ctx, bucket, object, uploadID, complMultipartUpload.Parts, opts)
-	// Stop writing white spaces to the client. Note that close(doneCh) style is not used as it
-	// can cause white space to be written after we send XML response in a race condition.
-	headerWritten := <-completeDoneCh
 	if err != nil {
-		if headerWritten {
-			writeErrorResponseWithoutXMLHeader(ctx, w, toAPIError(ctx, err), r.URL)
-		} else {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		}
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
-	}
-
-	// Get object location.
-	location := getObjectLocation(r, globalDomainNames, bucket, object)
-	// Generate complete multipart response.
-	response := generateCompleteMultpartUploadResponse(bucket, object, location, objInfo)
-	var encodedSuccessResponse []byte
-	if !headerWritten {
-		encodedSuccessResponse = encodeResponse(response)
-	} else {
-		encodedSuccessResponse, err = xml.Marshal(response)
-		if err != nil {
-			writeErrorResponseWithoutXMLHeader(ctx, w, toAPIError(ctx, err), r.URL)
-			return
-		}
 	}
 
 	opts.EncryptFn, err = objInfo.metadataEncryptFn(r.Header)
@@ -1042,13 +979,19 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 	}
 
 	setPutObjHeaders(w, objInfo, false)
-	if dsc := mustReplicate(ctx, bucket, object, getMustReplicateOptions(objInfo, replication.ObjectReplicationType, opts)); dsc.ReplicateAny() {
-		scheduleReplication(ctx, objInfo.Clone(), objectAPI, dsc, replication.ObjectReplicationType)
+	if dsc := mustReplicate(ctx, bucket, object, objInfo.getMustReplicateOptions(replication.ObjectReplicationType, opts)); dsc.ReplicateAny() {
+		scheduleReplication(ctx, objInfo, objectAPI, dsc, replication.ObjectReplicationType)
 	}
 	if _, ok := r.Header[xhttp.MinIOSourceReplicationRequest]; ok {
 		actualSize, _ := objInfo.GetActualSize()
 		defer globalReplicationStats.UpdateReplicaStat(bucket, actualSize)
 	}
+
+	// Get object location.
+	location := getObjectLocation(r, globalDomainNames, bucket, object)
+	// Generate complete multipart response.
+	response := generateCompleteMultpartUploadResponse(bucket, object, location, objInfo)
+	encodedSuccessResponse := encodeResponse(response)
 
 	// Write success response.
 	writeSuccessResponseXML(w, encodedSuccessResponse)
@@ -1074,7 +1017,7 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 	if !globalTierConfigMgr.Empty() {
 		// Schedule object for immediate transition if eligible.
 		enqueueTransitionImmediate(objInfo, lcEventSrc_s3CompleteMultipartUpload)
-		logger.LogIf(ctx, os.Sweep())
+		os.Sweep()
 	}
 }
 
@@ -1098,9 +1041,6 @@ func (api objectAPIHandlers) AbortMultipartUploadHandler(w http.ResponseWriter, 
 		return
 	}
 	abortMultipartUpload := objectAPI.AbortMultipartUpload
-	if api.CacheAPI() != nil {
-		abortMultipartUpload = api.CacheAPI().AbortMultipartUpload
-	}
 
 	if s3Error := checkRequestAuthType(ctx, r, policy.AbortMultipartUploadAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
@@ -1114,8 +1054,13 @@ func (api objectAPIHandlers) AbortMultipartUploadHandler(w http.ResponseWriter, 
 	}
 	opts := ObjectOptions{}
 	if err := abortMultipartUpload(ctx, bucket, object, uploadID, opts); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
+		switch err.(type) {
+		case InvalidUploadID:
+			// Do not have return an error for non-existent upload-id
+		default:
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
 	}
 
 	writeSuccessNoContent(w)
@@ -1193,64 +1138,4 @@ func (api objectAPIHandlers) ListObjectPartsHandler(w http.ResponseWriter, r *ht
 
 	// Write success response.
 	writeSuccessResponseXML(w, encodedSuccessResponse)
-}
-
-type whiteSpaceWriter struct {
-	http.ResponseWriter
-	http.Flusher
-	written bool
-}
-
-func (w *whiteSpaceWriter) Write(b []byte) (n int, err error) {
-	n, err = w.ResponseWriter.Write(b)
-	w.written = true
-	return
-}
-
-func (w *whiteSpaceWriter) WriteHeader(statusCode int) {
-	if !w.written {
-		w.ResponseWriter.WriteHeader(statusCode)
-	}
-}
-
-// Send empty whitespaces every 10 seconds to the client till completeMultiPartUpload() is
-// done so that the client does not time out. Downside is we might send 200 OK and
-// then send error XML. But accoording to S3 spec the client is supposed to check
-// for error XML even if it received 200 OK. But for erasure this is not a problem
-// as completeMultiPartUpload() is quick. Even For FS, it would not be an issue as
-// we do background append as and when the parts arrive and completeMultiPartUpload
-// is quick. Only in a rare case where parts would be out of order will
-// FS:completeMultiPartUpload() take a longer time.
-func sendWhiteSpace(ctx context.Context, w http.ResponseWriter) <-chan bool {
-	doneCh := make(chan bool)
-	go func() {
-		defer close(doneCh)
-		ticker := time.NewTicker(time.Second * 10)
-		defer ticker.Stop()
-		headerWritten := false
-		for {
-			select {
-			case <-ticker.C:
-				// Write header if not written yet.
-				if !headerWritten {
-					_, err := w.Write([]byte(xml.Header))
-					headerWritten = err == nil
-				}
-
-				// Once header is written keep writing empty spaces
-				// which are ignored by client SDK XML parsers.
-				// This occurs when server takes long time to completeMultiPartUpload()
-				_, err := w.Write([]byte(" "))
-				if err != nil {
-					return
-				}
-				w.(http.Flusher).Flush()
-			case doneCh <- headerWritten:
-				return
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return doneCh
 }

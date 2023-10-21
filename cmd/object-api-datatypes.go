@@ -109,6 +109,9 @@ type ObjectInfo struct {
 	// Total object size.
 	Size int64
 
+	// Actual size is the real size of the object uploaded by client.
+	ActualSize *int64
+
 	// IsDir indicates if the object is prefix.
 	IsDir bool
 
@@ -146,11 +149,6 @@ type ObjectInfo struct {
 	// Date and time at which the object is no longer able to be cached
 	Expires time.Time
 
-	// CacheStatus sets status of whether this is a cache hit/miss
-	CacheStatus CacheStatusType
-	// CacheLookupStatus sets whether a cacheable response is present in the cache
-	CacheLookupStatus CacheStatusType
-
 	// Specify object storage class
 	StorageClass string
 
@@ -185,6 +183,7 @@ type ObjectInfo struct {
 	VersionPurgeStatusInternal string
 	VersionPurgeStatus         VersionPurgeStatusType
 
+	replicationDecision string // internal representation of replication decision for use by DeleteObject handler
 	// The total count of all versions of this object
 	NumVersions int
 	//  The modtime of the successor object version if any
@@ -241,8 +240,6 @@ func (o *ObjectInfo) Clone() (cinfo ObjectInfo) {
 		ContentType:                o.ContentType,
 		ContentEncoding:            o.ContentEncoding,
 		Expires:                    o.Expires,
-		CacheStatus:                o.CacheStatus,
-		CacheLookupStatus:          o.CacheLookupStatus,
 		StorageClass:               o.StorageClass,
 		ReplicationStatus:          o.ReplicationStatus,
 		UserTags:                   o.UserTags,
@@ -281,9 +278,45 @@ func (o ObjectInfo) tierStats() tierStats {
 	return ts
 }
 
+// ToObjectInfo converts a replication object info to a partial ObjectInfo
+// do not rely on this function to give you correct ObjectInfo, this
+// function is merely and optimization.
+func (ri ReplicateObjectInfo) ToObjectInfo() ObjectInfo {
+	return ObjectInfo{
+		Name:                       ri.Name,
+		Bucket:                     ri.Bucket,
+		VersionID:                  ri.VersionID,
+		ModTime:                    ri.ModTime,
+		UserTags:                   ri.UserTags,
+		Size:                       ri.Size,
+		ActualSize:                 &ri.ActualSize,
+		ReplicationStatus:          ri.ReplicationStatus,
+		ReplicationStatusInternal:  ri.ReplicationStatusInternal,
+		VersionPurgeStatus:         ri.VersionPurgeStatus,
+		VersionPurgeStatusInternal: ri.VersionPurgeStatusInternal,
+		DeleteMarker:               true,
+		UserDefined:                map[string]string{},
+	}
+}
+
 // ReplicateObjectInfo represents object info to be replicated
 type ReplicateObjectInfo struct {
-	ObjectInfo
+	Name                       string
+	Bucket                     string
+	VersionID                  string
+	ETag                       string
+	Size                       int64
+	ActualSize                 int64
+	ModTime                    time.Time
+	UserTags                   string
+	SSEC                       bool
+	ReplicationStatus          replication.StatusType
+	ReplicationStatusInternal  string
+	VersionPurgeStatusInternal string
+	VersionPurgeStatus         VersionPurgeStatusType
+	ReplicationState           ReplicationState
+	DeleteMarker               bool
+
 	OpType               replication.Type
 	EventType            string
 	RetryCount           uint32
@@ -528,7 +561,7 @@ type PartInfo struct {
 	// Size in bytes of the part.
 	Size int64
 
-	// Decompressed Size.
+	// Real size of the object uploaded by client.
 	ActualSize int64
 
 	// Checksum values

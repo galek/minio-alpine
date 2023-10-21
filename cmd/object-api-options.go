@@ -30,7 +30,6 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
 )
 
 func getDefaultOpts(header http.Header, copySource bool, metadata map[string]string) (opts ObjectOptions, err error) {
@@ -108,6 +107,56 @@ func getOpts(ctx context.Context, r *http.Request, bucket, object string) (Objec
 		}
 	}
 
+	// default case of passing encryption headers to backend
+	opts, err = getDefaultOpts(r.Header, false, nil)
+	if err != nil {
+		return opts, err
+	}
+	opts.PartNumber = partNumber
+	opts.VersionID = vid
+
+	delMarker, err := parseBoolHeader(bucket, object, r.Header, xhttp.MinIOSourceDeleteMarker)
+	if err != nil {
+		return opts, err
+	}
+	opts.DeleteMarker = delMarker
+
+	replReadyCheck, err := parseBoolHeader(bucket, object, r.Header, xhttp.MinIOCheckDMReplicationReady)
+	if err != nil {
+		return opts, err
+	}
+	opts.CheckDMReplicationReady = replReadyCheck
+
+	opts.Tagging = r.Header.Get(xhttp.AmzTagDirective) == accessDirective
+	opts.Versioned = globalBucketVersioningSys.PrefixEnabled(bucket, object)
+	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(bucket, object)
+	return opts, nil
+}
+
+func parseBoolHeader(bucket, object string, h http.Header, headerName string) (bool, error) {
+	value := strings.TrimSpace(h.Get(headerName))
+	if value != "" {
+		switch value {
+		case "true":
+			return true, nil
+		case "false":
+		default:
+			return false, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    fmt.Errorf("Unable to parse %s, value should be either 'true' or 'false'", headerName),
+			}
+		}
+	}
+	return false, nil
+}
+
+func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts ObjectOptions, err error) {
+	opts, err = getOpts(ctx, r, bucket, object)
+	if err != nil {
+		return opts, err
+	}
+
 	deletePrefix := false
 	if d := r.Header.Get(xhttp.MinIOForceDelete); d != "" {
 		if b, err := strconv.ParseBool(d); err == nil {
@@ -117,57 +166,7 @@ func getOpts(ctx context.Context, r *http.Request, bucket, object string) (Objec
 		}
 	}
 
-	// default case of passing encryption headers to backend
-	opts, err = getDefaultOpts(r.Header, false, nil)
-	if err != nil {
-		return opts, err
-	}
 	opts.DeletePrefix = deletePrefix
-	opts.PartNumber = partNumber
-	opts.VersionID = vid
-	delMarker := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceDeleteMarker))
-	if delMarker != "" {
-		switch delMarker {
-		case "true":
-			opts.DeleteMarker = true
-		case "false":
-		default:
-			err = fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceDeleteMarker, fmt.Errorf("DeleteMarker should be true or false"))
-			logger.LogIf(ctx, err)
-			return opts, InvalidArgument{
-				Bucket: bucket,
-				Object: object,
-				Err:    err,
-			}
-		}
-	}
-	replReadyCheck := strings.TrimSpace(r.Header.Get(xhttp.MinIOCheckDMReplicationReady))
-	if replReadyCheck != "" {
-		switch replReadyCheck {
-		case "true":
-			opts.CheckDMReplicationReady = true
-		case "false":
-		default:
-			err = fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOCheckDMReplicationReady, fmt.Errorf("should be true or false"))
-			logger.LogIf(ctx, err)
-			return opts, InvalidArgument{
-				Bucket: bucket,
-				Object: object,
-				Err:    err,
-			}
-		}
-	}
-
-	opts.Versioned = globalBucketVersioningSys.PrefixEnabled(bucket, object)
-	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(bucket, object)
-	return opts, nil
-}
-
-func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts ObjectOptions, err error) {
-	opts, err = getOpts(ctx, r, bucket, object)
-	if err != nil {
-		return opts, err
-	}
 	opts.Versioned = globalBucketVersioningSys.PrefixEnabled(bucket, object)
 	// Objects matching prefixes should not leave delete markers,
 	// dramatically reduces namespace pollution while keeping the
@@ -179,22 +178,11 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 		opts.VersionID = nullVersionID
 	}
 
-	delMarker := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceDeleteMarker))
-	if delMarker != "" {
-		switch delMarker {
-		case "true":
-			opts.DeleteMarker = true
-		case "false":
-		default:
-			err = fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceDeleteMarker, fmt.Errorf("DeleteMarker should be true or false"))
-			logger.LogIf(ctx, err)
-			return opts, InvalidArgument{
-				Bucket: bucket,
-				Object: object,
-				Err:    err,
-			}
-		}
+	delMarker, err := parseBoolHeader(bucket, object, r.Header, xhttp.MinIOSourceDeleteMarker)
+	if err != nil {
+		return opts, err
 	}
+	opts.DeleteMarker = delMarker
 
 	mtime := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
 	if mtime != "" {
@@ -206,8 +194,6 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceMTime, err),
 			}
 		}
-	} else {
-		opts.MTime = UTCNow()
 	}
 	return opts, nil
 }
@@ -221,7 +207,6 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	if vid != "" && vid != nullVersionID {
 		_, err := uuid.Parse(vid)
 		if err != nil {
-			logger.LogIf(ctx, err)
 			return opts, InvalidVersionID{
 				Bucket:    bucket,
 				Object:    object,
@@ -232,13 +217,13 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			return opts, InvalidArgument{
 				Bucket: bucket,
 				Object: object,
-				Err:    fmt.Errorf("VersionID specified %s, but versioning not enabled on  %s", opts.VersionID, bucket),
+				Err:    fmt.Errorf("VersionID specified %s, but versioning not enabled on bucket=%s", opts.VersionID, bucket),
 			}
 		}
 	}
 
 	mtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
-	mtime := UTCNow()
+	var mtime time.Time
 	if mtimeStr != "" {
 		mtime, err = time.Parse(time.RFC3339Nano, mtimeStr)
 		if err != nil {
@@ -250,7 +235,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 		}
 	}
 	retaintimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceObjectRetentionTimestamp))
-	retaintimestmp := mtime
+	var retaintimestmp time.Time
 	if retaintimeStr != "" {
 		retaintimestmp, err = time.Parse(time.RFC3339, retaintimeStr)
 		if err != nil {
@@ -263,7 +248,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	}
 
 	lholdtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceObjectLegalHoldTimestamp))
-	lholdtimestmp := mtime
+	var lholdtimestmp time.Time
 	if lholdtimeStr != "" {
 		lholdtimestmp, err = time.Parse(time.RFC3339, lholdtimeStr)
 		if err != nil {
@@ -275,7 +260,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 		}
 	}
 	tagtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceTaggingTimestamp))
-	taggingtimestmp := mtime
+	var taggingtimestmp time.Time
 	if tagtimeStr != "" {
 		taggingtimestmp, err = time.Parse(time.RFC3339, tagtimeStr)
 		if err != nil {
@@ -366,7 +351,7 @@ func copySrcOpts(ctx context.Context, r *http.Request, bucket, object string) (O
 // get ObjectOptions for CompleteMultipart calls
 func completeMultipartOpts(ctx context.Context, r *http.Request, bucket, object string) (opts ObjectOptions, err error) {
 	mtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
-	mtime := UTCNow()
+	var mtime time.Time
 	if mtimeStr != "" {
 		mtime, err = time.Parse(time.RFC3339Nano, mtimeStr)
 		if err != nil {

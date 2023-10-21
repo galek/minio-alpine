@@ -35,7 +35,7 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v2/policy"
 	xxml "github.com/minio/xxml"
 )
 
@@ -550,7 +550,7 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 				content.UserMetadata.Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, xhttp.AmzEncryptionAES)
 			}
 			for k, v := range cleanMinioInternalMetadataKeys(object.UserDefined) {
-				if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+				if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 					// Do not need to send any internal metadata
 					// values to client.
 					continue
@@ -693,7 +693,7 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 					content.UserMetadata.Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, xhttp.AmzEncryptionAES)
 				}
 				for k, v := range cleanMinioInternalMetadataKeys(object.UserDefined) {
-					if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+					if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 						// Do not need to send any internal metadata
 						// values to client.
 						continue
@@ -978,7 +978,7 @@ func writeCustomErrorResponseJSON(ctx context.Context, w http.ResponseWriter, er
 		BucketName: reqInfo.BucketName,
 		Key:        reqInfo.ObjectName,
 		RequestID:  w.Header().Get(xhttp.AmzRequestID),
-		HostID:     globalDeploymentID,
+		HostID:     globalDeploymentID(),
 	}
 	encodedErrorResponse := encodeResponseJSON(errorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeJSON)

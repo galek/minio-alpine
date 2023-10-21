@@ -23,7 +23,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
@@ -31,7 +30,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/minio/pkg/ellipses"
+	"github.com/minio/pkg/v2/ellipses"
 )
 
 type xl struct {
@@ -97,13 +96,14 @@ type localDisk struct {
 func getMajorMinor(path string) (string, error) {
 	var stat syscall.Stat_t
 	if err := syscall.Stat(path, &stat); err != nil {
-		return "", fmt.Errorf("unable to stat `%s`: %w", err)
+		return "", fmt.Errorf("unable to stat `%s`: %w", path, err)
 	}
 
-	major := (stat.Dev & 0x00000000000fff00) >> 8
-	major |= (stat.Dev & 0xfffff00000000000) >> 32
-	minor := (stat.Dev & 0x00000000000000ff) >> 0
-	minor |= (stat.Dev & 0x00000ffffff00000) >> 12
+	devID := uint64(stat.Dev)
+	major := (devID & 0x00000000000fff00) >> 8
+	major |= (devID & 0xfffff00000000000) >> 32
+	minor := (devID & 0x00000000000000ff) >> 0
+	minor |= (devID & 0x00000ffffff00000) >> 12
 
 	return fmt.Sprintf("%d:%d", major, minor), nil
 }
@@ -137,7 +137,7 @@ func filterLocalDisks(node, args string) ([]localDisk, error) {
 }
 
 func getFormatJSON(path string) (format, error) {
-	formatJSON, err := ioutil.ReadFile(filepath.Join(path, ".minio.sys/format.json"))
+	formatJSON, err := os.ReadFile(filepath.Join(path, ".minio.sys/format.json"))
 	if err != nil {
 		return format{}, err
 	}
@@ -162,7 +162,6 @@ func getDiskLocation(f format) (string, error) {
 }
 
 func main() {
-
 	var node, args string
 
 	flag.StringVar(&node, "local-node-name", "", "the name of the local node")
