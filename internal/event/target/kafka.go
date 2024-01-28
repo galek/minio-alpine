@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,41 +44,51 @@ import (
 
 // Kafka input constants
 const (
-	KafkaBrokers       = "brokers"
-	KafkaTopic         = "topic"
-	KafkaQueueDir      = "queue_dir"
-	KafkaQueueLimit    = "queue_limit"
-	KafkaTLS           = "tls"
-	KafkaTLSSkipVerify = "tls_skip_verify"
-	KafkaTLSClientAuth = "tls_client_auth"
-	KafkaSASL          = "sasl"
-	KafkaSASLUsername  = "sasl_username"
-	KafkaSASLPassword  = "sasl_password"
-	KafkaSASLMechanism = "sasl_mechanism"
-	KafkaClientTLSCert = "client_tls_cert"
-	KafkaClientTLSKey  = "client_tls_key"
-	KafkaVersion       = "version"
-	KafkaBatchSize     = "batch_size"
+	KafkaBrokers          = "brokers"
+	KafkaTopic            = "topic"
+	KafkaQueueDir         = "queue_dir"
+	KafkaQueueLimit       = "queue_limit"
+	KafkaTLS              = "tls"
+	KafkaTLSSkipVerify    = "tls_skip_verify"
+	KafkaTLSClientAuth    = "tls_client_auth"
+	KafkaSASL             = "sasl"
+	KafkaSASLUsername     = "sasl_username"
+	KafkaSASLPassword     = "sasl_password"
+	KafkaSASLMechanism    = "sasl_mechanism"
+	KafkaClientTLSCert    = "client_tls_cert"
+	KafkaClientTLSKey     = "client_tls_key"
+	KafkaVersion          = "version"
+	KafkaBatchSize        = "batch_size"
+	KafkaCompressionCodec = "compression_codec"
+	KafkaCompressionLevel = "compression_level"
 
-	EnvKafkaEnable        = "MINIO_NOTIFY_KAFKA_ENABLE"
-	EnvKafkaBrokers       = "MINIO_NOTIFY_KAFKA_BROKERS"
-	EnvKafkaTopic         = "MINIO_NOTIFY_KAFKA_TOPIC"
-	EnvKafkaQueueDir      = "MINIO_NOTIFY_KAFKA_QUEUE_DIR"
-	EnvKafkaQueueLimit    = "MINIO_NOTIFY_KAFKA_QUEUE_LIMIT"
-	EnvKafkaTLS           = "MINIO_NOTIFY_KAFKA_TLS"
-	EnvKafkaTLSSkipVerify = "MINIO_NOTIFY_KAFKA_TLS_SKIP_VERIFY"
-	EnvKafkaTLSClientAuth = "MINIO_NOTIFY_KAFKA_TLS_CLIENT_AUTH"
-	EnvKafkaSASLEnable    = "MINIO_NOTIFY_KAFKA_SASL"
-	EnvKafkaSASLUsername  = "MINIO_NOTIFY_KAFKA_SASL_USERNAME"
-	EnvKafkaSASLPassword  = "MINIO_NOTIFY_KAFKA_SASL_PASSWORD"
-	EnvKafkaSASLMechanism = "MINIO_NOTIFY_KAFKA_SASL_MECHANISM"
-	EnvKafkaClientTLSCert = "MINIO_NOTIFY_KAFKA_CLIENT_TLS_CERT"
-	EnvKafkaClientTLSKey  = "MINIO_NOTIFY_KAFKA_CLIENT_TLS_KEY"
-	EnvKafkaVersion       = "MINIO_NOTIFY_KAFKA_VERSION"
-	EnvKafkaBatchSize     = "MINIO_NOTIFY_KAFKA_BATCH_SIZE"
-
-	maxBatchLimit = 100
+	EnvKafkaEnable                   = "MINIO_NOTIFY_KAFKA_ENABLE"
+	EnvKafkaBrokers                  = "MINIO_NOTIFY_KAFKA_BROKERS"
+	EnvKafkaTopic                    = "MINIO_NOTIFY_KAFKA_TOPIC"
+	EnvKafkaQueueDir                 = "MINIO_NOTIFY_KAFKA_QUEUE_DIR"
+	EnvKafkaQueueLimit               = "MINIO_NOTIFY_KAFKA_QUEUE_LIMIT"
+	EnvKafkaTLS                      = "MINIO_NOTIFY_KAFKA_TLS"
+	EnvKafkaTLSSkipVerify            = "MINIO_NOTIFY_KAFKA_TLS_SKIP_VERIFY"
+	EnvKafkaTLSClientAuth            = "MINIO_NOTIFY_KAFKA_TLS_CLIENT_AUTH"
+	EnvKafkaSASLEnable               = "MINIO_NOTIFY_KAFKA_SASL"
+	EnvKafkaSASLUsername             = "MINIO_NOTIFY_KAFKA_SASL_USERNAME"
+	EnvKafkaSASLPassword             = "MINIO_NOTIFY_KAFKA_SASL_PASSWORD"
+	EnvKafkaSASLMechanism            = "MINIO_NOTIFY_KAFKA_SASL_MECHANISM"
+	EnvKafkaClientTLSCert            = "MINIO_NOTIFY_KAFKA_CLIENT_TLS_CERT"
+	EnvKafkaClientTLSKey             = "MINIO_NOTIFY_KAFKA_CLIENT_TLS_KEY"
+	EnvKafkaVersion                  = "MINIO_NOTIFY_KAFKA_VERSION"
+	EnvKafkaBatchSize                = "MINIO_NOTIFY_KAFKA_BATCH_SIZE"
+	EnvKafkaProducerCompressionCodec = "MINIO_NOTIFY_KAFKA_PRODUCER_COMPRESSION_CODEC"
+	EnvKafkaProducerCompressionLevel = "MINIO_NOTIFY_KAFKA_PRODUCER_COMPRESSION_LEVEL"
 )
+
+var codecs = map[string]sarama.CompressionCodec{
+	"none":   sarama.CompressionNone,
+	"gzip":   sarama.CompressionGZIP,
+	"snappy": sarama.CompressionSnappy,
+	"lz4":    sarama.CompressionLZ4,
+	"zstd":   sarama.CompressionZSTD,
+}
 
 // KafkaArgs - Kafka target arguments.
 type KafkaArgs struct {
@@ -102,6 +113,10 @@ type KafkaArgs struct {
 		Password  string `json:"password"`
 		Mechanism string `json:"mechanism"`
 	} `json:"sasl"`
+	Producer struct {
+		Compression      string `json:"compression"`
+		CompressionLevel int    `json:"compressionLevel"`
+	} `json:"producer"`
 }
 
 // Validate KafkaArgs fields
@@ -131,9 +146,6 @@ func (k KafkaArgs) Validate() error {
 		if k.QueueDir == "" {
 			return errors.New("batch should be enabled only if queue dir is enabled")
 		}
-		if k.BatchSize > maxBatchLimit {
-			return fmt.Errorf("batch limit should not exceed %d", maxBatchLimit)
-		}
 	}
 	return nil
 }
@@ -142,14 +154,15 @@ func (k KafkaArgs) Validate() error {
 type KafkaTarget struct {
 	initOnce once.Init
 
-	id         event.TargetID
-	args       KafkaArgs
-	producer   sarama.SyncProducer
-	config     *sarama.Config
-	store      store.Store[event.Event]
-	batch      *store.Batch[string, *sarama.ProducerMessage]
-	loggerOnce logger.LogOnce
-	quitCh     chan struct{}
+	id          event.TargetID
+	args        KafkaArgs
+	producer    sarama.SyncProducer
+	config      *sarama.Config
+	store       store.Store[event.Event]
+	batch       *store.Batch[string, *sarama.ProducerMessage]
+	loggerOnce  logger.LogOnce
+	brokerConns map[string]net.Conn
+	quitCh      chan struct{}
 }
 
 // ID - returns target ID.
@@ -176,7 +189,7 @@ func (target *KafkaTarget) IsActive() (bool, error) {
 }
 
 func (target *KafkaTarget) isActive() (bool, error) {
-	if err := target.args.pingBrokers(); err != nil {
+	if err := target.pingBrokers(); err != nil {
 		return false, store.ErrNotConnected
 	}
 	return true, nil
@@ -188,10 +201,6 @@ func (target *KafkaTarget) Save(eventData event.Event) error {
 		return target.store.Put(eventData)
 	}
 	if err := target.init(); err != nil {
-		return err
-	}
-	_, err := target.isActive()
-	if err != nil {
 		return err
 	}
 	return target.send(eventData)
@@ -222,12 +231,6 @@ func (target *KafkaTarget) SendFromStore(key store.Key) error {
 		return target.addToBatch(key)
 	}
 
-	var err error
-	_, err = target.isActive()
-	if err != nil {
-		return err
-	}
-
 	eventData, eErr := target.store.Get(key.Name)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
@@ -238,8 +241,7 @@ func (target *KafkaTarget) SendFromStore(key store.Key) error {
 		return eErr
 	}
 
-	err = target.send(eventData)
-	if err != nil {
+	if err := target.send(eventData); err != nil {
 		if isKafkaConnErr(err) {
 			return store.ErrNotConnected
 		}
@@ -280,9 +282,6 @@ func (target *KafkaTarget) addToBatch(key store.Key) error {
 }
 
 func (target *KafkaTarget) commitBatch() error {
-	if _, err := target.isActive(); err != nil {
-		return err
-	}
 	keys, msgs, err := target.batch.GetAll()
 	if err != nil {
 		return err
@@ -321,23 +320,38 @@ func (target *KafkaTarget) Close() error {
 	if target.producer != nil {
 		return target.producer.Close()
 	}
+	for _, conn := range target.brokerConns {
+		if conn != nil {
+			conn.Close()
+		}
+	}
 	return nil
 }
 
-// Check if atleast one broker in cluster is active
-func (k KafkaArgs) pingBrokers() (err error) {
+// Check if at least one broker in cluster is active
+func (target *KafkaTarget) pingBrokers() (err error) {
 	d := net.Dialer{Timeout: 1 * time.Second}
 
-	errs := make([]error, len(k.Brokers))
+	errs := make([]error, len(target.args.Brokers))
 	var wg sync.WaitGroup
-	for idx, broker := range k.Brokers {
+	for idx, broker := range target.args.Brokers {
 		broker := broker
 		idx := idx
 		wg.Add(1)
 		go func(broker xnet.Host, idx int) {
 			defer wg.Done()
-
-			_, errs[idx] = d.Dial("tcp", broker.String())
+			conn, ok := target.brokerConns[broker.String()]
+			if !ok || conn == nil {
+				conn, errs[idx] = d.Dial("tcp", broker.String())
+				if errs[idx] != nil {
+					return
+				}
+				target.brokerConns[broker.String()] = conn
+			}
+			if _, errs[idx] = conn.Write([]byte("")); errs[idx] != nil {
+				conn.Close()
+				target.brokerConns[broker.String()] = nil
+			}
 		}(broker, idx)
 	}
 	wg.Wait()
@@ -396,6 +410,13 @@ func (target *KafkaTarget) initKafka() error {
 	config.Producer.Return.Errors = true
 	config.Producer.RequiredAcks = 1
 	config.Producer.Timeout = (5 * time.Second)
+	// Set Producer Compression
+	cc, ok := codecs[strings.ToLower(args.Producer.Compression)]
+	if ok {
+		config.Producer.Compression = cc
+		config.Producer.CompressionLevel = args.Producer.CompressionLevel
+	}
+
 	config.Net.ReadTimeout = (5 * time.Second)
 	config.Net.DialTimeout = (5 * time.Second)
 	config.Net.WriteTimeout = (5 * time.Second)
@@ -442,11 +463,12 @@ func NewKafkaTarget(id string, args KafkaArgs, loggerOnce logger.LogOnce) (*Kafk
 	}
 
 	target := &KafkaTarget{
-		id:         event.TargetID{ID: id, Name: "kafka"},
-		args:       args,
-		store:      queueStore,
-		loggerOnce: loggerOnce,
-		quitCh:     make(chan struct{}),
+		id:          event.TargetID{ID: id, Name: "kafka"},
+		args:        args,
+		store:       queueStore,
+		loggerOnce:  loggerOnce,
+		quitCh:      make(chan struct{}),
+		brokerConns: make(map[string]net.Conn, len(args.Brokers)),
 	}
 
 	if target.store != nil {
@@ -460,6 +482,6 @@ func NewKafkaTarget(id string, args KafkaArgs, loggerOnce logger.LogOnce) (*Kafk
 }
 
 func isKafkaConnErr(err error) bool {
-	// Sarama opens the ciruit breaker after 3 consecutive connection failures.
+	// Sarama opens the circuit breaker after 3 consecutive connection failures.
 	return err == sarama.ErrLeaderNotAvailable || err.Error() == "circuit breaker is open"
 }

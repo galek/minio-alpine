@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 )
 
@@ -800,7 +801,7 @@ func (h *healSequence) healItems(objAPI ObjectLayer, bucketsOnly bool) error {
 func (h *healSequence) traverseAndHeal(objAPI ObjectLayer) {
 	bucketsOnly := false // Heals buckets and objects also.
 	h.traverseAndHealDoneCh <- h.healItems(objAPI, bucketsOnly)
-	close(h.traverseAndHealDoneCh)
+	xioutil.SafeClose(h.traverseAndHealDoneCh)
 }
 
 // healMinioSysMeta - heals all files under a given meta prefix, returns a function
@@ -810,7 +811,7 @@ func (h *healSequence) healMinioSysMeta(objAPI ObjectLayer, metaPrefix string) f
 		// NOTE: Healing on meta is run regardless
 		// of any bucket being selected, this is to ensure that
 		// meta are always upto date and correct.
-		return objAPI.HealObjects(h.ctx, minioMetaBucket, metaPrefix, h.settings, func(bucket, object, versionID string) error {
+		return objAPI.HealObjects(h.ctx, minioMetaBucket, metaPrefix, h.settings, func(bucket, object, versionID string, scanMode madmin.HealScanMode) error {
 			if h.isQuitting() {
 				return errHealStopSignalled
 			}
@@ -867,7 +868,7 @@ func (h *healSequence) healBucket(objAPI ObjectLayer, bucket string, bucketsOnly
 
 	if !h.settings.Recursive {
 		if h.object != "" {
-			if err := h.healObject(bucket, h.object, ""); err != nil {
+			if err := h.healObject(bucket, h.object, "", h.settings.ScanMode); err != nil {
 				return err
 			}
 		}
@@ -882,7 +883,7 @@ func (h *healSequence) healBucket(objAPI ObjectLayer, bucket string, bucketsOnly
 }
 
 // healObject - heal the given object and record result
-func (h *healSequence) healObject(bucket, object, versionID string) error {
+func (h *healSequence) healObject(bucket, object, versionID string, scanMode madmin.HealScanMode) error {
 	if h.isQuitting() {
 		return errHealStopSignalled
 	}

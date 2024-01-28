@@ -25,10 +25,41 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/disk"
+)
+
+// Block sizes constant.
+const (
+	BlockSizeSmall       = 32 * humanize.KiByte // Default r/w block size for smaller objects.
+	BlockSizeLarge       = 2 * humanize.MiByte  // Default r/w block size for larger objects.
+	BlockSizeReallyLarge = 4 * humanize.MiByte  // Default write block size for objects per shard >= 64MiB
+)
+
+// aligned sync.Pool's
+var (
+	ODirectPoolXLarge = sync.Pool{
+		New: func() interface{} {
+			b := disk.AlignedBlock(BlockSizeReallyLarge)
+			return &b
+		},
+	}
+	ODirectPoolLarge = sync.Pool{
+		New: func() interface{} {
+			b := disk.AlignedBlock(BlockSizeLarge)
+			return &b
+		},
+	}
+	ODirectPoolSmall = sync.Pool{
+		New: func() interface{} {
+			b := disk.AlignedBlock(BlockSizeSmall)
+			return &b
+		},
+	}
 )
 
 // WriteOnCloser implements io.WriteCloser and always
@@ -69,56 +100,9 @@ func WriteOnClose(w io.Writer) *WriteOnCloser {
 	return &WriteOnCloser{w, false}
 }
 
-type ioret struct {
-	n   int
+type ioret[V any] struct {
+	val V
 	err error
-}
-
-// DeadlineReader deadline reader with timeout
-type DeadlineReader struct {
-	io.ReadCloser
-	timeout time.Duration
-	err     error
-}
-
-// NewDeadlineReader wraps a writer to make it respect given deadline
-// value per Write(). If there is a blocking write, the returned Reader
-// will return whenever the timer hits (the return values are n=0
-// and err=context.DeadlineExceeded.)
-func NewDeadlineReader(r io.ReadCloser, timeout time.Duration) io.ReadCloser {
-	return &DeadlineReader{ReadCloser: r, timeout: timeout}
-}
-
-func (r *DeadlineReader) Read(buf []byte) (int, error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-
-	c := make(chan ioret, 1)
-	t := time.NewTimer(r.timeout)
-	go func() {
-		n, err := r.ReadCloser.Read(buf)
-		c <- ioret{n, err}
-		close(c)
-	}()
-
-	select {
-	case res := <-c:
-		if !t.Stop() {
-			<-t.C
-		}
-		r.err = res.err
-		return res.n, res.err
-	case <-t.C:
-		r.ReadCloser.Close()
-		r.err = context.DeadlineExceeded
-		return 0, context.DeadlineExceeded
-	}
-}
-
-// Close closer interface to close the underlying closer
-func (r *DeadlineReader) Close() error {
-	return r.ReadCloser.Close()
 }
 
 // DeadlineWriter deadline writer with timeout
@@ -128,35 +112,51 @@ type DeadlineWriter struct {
 	err     error
 }
 
+// WithDeadline will execute a function with a deadline and return a value of a given type.
+// If the deadline/context passes before the function finishes executing,
+// the zero value and the context error is returned.
+func WithDeadline[V any](ctx context.Context, timeout time.Duration, work func(ctx context.Context) (result V, err error)) (result V, err error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	c := make(chan ioret[V], 1)
+	go func() {
+		v, err := work(ctx)
+		c <- ioret[V]{val: v, err: err}
+	}()
+
+	select {
+	case v := <-c:
+		return v.val, v.err
+	case <-ctx.Done():
+		var zero V
+		return zero, ctx.Err()
+	}
+}
+
 // DeadlineWorker implements the deadline/timeout resiliency pattern.
 type DeadlineWorker struct {
 	timeout time.Duration
-	err     error
 }
 
 // NewDeadlineWorker constructs a new DeadlineWorker with the given timeout.
+// To return values, use the WithDeadline helper instead.
 func NewDeadlineWorker(timeout time.Duration) *DeadlineWorker {
-	return &DeadlineWorker{
+	dw := &DeadlineWorker{
 		timeout: timeout,
 	}
+	return dw
 }
 
 // Run runs the given function, passing it a stopper channel. If the deadline passes before
-// the function finishes executing, Run returns ErrTimeOut to the caller and closes the stopper
-// channel so that the work function can attempt to exit gracefully. It does not (and cannot)
-// simply kill the running function, so if it doesn't respect the stopper channel then it may
-// keep running after the deadline passes. If the function finishes before the deadline, then
-// the return value of the function is returned from Run.
+// the function finishes executing, Run returns context.DeadlineExceeded to the caller.
+// channel so that the work function can attempt to exit gracefully.
+// Multiple calls to Run will run independently of each other.
 func (d *DeadlineWorker) Run(work func() error) error {
-	if d.err != nil {
-		return d.err
-	}
-
-	c := make(chan ioret, 1)
+	c := make(chan ioret[struct{}], 1)
 	t := time.NewTimer(d.timeout)
 	go func() {
-		c <- ioret{0, work()}
-		close(c)
+		c <- ioret[struct{}]{val: struct{}{}, err: work()}
 	}()
 
 	select {
@@ -164,10 +164,8 @@ func (d *DeadlineWorker) Run(work func() error) error {
 		if !t.Stop() {
 			<-t.C
 		}
-		d.err = r.err
 		return r.err
 	case <-t.C:
-		d.err = context.DeadlineExceeded
 		return context.DeadlineExceeded
 	}
 }
@@ -185,11 +183,11 @@ func (w *DeadlineWriter) Write(buf []byte) (int, error) {
 		return 0, w.err
 	}
 
-	c := make(chan ioret, 1)
+	c := make(chan ioret[int], 1)
 	t := time.NewTimer(w.timeout)
 	go func() {
 		n, err := w.WriteCloser.Write(buf)
-		c <- ioret{n, err}
+		c <- ioret[int]{val: n, err: err}
 		close(c)
 	}()
 
@@ -199,7 +197,7 @@ func (w *DeadlineWriter) Write(buf []byte) (int, error) {
 			<-t.C
 		}
 		w.err = r.err
-		return r.n, r.err
+		return r.val, r.err
 	case <-t.C:
 		w.WriteCloser.Close()
 		w.err = context.DeadlineExceeded
@@ -312,7 +310,7 @@ var copyBufPool = sync.Pool{
 	},
 }
 
-// Copy is exactly like io.Copy but with re-usable buffers.
+// Copy is exactly like io.Copy but with reusable buffers.
 func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
 	bufp := copyBufPool.Get().(*[]byte)
 	buf := *bufp
@@ -420,4 +418,14 @@ func CopyAligned(w io.Writer, r io.Reader, alignedBuf []byte, totalSize int64, f
 			return written, nil
 		}
 	}
+}
+
+// SafeClose safely closes any channel of any type
+func SafeClose[T any](c chan<- T) {
+	if c != nil {
+		close(c)
+	}
+	// Print stack to check who is sending `c` as `nil`
+	// without crashing the server.
+	debug.PrintStack()
 }

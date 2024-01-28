@@ -34,6 +34,7 @@ import (
 	"time"
 
 	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
@@ -379,10 +380,6 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 // Messages are queued in the disk if the store is enabled
 // If Cancel has been called the message is ignored.
 func (h *Target) Send(ctx context.Context, entry interface{}) error {
-	if atomic.LoadInt32(&h.status) == statusOffline {
-		h.config.LogOnce(ctx, fmt.Errorf("target %s is offline", h.Endpoint()), h.Endpoint())
-		return nil
-	}
 	if atomic.LoadInt32(&h.status) == statusClosed {
 		return nil
 	}
@@ -447,7 +444,7 @@ func (h *Target) Cancel() {
 	// and finish the existing ones.
 	// All future ones will be discarded.
 	h.logChMu.Lock()
-	close(h.logCh)
+	xioutil.SafeClose(h.logCh)
 	h.logCh = nil
 	h.logChMu.Unlock()
 

@@ -536,6 +536,10 @@ func (j xlMetaV2Object) InlineData() bool {
 	return ok
 }
 
+func (j *xlMetaV2Object) ResetInlineData() {
+	delete(j.MetaSys, ReservedMetadataPrefixLower+"inline-data")
+}
+
 const (
 	metaTierStatus    = ReservedMetadataPrefixLower + TransitionStatus
 	metaTierObjName   = ReservedMetadataPrefixLower + TransitionedObjectName
@@ -766,7 +770,7 @@ func readXLMetaNoData(r io.Reader, size int64) ([]byte, error) {
 		case 1, 2, 3:
 			sz, tmp, err := msgp.ReadBytesHeader(tmp)
 			if err != nil {
-				return nil, fmt.Errorf("readXLMetaNoData(read_meta): uknown metadata version %w", err)
+				return nil, fmt.Errorf("readXLMetaNoData(read_meta): unknown metadata version %w", err)
 			}
 			want := int64(sz) + int64(len(buf)-len(tmp))
 
@@ -1182,6 +1186,8 @@ func (x *xlMetaV2) AppendTo(dst []byte) ([]byte, error) {
 	return append(dst, x.data...), nil
 }
 
+const emptyUUID = "00000000-0000-0000-0000-000000000000"
+
 func (x *xlMetaV2) findVersionStr(key string) (idx int, ver *xlMetaV2Version, err error) {
 	if key == nullVersionID {
 		key = ""
@@ -1404,10 +1410,11 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 				err = x.setIdx(i, *ver)
 				return "", err
 			}
-			var err error
 			x.versions = append(x.versions[:i], x.versions[i+1:]...)
 			if fi.MarkDeleted && (fi.VersionPurgeStatus().Empty() || (fi.VersionPurgeStatus() != Complete)) {
 				err = x.addVersion(ventry)
+			} else if fi.Deleted && uv.String() == emptyUUID {
+				return "", x.addVersion(ventry)
 			}
 			return "", err
 		case ObjectType:
@@ -1440,6 +1447,7 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 			err = x.setIdx(i, *ver)
 		case fi.TransitionStatus == lifecycle.TransitionComplete:
 			ver.ObjectV2.SetTransition(fi)
+			ver.ObjectV2.ResetInlineData()
 			err = x.setIdx(i, *ver)
 		default:
 			x.versions = append(x.versions[:i], x.versions[i+1:]...)

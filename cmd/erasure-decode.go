@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 )
 
@@ -118,7 +119,7 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 	}
 
 	readTriggerCh := make(chan bool, len(p.readers))
-	defer close(readTriggerCh) // close the channel upon return
+	defer xioutil.SafeClose(readTriggerCh) // close the channel upon return
 
 	for i := 0; i < p.dataBlocks; i++ {
 		// Setup read triggers for p.dataBlocks number of reads so that it reads in parallel.
@@ -158,7 +159,7 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 			bufIdx := p.readerToBuf[i]
 			if p.buf[bufIdx] == nil {
 				// Reading first time on this disk, hence the buffer needs to be allocated.
-				// Subsequent reads will re-use this buffer.
+				// Subsequent reads will reuse this buffer.
 				p.buf[bufIdx] = make([]byte, p.shardSize)
 			}
 			// For the last shard, the shardsize might be less than previous shard sizes.

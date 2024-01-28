@@ -701,10 +701,12 @@ func (set *erasureObjects) listObjectsToDecommission(ctx context.Context, bi dec
 		return fmt.Errorf("no online drives found for set with endpoints %s", set.getEndpoints())
 	}
 
+	listQuorum := (len(disks) + 1) / 2
+
 	// How to resolve partial results.
 	resolver := metadataResolutionParams{
-		dirQuorum: len(disks) / 2, // make sure to capture all quorum ratios
-		objQuorum: len(disks) / 2, // make sure to capture all quorum ratios
+		dirQuorum: listQuorum, // make sure to capture all quorum ratios
+		objQuorum: listQuorum, // make sure to capture all quorum ratios
 		bucket:    bi.Name,
 	}
 
@@ -714,7 +716,7 @@ func (set *erasureObjects) listObjectsToDecommission(ctx context.Context, bi dec
 		path:           bi.Prefix,
 		recursive:      true,
 		forwardTo:      "",
-		minDisks:       len(disks) / 2, // to capture all quorum ratios
+		minDisks:       listQuorum,
 		reportNotFound: false,
 		agreed:         fn,
 		partial: func(entries metaCacheEntries, _ []error) {
@@ -767,7 +769,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 
 			evt := evalActionFromLifecycle(ctx, *lc, lr, rcfg, objInfo)
 			switch {
-			case evt.Action.DeleteRestored(): // if restored copy has expired,delete it synchronously
+			case evt.Action.DeleteRestored(): // if restored copy has expired, delete it synchronously
 				applyExpiryOnTransitionedObject(ctx, z, objInfo, evt, lcEventSrc_Decom)
 				return false
 			case evt.Action.Delete():
@@ -934,7 +936,8 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					bi.Name,
 					encodeDirObject(entry.name),
 					ObjectOptions{
-						DeletePrefix: true, // use prefix delete to delete all versions at once.
+						DeletePrefix:       true, // use prefix delete to delete all versions at once.
+						DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
 					},
 				)
 				stopFn(err)

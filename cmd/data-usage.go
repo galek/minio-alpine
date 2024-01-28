@@ -41,7 +41,7 @@ const (
 	dataUsageCacheName = ".usage-cache.bin"
 )
 
-// storeDataUsageInBackend will store all objects sent on the gui channel until closed.
+// storeDataUsageInBackend will store all objects sent on the dui channel until closed.
 func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan DataUsageInfo) {
 	attempts := 1
 	for dataUsageInfo := range dui {
@@ -56,7 +56,7 @@ func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan
 			attempts = 1
 		}
 		if err = saveConfig(ctx, objAPI, dataUsageObjNamePath, dataUsageJSON); err != nil {
-			logger.LogIf(ctx, err)
+			logger.LogOnceIf(ctx, err, dataUsageObjNamePath)
 		}
 		attempts++
 	}

@@ -154,9 +154,16 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 	}
 
 	for _, adminVersion := range adminVersions {
-		// Restart and stop MinIO service.
+		// Restart and stop MinIO service type=2
+		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/service").HandlerFunc(adminMiddleware(adminAPI.ServiceV2Handler, traceAllFlag)).Queries("action", "{action:.*}", "type", "2")
+
+		// Deprecated: Restart and stop MinIO service.
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/service").HandlerFunc(adminMiddleware(adminAPI.ServiceHandler, traceAllFlag)).Queries("action", "{action:.*}")
-		// Update MinIO servers.
+
+		// Update all MinIO servers type=2
+		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/update").HandlerFunc(adminMiddleware(adminAPI.ServerUpdateV2Handler, traceAllFlag)).Queries("updateURL", "{updateURL:.*}", "type", "2")
+
+		// Deprecated: Update MinIO servers.
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/update").HandlerFunc(adminMiddleware(adminAPI.ServerUpdateHandler, traceAllFlag)).Queries("updateURL", "{updateURL:.*}")
 
 		// Info operations
@@ -300,6 +307,12 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(adminMiddleware(adminAPI.GetIdentityProviderCfg))
 		adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(adminMiddleware(adminAPI.DeleteIdentityProviderCfg))
 
+		// LDAP specific service accounts ops
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/idp/ldap/add-service-account").HandlerFunc(adminMiddleware(adminAPI.AddServiceAccountLDAP))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/idp/ldap/list-access-keys").
+			HandlerFunc(adminMiddleware(adminAPI.ListAccessKeysLDAP)).
+			Queries("userDN", "{userDN:.*}", "listType", "{listType:.*}")
+
 		// LDAP IAM operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp/ldap/policy-entities").HandlerFunc(adminMiddleware(adminAPI.ListLDAPPolicyMappingEntities))
 		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/idp/ldap/policy/{operation}").HandlerFunc(adminMiddleware(adminAPI.AttachDetachPolicyLDAP))
@@ -376,6 +389,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/edit").HandlerFunc(adminMiddleware(adminAPI.SRPeerEdit))
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/remove").HandlerFunc(adminMiddleware(adminAPI.SRPeerRemove))
 		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/site-replication/resync/op").HandlerFunc(adminMiddleware(adminAPI.SiteReplicationResyncOp)).Queries("operation", "{operation:.*}")
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/state/edit").HandlerFunc(adminMiddleware(adminAPI.SRStateEdit))
 
 		if globalIsDistErasure {
 			// Top locks

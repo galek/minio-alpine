@@ -47,14 +47,21 @@ import (
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/certs"
 	"github.com/minio/pkg/v2/env"
 	"golang.org/x/exp/slices"
+	"gopkg.in/yaml.v2"
 )
 
 // ServerFlags - server command specific flags
 var ServerFlags = []cli.Flag{
+	cli.StringFlag{
+		Name:   "config",
+		Usage:  "specify server configuration via YAML configuration",
+		EnvVar: "MINIO_CONFIG",
+	},
 	cli.StringFlag{
 		Name:   "address",
 		Value:  ":" + GlobalMinioDefaultPort,
@@ -83,7 +90,7 @@ var ServerFlags = []cli.Flag{
 	cli.DurationFlag{
 		Name:   "idle-timeout",
 		Value:  xhttp.DefaultIdleTimeout,
-		Usage:  "idle timeout is the maximum amount of time to wait for the next request when keep-alives are enabled",
+		Usage:  "idle timeout is the maximum amount of time to wait for the next request when keep-alive are enabled",
 		EnvVar: "MINIO_IDLE_TIMEOUT",
 		Hidden: true,
 	},
@@ -226,9 +233,57 @@ func serverCmdArgs(ctx *cli.Context) []string {
 	return strings.Fields(v)
 }
 
-func serverHandleCmdArgs(ctx *cli.Context) {
-	// Handle common command args.
-	handleCommonCmdArgs(ctx)
+func mergeServerCtxtFromConfigFile(configFile string, ctxt *serverCtxt) error {
+	rd, err := Open(configFile)
+	if err != nil {
+		return err
+	}
+	defer rd.Close()
+
+	cf := &config.ServerConfig{}
+	dec := yaml.NewDecoder(rd)
+	dec.SetStrict(true)
+	if err = dec.Decode(cf); err != nil {
+		return err
+	}
+	if cf.Version != "v1" {
+		return fmt.Errorf("unexpected version: %s", cf.Version)
+	}
+
+	ctxt.RootUser = cf.RootUser
+	ctxt.RootPwd = cf.RootPwd
+
+	if cf.Addr != "" {
+		ctxt.Addr = cf.Addr
+	}
+	if cf.ConsoleAddr != "" {
+		ctxt.ConsoleAddr = cf.ConsoleAddr
+	}
+	if cf.CertsDir != "" {
+		ctxt.CertsDir = cf.CertsDir
+		ctxt.certsDirSet = true
+	}
+
+	if cf.Options.FTP.Address != "" {
+		ctxt.FTP = append(ctxt.FTP, fmt.Sprintf("address=%s", cf.Options.FTP.Address))
+	}
+	if cf.Options.FTP.PassivePortRange != "" {
+		ctxt.FTP = append(ctxt.FTP, fmt.Sprintf("passive-port-range=%s", cf.Options.FTP.PassivePortRange))
+	}
+
+	if cf.Options.SFTP.Address != "" {
+		ctxt.SFTP = append(ctxt.SFTP, fmt.Sprintf("address=%s", cf.Options.SFTP.Address))
+	}
+	if cf.Options.SFTP.SSHPrivateKey != "" {
+		ctxt.SFTP = append(ctxt.SFTP, fmt.Sprintf("ssh-private-key=%s", cf.Options.SFTP.SSHPrivateKey))
+	}
+
+	ctxt.Layout, err = buildDisksLayoutFromConfFile(cf.Pools)
+	return err
+}
+
+func serverHandleCmdArgs(ctxt serverCtxt) {
+	handleCommonArgs(ctxt)
 
 	logger.FatalIf(CheckLocalServerAddr(globalMinioAddr), "Unable to validate passed arguments")
 
@@ -251,7 +306,7 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	// Register root CAs for remote ENVs
 	env.RegisterGlobalCAs(globalRootCAs)
 
-	globalEndpoints, setupType, err = createServerEndpoints(globalMinioAddr, serverCmdArgs(ctx)...)
+	globalEndpoints, setupType, err = createServerEndpoints(globalMinioAddr, ctxt.Layout.pools, ctxt.Layout.legacy)
 	logger.FatalIf(err, "Invalid command line arguments")
 	globalNodes = globalEndpoints.GetNodes()
 
@@ -262,7 +317,7 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	}
 	globalIsErasureSD = (setupType == ErasureSDSetupType)
 	if globalDynamicAPIPort && globalIsDistErasure {
-		logger.FatalIf(errInvalidArgument, "Invalid --address=\"%s\", port '0' is not allowed in a distributed erasure coded setup", ctx.String("address"))
+		logger.FatalIf(errInvalidArgument, "Invalid --address=\"%s\", port '0' is not allowed in a distributed erasure coded setup", ctxt.Addr)
 	}
 
 	globalLocalNodeName = GetLocalPeer(globalEndpoints, globalMinioHost, globalMinioPort)
@@ -270,7 +325,7 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	globalLocalNodeNameHex = hex.EncodeToString(nodeNameSum[:])
 
 	// Initialize, see which NIC the service is running on, and save it as global value
-	setGlobalInternodeInterface(ctx.String("interface"))
+	setGlobalInternodeInterface(ctxt.Interface)
 
 	// allow transport to be HTTP/1.1 for proxying.
 	globalProxyTransport = NewCustomHTTPProxyTransport()()
@@ -289,8 +344,8 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	})
 
 	globalTCPOptions = xhttp.TCPOptions{
-		UserTimeout: int(ctx.Duration("conn-user-timeout").Milliseconds()),
-		Interface:   ctx.String("interface"),
+		UserTimeout: int(ctxt.UserTimeout.Milliseconds()),
+		Interface:   ctxt.Interface,
 	}
 
 	// On macOS, if a process already listens on LOCALIPADDR:PORT, net.Listen() falls back
@@ -299,13 +354,8 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	// To avoid this error situation we check for port availability.
 	logger.FatalIf(xhttp.CheckPortAvailability(globalMinioHost, globalMinioPort, globalTCPOptions), "Unable to start the server")
 
-	globalConnReadDeadline = ctx.Duration("conn-read-deadline")
-	globalConnWriteDeadline = ctx.Duration("conn-write-deadline")
-}
-
-func serverHandleEnvVars() {
-	// Handle common environment variables.
-	handleCommonEnvVars()
+	globalConnReadDeadline = ctxt.ConnReadDeadline
+	globalConnWriteDeadline = ctxt.ConnWriteDeadline
 }
 
 var globalHealStateLK sync.RWMutex
@@ -321,7 +371,7 @@ func initAllSubsystems(ctx context.Context) {
 	globalNotificationSys = NewNotificationSys(globalEndpoints)
 
 	// Create new notification system
-	globalEventNotifier = NewEventNotifier()
+	globalEventNotifier = NewEventNotifier(GlobalContext)
 
 	// Create new bucket metadata system.
 	if globalBucketMetadataSys == nil {
@@ -332,7 +382,7 @@ func initAllSubsystems(ctx context.Context) {
 	}
 
 	// Create the bucket bandwidth monitor
-	globalBucketMonitor = bandwidth.NewMonitor(ctx, totalNodeCount())
+	globalBucketMonitor = bandwidth.NewMonitor(ctx, uint64(totalNodeCount()))
 
 	// Create a new config system.
 	globalConfigSys = NewConfigSys()
@@ -360,7 +410,7 @@ func initAllSubsystems(ctx context.Context) {
 		globalBucketVersioningSys = NewBucketVersioningSys()
 	}
 
-	// Create new bucket replication subsytem
+	// Create new bucket replication subsystem
 	globalBucketTargetSys = NewBucketTargetSys(GlobalContext)
 
 	// Create new ILM tier configuration subsystem
@@ -590,13 +640,23 @@ func serverMain(ctx *cli.Context) {
 	// Always load ENV variables from files first.
 	loadEnvVarsFromFiles()
 
-	// Handle all server command args.
+	// Handle all server command args and build the disks layout
 	bootstrapTrace("serverHandleCmdArgs", func() {
-		serverHandleCmdArgs(ctx)
+		err := buildServerCtxt(ctx, &globalServerCtxt)
+		logger.FatalIf(err, "Unable to prepare the list of endpoints")
+
+		serverHandleCmdArgs(globalServerCtxt)
 	})
+
+	// DNS cache subsystem to reduce outgoing DNS requests
+	runDNSCache(ctx)
 
 	// Handle all server environment vars.
 	serverHandleEnvVars()
+
+	// Load the root credentials from the shell environment or from
+	// the config file if not defined, set the default one.
+	loadRootCredentials()
 
 	// Initialize globalConsoleSys system
 	bootstrapTrace("newConsoleLogger", func() {
@@ -637,7 +697,7 @@ func serverMain(ctx *cli.Context) {
 
 	// Check for updates in non-blocking manner.
 	go func() {
-		if !globalCLIContext.Quiet && !globalInplaceUpdateDisabled {
+		if !globalServerCtxt.Quiet && !globalInplaceUpdateDisabled {
 			// Check for new updates from dl.min.io.
 			bootstrapTrace("checkUpdate", func() {
 				checkUpdate(getMinioMode())
@@ -666,19 +726,26 @@ func serverMain(ctx *cli.Context) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
+	// Initialize gridn
+	bootstrapTrace("initGrid", func() {
+		logger.FatalIf(initGlobalGrid(GlobalContext, globalEndpoints), "Unable to configure server grid RPC services")
+	})
+
 	// Configure server.
 	bootstrapTrace("configureServer", func() {
 		handler, err := configureServerHandler(globalEndpoints)
 		if err != nil {
 			logger.Fatal(config.ErrUnexpectedError(err), "Unable to configure one of server's RPC services")
 		}
+		// Allow grid to start after registering all services.
+		xioutil.SafeClose(globalGridStart)
 
 		httpServer := xhttp.NewServer(getServerListenAddrs()).
 			UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 			UseTLSConfig(newTLSConfig(getCert)).
-			UseShutdownTimeout(ctx.Duration("shutdown-timeout")).
-			UseIdleTimeout(ctx.Duration("idle-timeout")).
-			UseReadHeaderTimeout(ctx.Duration("read-header-timeout")).
+			UseShutdownTimeout(globalServerCtxt.ShutdownTimeout).
+			UseIdleTimeout(globalServerCtxt.IdleTimeout).
+			UseReadHeaderTimeout(globalServerCtxt.ReadHeaderTimeout).
 			UseBaseContext(GlobalContext).
 			UseCustomLogger(log.New(io.Discard, "", 0)). // Turn-off random logging by Go stdlib
 			UseTCPOptions(globalTCPOptions)
@@ -701,7 +768,7 @@ func serverMain(ctx *cli.Context) {
 	if globalIsDistErasure {
 		bootstrapTrace("verifying system configuration", func() {
 			// Additionally in distributed setup, validate the setup and configuration.
-			if err := verifyServerSystemConfig(GlobalContext, globalEndpoints); err != nil {
+			if err := verifyServerSystemConfig(GlobalContext, globalEndpoints, globalGrid.Load()); err != nil {
 				logger.Fatal(err, "Unable to start the server")
 			}
 		})
@@ -772,7 +839,7 @@ func serverMain(ctx *cli.Context) {
 			logger.LogIf(GlobalContext, err)
 		}
 
-		if !globalCLIContext.StrictS3Compat {
+		if !globalServerCtxt.StrictS3Compat {
 			logger.Info(color.RedBold("WARNING: Strict AWS S3 compatible incoming PUT, POST content payload validation is turned off, caution is advised do not use in production"))
 		}
 	})
@@ -806,16 +873,16 @@ func serverMain(ctx *cli.Context) {
 		}
 
 		// if we see FTP args, start FTP if possible
-		if len(ctx.StringSlice("ftp")) > 0 {
+		if len(globalServerCtxt.FTP) > 0 {
 			bootstrapTrace("go startFTPServer", func() {
-				go startFTPServer(ctx)
+				go startFTPServer(globalServerCtxt.FTP)
 			})
 		}
 
 		// If we see SFTP args, start SFTP if possible
-		if len(ctx.StringSlice("sftp")) > 0 {
-			bootstrapTrace("go startFTPServer", func() {
-				go startSFTPServer(ctx)
+		if len(globalServerCtxt.SFTP) > 0 {
+			bootstrapTrace("go startSFTPServer", func() {
+				go startSFTPServer(globalServerCtxt.SFTP)
 			})
 		}
 	}()
@@ -833,7 +900,9 @@ func serverMain(ctx *cli.Context) {
 
 		// Initialize data scanner.
 		bootstrapTrace("initDataScanner", func() {
-			initDataScanner(GlobalContext, newObject)
+			if v := env.Get("_MINIO_SCANNER", config.EnableOn); v == config.EnableOn {
+				initDataScanner(GlobalContext, newObject)
+			}
 		})
 
 		// Initialize background replication

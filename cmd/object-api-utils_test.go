@@ -99,7 +99,7 @@ func testPathTraversalExploit(obj ObjectLayer, instanceType, bucketName string, 
 		t.Fatalf("failed to create HTTP request for Put Object: <ERROR> %v", err)
 	}
 
-	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 	// Call the ServeHTTP to execute the handler.
 	apiRouter.ServeHTTP(rec, req)
 
@@ -111,7 +111,7 @@ func testPathTraversalExploit(obj ObjectLayer, instanceType, bucketName string, 
 	z := obj.(*erasureServerPools)
 	xl := z.serverPools[0].sets[0]
 	erasureDisks := xl.getDisks()
-	parts, errs := readAllFileInfo(ctx, erasureDisks, bucketName, objectName, "", false)
+	parts, errs := readAllFileInfo(ctx, erasureDisks, bucketName, objectName, "", false, false)
 	for i := range parts {
 		if errs[i] == nil {
 			if parts[i].Name == objectName {

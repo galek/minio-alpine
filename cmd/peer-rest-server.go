@@ -20,19 +20,24 @@ package cmd
 import (
 	"context"
 	"encoding/gob"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/klauspost/compress/zstd"
 	"github.com/minio/madmin-go/v3"
 	b "github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/event"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/mux"
@@ -344,7 +349,14 @@ func (s *peerRESTServer) LocalStorageInfoHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(objLayer.LocalStorageInfo(r.Context())))
+	metrics, err := strconv.ParseBool(r.Form.Get(peerRESTMetrics))
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+
+	}
+
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(objLayer.LocalStorageInfo(r.Context(), metrics)))
 }
 
 // ServerInfoHandler - returns Server Info
@@ -815,8 +827,8 @@ func (s *peerRESTServer) GetLocalDiskIDs(w http.ResponseWriter, r *http.Request)
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(ids))
 }
 
-// DownloadBinary - updates the current server.
-func (s *peerRESTServer) DownloadBinaryHandler(w http.ResponseWriter, r *http.Request) {
+// VerifyBinary - verifies the downloaded binary is in-tact
+func (s *peerRESTServer) VerifyBinaryHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -827,14 +839,38 @@ func (s *peerRESTServer) DownloadBinaryHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	var info binaryInfo
-	err := gob.NewDecoder(r.Body).Decode(&info)
+	u, err := url.Parse(r.Form.Get(peerRESTURL))
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
 
-	if err = verifyBinary(info.URL, info.Sha256Sum, info.ReleaseInfo, getMinioMode(), info.BinaryFile); err != nil {
+	sha256Sum, err := hex.DecodeString(r.Form.Get(peerRESTSha256Sum))
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+	releaseInfo := r.Form.Get(peerRESTReleaseInfo)
+
+	lrTime, err := releaseInfoToReleaseTime(releaseInfo)
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+
+	if lrTime.Sub(currentReleaseTime) <= 0 {
+		s.writeErrorResponse(w, fmt.Errorf("server is already running the latest version: %s", Version))
+		return
+	}
+
+	zr, err := zstd.NewReader(r.Body)
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+	defer zr.Close()
+
+	if err = verifyBinary(u, sha256Sum, releaseInfo, getMinioMode(), zr); err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
@@ -854,6 +890,24 @@ func (s *peerRESTServer) CommitBinaryHandler(w http.ResponseWriter, r *http.Requ
 }
 
 var errUnsupportedSignal = fmt.Errorf("unsupported signal")
+
+func waitingDrivesNode() map[string]madmin.DiskMetrics {
+	errs := make([]error, len(globalLocalDrives))
+	infos := make([]DiskInfo, len(globalLocalDrives))
+	for i, drive := range globalLocalDrives {
+		infos[i], errs[i] = drive.DiskInfo(GlobalContext, DiskInfoOptions{})
+	}
+	infoMaps := make(map[string]madmin.DiskMetrics)
+	for i := range infos {
+		if infos[i].Metrics.TotalWaiting >= 1 && errors.Is(errs[i], errFaultyDisk) {
+			infoMaps[infos[i].Endpoint] = madmin.DiskMetrics{
+				TotalTokens:  infos[i].Metrics.TotalTokens,
+				TotalWaiting: infos[i].Metrics.TotalWaiting,
+			}
+		}
+	}
+	return infoMaps
+}
 
 // SignalServiceHandler - signal service handler.
 func (s *peerRESTServer) SignalServiceHandler(w http.ResponseWriter, r *http.Request) {
@@ -875,10 +929,21 @@ func (s *peerRESTServer) SignalServiceHandler(w http.ResponseWriter, r *http.Req
 	}
 	signal := serviceSignal(si)
 	switch signal {
-	case serviceRestart:
-		globalServiceSignalCh <- signal
-	case serviceStop:
-		globalServiceSignalCh <- signal
+	case serviceRestart, serviceStop:
+		dryRun := r.Form.Get("dry-run") == "true" // This is only supported for `restart/stop`
+
+		waitingDisks := waitingDrivesNode()
+		if len(waitingDisks) > 0 {
+			buf, err := json.Marshal(waitingDisks)
+			if err != nil {
+				s.writeErrorResponse(w, err)
+				return
+			}
+			s.writeErrorResponse(w, errors.New(string(buf)))
+		}
+		if !dryRun {
+			globalServiceSignalCh <- signal
+		}
 	case serviceFreeze:
 		freezeServices()
 	case serviceUnFreeze:
@@ -1172,7 +1237,7 @@ func (s *peerRESTServer) ConsoleLogHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	doneCh := make(chan struct{})
-	defer close(doneCh)
+	defer xioutil.SafeClose(doneCh)
 
 	ch := make(chan log.Info, 100000)
 	err := globalConsoleSys.Subscribe(ch, doneCh, "", 0, madmin.LogMaskAll, nil)
@@ -1233,7 +1298,7 @@ func (s *peerRESTServer) GetBandwidth(w http.ResponseWriter, r *http.Request) {
 	bucketsString := r.Form.Get("buckets")
 
 	doneCh := make(chan struct{})
-	defer close(doneCh)
+	defer xioutil.SafeClose(doneCh)
 
 	selectBuckets := b.SelectBuckets(strings.Split(bucketsString, ",")...)
 	report := globalBucketMonitor.GetReport(selectBuckets)
@@ -1296,6 +1361,7 @@ func (s *peerRESTServer) SpeedTestHandler(w http.ResponseWriter, r *http.Request
 	concurrentStr := r.Form.Get(peerRESTConcurrent)
 	storageClass := r.Form.Get(peerRESTStorageClass)
 	bucketName := r.Form.Get(peerRESTBucket)
+	enableSha256 := r.Form.Get(peerRESTEnableSha256) == "true"
 
 	size, err := strconv.Atoi(sizeStr)
 	if err != nil {
@@ -1320,6 +1386,7 @@ func (s *peerRESTServer) SpeedTestHandler(w http.ResponseWriter, r *http.Request
 		duration:     duration,
 		storageClass: storageClass,
 		bucketName:   bucketName,
+		enableSha256: enableSha256,
 	})
 	if err != nil {
 		result.Error = err.Error()
@@ -1423,7 +1490,7 @@ func (s *peerRESTServer) DevNull(w http.ResponseWriter, r *http.Request) {
 	connectTime := time.Now()
 	ctx := newContext(r, w, "DevNull")
 	for {
-		n, err := io.CopyN(io.Discard, r.Body, 128*humanize.KiByte)
+		n, err := io.CopyN(xioutil.Discard, r.Body, 128*humanize.KiByte)
 		atomic.AddUint64(&globalNetPerfRX.RX, uint64(n))
 		if err != nil && err != io.EOF {
 			// If there is a disconnection before globalNetPerfMinDuration (we give a margin of error of 1 sec)
@@ -1482,7 +1549,7 @@ func registerPeerRESTHandlers(router *mux.Router) {
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadBucketMetadata).HandlerFunc(h(server.LoadBucketMetadataHandler)).Queries(restQueries(peerRESTBucket)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetBucketStats).HandlerFunc(h(server.GetBucketStatsHandler)).Queries(restQueries(peerRESTBucket)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodSignalService).HandlerFunc(h(server.SignalServiceHandler)).Queries(restQueries(peerRESTSignal)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDownloadBinary).HandlerFunc(h(server.DownloadBinaryHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodVerifyBinary).HandlerFunc(h(server.VerifyBinaryHandler)).Queries(restQueries(peerRESTURL, peerRESTSha256Sum, peerRESTReleaseInfo)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCommitBinary).HandlerFunc(h(server.CommitBinaryHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeletePolicy).HandlerFunc(h(server.DeletePolicyHandler)).Queries(restQueries(peerRESTPolicy)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadPolicy).HandlerFunc(h(server.LoadPolicyHandler)).Queries(restQueries(peerRESTPolicy)...)

@@ -133,6 +133,121 @@ func getOpts(ctx context.Context, r *http.Request, bucket, object string) (Objec
 	return opts, nil
 }
 
+func getAndValidateAttributesOpts(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, object string) (opts ObjectOptions, valid bool) {
+	var argumentName string
+	var argumentValue string
+	var apiErr APIError
+	var err error
+	valid = true
+
+	defer func() {
+		if valid {
+			return
+		}
+
+		errResp := objectAttributesErrorResponse{
+			ArgumentName:  &argumentName,
+			ArgumentValue: &argumentValue,
+			APIErrorResponse: getAPIErrorResponse(
+				ctx,
+				apiErr,
+				r.URL.Path,
+				w.Header().Get(xhttp.AmzRequestID),
+				w.Header().Get(xhttp.AmzRequestHostID),
+			),
+		}
+
+		writeResponse(w, apiErr.HTTPStatusCode, encodeResponse(errResp), mimeXML)
+	}()
+
+	opts, err = getOpts(ctx, r, bucket, object)
+	if err != nil {
+		switch vErr := err.(type) {
+		case InvalidVersionID:
+			apiErr = toAPIError(ctx, vErr)
+			argumentName = strings.ToLower("versionId")
+			argumentValue = vErr.VersionID
+		default:
+			apiErr = toAPIError(ctx, vErr)
+		}
+		valid = false
+		return
+	}
+
+	opts.MaxParts, err = parseIntHeader(bucket, object, r.Header, xhttp.AmzMaxParts)
+	if err != nil {
+		apiErr = toAPIError(ctx, err)
+		argumentName = strings.ToLower(xhttp.AmzMaxParts)
+		valid = false
+		return
+	}
+
+	if opts.MaxParts == 0 {
+		opts.MaxParts = maxPartsList
+	}
+
+	opts.PartNumberMarker, err = parseIntHeader(bucket, object, r.Header, xhttp.AmzPartNumberMarker)
+	if err != nil {
+		apiErr = toAPIError(ctx, err)
+		argumentName = strings.ToLower(xhttp.AmzPartNumberMarker)
+		valid = false
+		return
+	}
+
+	opts.ObjectAttributes = parseObjectAttributes(r.Header)
+	if len(opts.ObjectAttributes) < 1 {
+		apiErr = errorCodes.ToAPIErr(ErrInvalidAttributeName)
+		argumentName = strings.ToLower(xhttp.AmzObjectAttributes)
+		valid = false
+		return
+	}
+
+	for tag := range opts.ObjectAttributes {
+		switch tag {
+		case xhttp.ETag:
+		case xhttp.Checksum:
+		case xhttp.StorageClass:
+		case xhttp.ObjectSize:
+		case xhttp.ObjectParts:
+		default:
+			apiErr = errorCodes.ToAPIErr(ErrInvalidAttributeName)
+			argumentName = strings.ToLower(xhttp.AmzObjectAttributes)
+			argumentValue = tag
+			valid = false
+			return
+		}
+	}
+
+	return
+}
+
+func parseObjectAttributes(h http.Header) (attributes map[string]struct{}) {
+	attributes = make(map[string]struct{})
+	for _, v := range strings.Split(strings.TrimSpace(h.Get(xhttp.AmzObjectAttributes)), ",") {
+		if v != "" {
+			attributes[v] = struct{}{}
+		}
+	}
+
+	return
+}
+
+func parseIntHeader(bucket, object string, h http.Header, headerName string) (value int, err error) {
+	stringInt := strings.TrimSpace(h.Get(headerName))
+	if stringInt == "" {
+		return
+	}
+	value, err = strconv.Atoi(stringInt)
+	if err != nil {
+		return 0, InvalidArgument{
+			Bucket: bucket,
+			Object: object,
+			Err:    fmt.Errorf("Unable to parse %s, value should be an integer", headerName),
+		}
+	}
+	return
+}
+
 func parseBoolHeader(bucket, object string, h http.Header, headerName string) (bool, error) {
 	value := strings.TrimSpace(h.Get(headerName))
 	if value != "" {
@@ -199,11 +314,15 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 }
 
 // get ObjectOptions for PUT calls from encryption headers and metadata
-func putOpts(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
+func putOptsFromReq(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
+	return putOpts(ctx, bucket, object, r.Form.Get(xhttp.VersionID), r.Header, metadata)
+}
+
+func putOpts(ctx context.Context, bucket, object, vid string, hdrs http.Header, metadata map[string]string) (opts ObjectOptions, err error) {
 	versioned := globalBucketVersioningSys.PrefixEnabled(bucket, object)
 	versionSuspended := globalBucketVersioningSys.PrefixSuspended(bucket, object)
 
-	vid := strings.TrimSpace(r.Form.Get(xhttp.VersionID))
+	vid = strings.TrimSpace(vid)
 	if vid != "" && vid != nullVersionID {
 		_, err := uuid.Parse(vid)
 		if err != nil {
@@ -221,54 +340,59 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			}
 		}
 	}
+	opts, err = putOptsFromHeaders(ctx, hdrs, metadata)
+	if err != nil {
+		return opts, InvalidArgument{
+			Bucket: bucket,
+			Object: object,
+			Err:    err,
+		}
+	}
 
-	mtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
+	opts.VersionID = vid
+	opts.Versioned = versioned
+	opts.VersionSuspended = versionSuspended
+
+	// For directory objects skip creating new versions.
+	if isDirObject(object) && vid == "" {
+		opts.VersionID = nullVersionID
+	}
+
+	return opts, nil
+}
+
+func putOptsFromHeaders(ctx context.Context, hdr http.Header, metadata map[string]string) (opts ObjectOptions, err error) {
+	mtimeStr := strings.TrimSpace(hdr.Get(xhttp.MinIOSourceMTime))
 	var mtime time.Time
 	if mtimeStr != "" {
 		mtime, err = time.Parse(time.RFC3339Nano, mtimeStr)
 		if err != nil {
-			return opts, InvalidArgument{
-				Bucket: bucket,
-				Object: object,
-				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceMTime, err),
-			}
+			return opts, fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceMTime, err)
 		}
 	}
-	retaintimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceObjectRetentionTimestamp))
+	retaintimeStr := strings.TrimSpace(hdr.Get(xhttp.MinIOSourceObjectRetentionTimestamp))
 	var retaintimestmp time.Time
 	if retaintimeStr != "" {
 		retaintimestmp, err = time.Parse(time.RFC3339, retaintimeStr)
 		if err != nil {
-			return opts, InvalidArgument{
-				Bucket: bucket,
-				Object: object,
-				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceObjectRetentionTimestamp, err),
-			}
+			return opts, fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceObjectRetentionTimestamp, err)
 		}
 	}
 
-	lholdtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceObjectLegalHoldTimestamp))
+	lholdtimeStr := strings.TrimSpace(hdr.Get(xhttp.MinIOSourceObjectLegalHoldTimestamp))
 	var lholdtimestmp time.Time
 	if lholdtimeStr != "" {
 		lholdtimestmp, err = time.Parse(time.RFC3339, lholdtimeStr)
 		if err != nil {
-			return opts, InvalidArgument{
-				Bucket: bucket,
-				Object: object,
-				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceObjectLegalHoldTimestamp, err),
-			}
+			return opts, fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceObjectLegalHoldTimestamp, err)
 		}
 	}
-	tagtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceTaggingTimestamp))
+	tagtimeStr := strings.TrimSpace(hdr.Get(xhttp.MinIOSourceTaggingTimestamp))
 	var taggingtimestmp time.Time
 	if tagtimeStr != "" {
 		taggingtimestmp, err = time.Parse(time.RFC3339, tagtimeStr)
 		if err != nil {
-			return opts, InvalidArgument{
-				Bucket: bucket,
-				Object: object,
-				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceTaggingTimestamp, err),
-			}
+			return opts, fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceTaggingTimestamp, err)
 		}
 	}
 
@@ -276,18 +400,14 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 		metadata = make(map[string]string)
 	}
 
-	wantCRC, err := hash.GetContentChecksum(r.Header)
+	wantCRC, err := hash.GetContentChecksum(hdr)
 	if err != nil {
-		return opts, InvalidArgument{
-			Bucket: bucket,
-			Object: object,
-			Err:    fmt.Errorf("invalid/unknown checksum sent: %v", err),
-		}
+		return opts, fmt.Errorf("invalid/unknown checksum sent: %v", err)
 	}
-	etag := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceETag))
+	etag := strings.TrimSpace(hdr.Get(xhttp.MinIOSourceETag))
 
-	if crypto.S3KMS.IsRequested(r.Header) {
-		keyID, context, err := crypto.S3KMS.ParseHTTP(r.Header)
+	if crypto.S3KMS.IsRequested(hdr) {
+		keyID, context, err := crypto.S3KMS.ParseHTTP(hdr)
 		if err != nil {
 			return ObjectOptions{}, err
 		}
@@ -298,27 +418,15 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 		return ObjectOptions{
 			ServerSideEncryption: sseKms,
 			UserDefined:          metadata,
-			VersionID:            vid,
-			Versioned:            versioned,
-			VersionSuspended:     versionSuspended,
 			MTime:                mtime,
 			WantChecksum:         wantCRC,
 			PreserveETag:         etag,
 		}, nil
 	}
 	// default case of passing encryption headers and UserDefined metadata to backend
-	opts, err = getDefaultOpts(r.Header, false, metadata)
+	opts, err = getDefaultOpts(hdr, false, metadata)
 	if err != nil {
 		return opts, err
-	}
-
-	opts.VersionID = vid
-	opts.Versioned = versioned
-	opts.VersionSuspended = versionSuspended
-
-	// For directory objects skip creating new versions.
-	if isDirObject(object) && vid == "" {
-		opts.VersionID = nullVersionID
 	}
 
 	opts.MTime = mtime
@@ -333,7 +441,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 
 // get ObjectOptions for Copy calls with encryption headers provided on the target side and source side metadata
 func copyDstOpts(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
-	return putOpts(ctx, r, bucket, object, metadata)
+	return putOptsFromReq(ctx, r, bucket, object, metadata)
 }
 
 // get ObjectOptions for Copy calls with encryption headers provided on the source side

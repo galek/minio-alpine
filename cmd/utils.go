@@ -99,11 +99,15 @@ func ErrorRespToObjectError(err error, params ...string) error {
 
 	bucket := ""
 	object := ""
+	versionID := ""
 	if len(params) >= 1 {
 		bucket = params[0]
 	}
-	if len(params) == 2 {
+	if len(params) >= 2 {
 		object = params[1]
+	}
+	if len(params) >= 3 {
+		versionID = params[2]
 	}
 
 	if xnet.IsNetworkOrHostDown(err, false) {
@@ -118,6 +122,10 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	}
 
 	switch minioErr.Code {
+	case "SlowDownWrite":
+		err = InsufficientWriteQuorum{Bucket: bucket, Object: object}
+	case "SlowDownRead":
+		err = InsufficientReadQuorum{Bucket: bucket, Object: object}
 	case "PreconditionFailed":
 		err = PreConditionFailed{}
 	case "InvalidRange":
@@ -139,6 +147,12 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	case "NoSuchKey":
 		if object != "" {
 			err = ObjectNotFound{Bucket: bucket, Object: object}
+		} else {
+			err = BucketNotFound{Bucket: bucket}
+		}
+	case "NoSuchVersion":
+		if object != "" {
+			err = ObjectNotFound{Bucket: bucket, Object: object, VersionID: versionID}
 		} else {
 			err = BucketNotFound{Bucket: bucket}
 		}
@@ -278,7 +292,7 @@ func isMaxPartID(partID int) bool {
 	return partID > globalMaxPartID
 }
 
-// profilerWrapper is created becauses pkg/profiler doesn't
+// profilerWrapper is created because pkg/profiler doesn't
 // provide any API to calculate the profiler file path in the
 // disk since the name of this latter is randomly generated.
 type profilerWrapper struct {
@@ -1022,9 +1036,8 @@ func isDirObject(object string) bool {
 }
 
 // Helper method to return total number of nodes in cluster
-func totalNodeCount() uint64 {
-	peers, _ := globalEndpoints.peers()
-	totalNodesCount := uint64(len(peers))
+func totalNodeCount() int {
+	totalNodesCount := len(globalEndpoints.Hostnames())
 	if totalNodesCount == 0 {
 		totalNodesCount = 1 // For standalone erasure coding
 	}
@@ -1254,4 +1267,22 @@ func unwrapAll(err error) error {
 func stringsHasPrefixFold(s, prefix string) bool {
 	// Test match with case first.
 	return len(s) >= len(prefix) && (s[0:len(prefix)] == prefix || strings.EqualFold(s[0:len(prefix)], prefix))
+}
+
+func ptr[T any](a T) *T {
+	return &a
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

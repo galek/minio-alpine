@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -78,8 +78,11 @@ const (
 
 // Detects change in underlying disk.
 type xlStorageDiskIDCheck struct {
-	totalErrsAvailability uint64 // Captures all data availability errors such as permission denied, faulty disk and timeout errors.
-	totalErrsTimeout      uint64 // Captures all timeout only errors
+	totalWrites           atomic.Uint64
+	totalDeletes          atomic.Uint64
+	totalErrsAvailability atomic.Uint64 // Captures all data availability errors such as permission denied, faulty disk and timeout errors.
+	totalErrsTimeout      atomic.Uint64 // Captures all timeout only errors
+
 	// apiCalls should be placed first so alignment is guaranteed for atomic operations.
 	apiCalls     [storageMetricLast]uint64
 	apiLatencies [storageMetricLast]*lockedLastMinuteLatency
@@ -87,22 +90,22 @@ type xlStorageDiskIDCheck struct {
 	storage      *xlStorage
 	health       *diskHealthTracker
 
-	// diskStartChecking is a threshold above which we will start to check
-	// the state of disks, generally this value is less than diskMaxConcurrent
-	diskStartChecking int
+	// driveStartChecking is a threshold above which we will start to check
+	// the state of disks, generally this value is less than driveMaxConcurrent
+	driveStartChecking int
 
-	// diskMaxConcurrent represents maximum number of running concurrent
+	// driveMaxConcurrent represents maximum number of running concurrent
 	// operations for local and (incoming) remote disk operations.
-	diskMaxConcurrent int
+	driveMaxConcurrent int
 
 	metricsCache timedValue
 	diskCtx      context.Context
-	cancel       context.CancelFunc
+	diskCancel   context.CancelFunc
 }
 
 func (p *xlStorageDiskIDCheck) getMetrics() DiskMetrics {
 	p.metricsCache.Once.Do(func() {
-		p.metricsCache.TTL = 1 * time.Second
+		p.metricsCache.TTL = 5 * time.Second
 		p.metricsCache.Update = func() (interface{}, error) {
 			diskMetric := DiskMetrics{
 				LastMinute: make(map[string]AccElem, len(p.apiLatencies)),
@@ -114,13 +117,22 @@ func (p *xlStorageDiskIDCheck) getMetrics() DiskMetrics {
 			for i := range p.apiCalls {
 				diskMetric.APICalls[storageMetric(i).String()] = atomic.LoadUint64(&p.apiCalls[i])
 			}
-			diskMetric.TotalErrorsAvailability = atomic.LoadUint64(&p.totalErrsAvailability)
-			diskMetric.TotalErrorsTimeout = atomic.LoadUint64(&p.totalErrsTimeout)
 			return diskMetric, nil
 		}
 	})
 	m, _ := p.metricsCache.Get()
-	return m.(DiskMetrics)
+	diskMetric := DiskMetrics{}
+	if m != nil {
+		diskMetric = m.(DiskMetrics)
+	}
+
+	// Do not need this value to be cached.
+	diskMetric.TotalTokens = uint32(p.driveMaxConcurrent)
+	diskMetric.TotalWaiting = uint32(p.health.waiting.Load())
+	diskMetric.TotalErrorsTimeout = p.totalErrsTimeout.Load()
+	diskMetric.TotalErrorsAvailability = p.totalErrsAvailability.Load()
+
+	return diskMetric
 }
 
 // lockedLastMinuteLatency accumulates totals lockless for each second.
@@ -180,44 +192,50 @@ func (e *lockedLastMinuteLatency) total() AccElem {
 var maxConcurrentOnce sync.Once
 
 func newXLStorageDiskIDCheck(storage *xlStorage, healthCheck bool) *xlStorageDiskIDCheck {
-	// diskMaxConcurrent represents maximum number of running concurrent
+	// driveMaxConcurrent represents maximum number of running concurrent
 	// operations for local and (incoming) remote disk operations.
 	//
 	// this value is a placeholder it is overridden via ENV for custom settings
 	// or this default value is used to pick the correct value HDDs v/s NVMe's
-	diskMaxConcurrent := -1
+	driveMaxConcurrent := -1
 	maxConcurrentOnce.Do(func() {
 		s := env.Get("_MINIO_DRIVE_MAX_CONCURRENT", "")
 		if s == "" {
 			s = env.Get("_MINIO_DISK_MAX_CONCURRENT", "")
 		}
 		if s != "" {
-			diskMaxConcurrent, _ = strconv.Atoi(s)
+			driveMaxConcurrent, _ = strconv.Atoi(s)
 		}
 	})
 
-	if diskMaxConcurrent <= 0 {
-		diskMaxConcurrent = 512
+	if driveMaxConcurrent <= 0 {
+		driveMaxConcurrent = 512
 		if storage.rotational {
-			diskMaxConcurrent = int(storage.nrRequests) / 2
-			if diskMaxConcurrent < 32 {
-				diskMaxConcurrent = 32
+			driveMaxConcurrent = int(storage.nrRequests) / 2
+			if driveMaxConcurrent < 32 {
+				driveMaxConcurrent = 32
 			}
 		}
 	}
 
-	diskStartChecking := 16 + diskMaxConcurrent/8
-	if diskStartChecking > diskMaxConcurrent {
-		diskStartChecking = diskMaxConcurrent
+	driveStartChecking := 16 + driveMaxConcurrent/8
+	if driveStartChecking > driveMaxConcurrent {
+		driveStartChecking = driveMaxConcurrent
 	}
 
 	xl := xlStorageDiskIDCheck{
-		storage:           storage,
-		health:            newDiskHealthTracker(diskMaxConcurrent),
-		diskMaxConcurrent: diskMaxConcurrent,
-		diskStartChecking: diskStartChecking,
+		storage:            storage,
+		health:             newDiskHealthTracker(driveMaxConcurrent),
+		driveMaxConcurrent: driveMaxConcurrent,
+		driveStartChecking: driveStartChecking,
 	}
-	xl.diskCtx, xl.cancel = context.WithCancel(context.TODO())
+
+	if driveQuorum {
+		xl.totalWrites.Store(xl.storage.getWriteAttribute())
+		xl.totalDeletes.Store(xl.storage.getDeleteAttribute())
+	}
+
+	xl.diskCtx, xl.diskCancel = context.WithCancel(context.TODO())
 	for i := range xl.apiLatencies[:] {
 		xl.apiLatencies[i] = &lockedLastMinuteLatency{}
 	}
@@ -259,17 +277,26 @@ func (p *xlStorageDiskIDCheck) Healing() *healingTracker {
 	return p.storage.Healing()
 }
 
-func (p *xlStorageDiskIDCheck) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode) (dataUsageCache, error) {
+func (p *xlStorageDiskIDCheck) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode, _ func() bool) (dataUsageCache, error) {
 	if contextCanceled(ctx) {
-		close(updates)
+		xioutil.SafeClose(updates)
 		return dataUsageCache{}, ctx.Err()
 	}
 
 	if err := p.checkDiskStale(); err != nil {
-		close(updates)
+		xioutil.SafeClose(updates)
 		return dataUsageCache{}, err
 	}
-	return p.storage.NSScanner(ctx, cache, updates, scanMode)
+
+	weSleep := func() bool {
+		return scannerIdleMode.Load() == 0
+	}
+
+	return p.storage.NSScanner(ctx, cache, updates, scanMode, weSleep)
+}
+
+func (p *xlStorageDiskIDCheck) SetFormatData(b []byte) {
+	p.storage.SetFormatData(b)
 }
 
 func (p *xlStorageDiskIDCheck) GetDiskLoc() (poolIdx, setIdx, diskIdx int) {
@@ -281,7 +308,7 @@ func (p *xlStorageDiskIDCheck) SetDiskLoc(poolIdx, setIdx, diskIdx int) {
 }
 
 func (p *xlStorageDiskIDCheck) Close() error {
-	p.cancel()
+	p.diskCancel()
 	return p.storage.Close()
 }
 
@@ -311,7 +338,7 @@ func (p *xlStorageDiskIDCheck) checkDiskStale() error {
 	return errDiskNotFound
 }
 
-func (p *xlStorageDiskIDCheck) DiskInfo(ctx context.Context, metrics bool) (info DiskInfo, err error) {
+func (p *xlStorageDiskIDCheck) DiskInfo(ctx context.Context, opts DiskInfoOptions) (info DiskInfo, err error) {
 	if contextCanceled(ctx) {
 		return DiskInfo{}, ctx.Err()
 	}
@@ -319,10 +346,30 @@ func (p *xlStorageDiskIDCheck) DiskInfo(ctx context.Context, metrics bool) (info
 	si := p.updateStorageMetrics(storageMetricDiskInfo)
 	defer si(&err)
 
+	if opts.NoOp {
+		if driveQuorum {
+			info.Metrics.TotalWrites = p.totalWrites.Load()
+			info.Metrics.TotalDeletes = p.totalDeletes.Load()
+		}
+		info.Metrics.TotalTokens = uint32(p.driveMaxConcurrent)
+		info.Metrics.TotalWaiting = uint32(p.health.waiting.Load())
+		info.Metrics.TotalErrorsTimeout = p.totalErrsTimeout.Load()
+		info.Metrics.TotalErrorsAvailability = p.totalErrsAvailability.Load()
+		return
+	}
+
 	defer func() {
-		if metrics {
+		if opts.Metrics {
 			info.Metrics = p.getMetrics()
 		}
+		if driveQuorum {
+			info.Metrics.TotalWrites = p.totalWrites.Load()
+			info.Metrics.TotalDeletes = p.totalDeletes.Load()
+		}
+		info.Metrics.TotalTokens = uint32(p.driveMaxConcurrent)
+		info.Metrics.TotalWaiting = uint32(p.health.waiting.Load())
+		info.Metrics.TotalErrorsTimeout = p.totalErrsTimeout.Load()
+		info.Metrics.TotalErrorsAvailability = p.totalErrsAvailability.Load()
 	}()
 
 	if p.health.isFaulty() {
@@ -330,7 +377,7 @@ func (p *xlStorageDiskIDCheck) DiskInfo(ctx context.Context, metrics bool) (info
 		return info, errFaultyDisk
 	}
 
-	info, err = p.storage.DiskInfo(ctx, metrics)
+	info, err = p.storage.DiskInfo(ctx, opts)
 	if err != nil {
 		return info, err
 	}
@@ -340,7 +387,6 @@ func (p *xlStorageDiskIDCheck) DiskInfo(ctx context.Context, metrics bool) (info
 	if p.diskID != "" && p.diskID != info.ID {
 		return info, errDiskNotFound
 	}
-
 	return info, nil
 }
 
@@ -351,7 +397,7 @@ func (p *xlStorageDiskIDCheck) MakeVolBulk(ctx context.Context, volumes ...strin
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.MakeVolBulk(ctx, volumes...) })
 }
 
@@ -362,7 +408,7 @@ func (p *xlStorageDiskIDCheck) MakeVol(ctx context.Context, volume string) (err 
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.MakeVol(ctx, volume) })
 }
 
@@ -383,13 +429,9 @@ func (p *xlStorageDiskIDCheck) StatVol(ctx context.Context, volume string) (vol 
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
-	err = w.Run(func() error {
-		var ierr error
-		vol, ierr = p.storage.StatVol(ctx, volume)
-		return ierr
+	return xioutil.WithDeadline[VolInfo](ctx, globalDriveConfig.GetMaxTimeout(), func(ctx context.Context) (result VolInfo, err error) {
+		return p.storage.StatVol(ctx, volume)
 	})
-	return vol, err
 }
 
 func (p *xlStorageDiskIDCheck) DeleteVol(ctx context.Context, volume string, forceDelete bool) (err error) {
@@ -399,7 +441,7 @@ func (p *xlStorageDiskIDCheck) DeleteVol(ctx context.Context, volume string, for
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.DeleteVol(ctx, volume, forceDelete) })
 }
 
@@ -421,7 +463,9 @@ func (p *xlStorageDiskIDCheck) ReadFile(ctx context.Context, volume string, path
 	}
 	defer done(&err)
 
-	return p.storage.ReadFile(ctx, volume, path, offset, buf, verifier)
+	return xioutil.WithDeadline[int64](ctx, globalDriveConfig.GetMaxTimeout(), func(ctx context.Context) (result int64, err error) {
+		return p.storage.ReadFile(ctx, volume, path, offset, buf, verifier)
+	})
 }
 
 // Legacy API - does not have any deadlines
@@ -432,7 +476,10 @@ func (p *xlStorageDiskIDCheck) AppendFile(ctx context.Context, volume string, pa
 	}
 	defer done(&err)
 
-	return p.storage.AppendFile(ctx, volume, path, buf)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
+	return w.Run(func() error {
+		return p.storage.AppendFile(ctx, volume, path, buf)
+	})
 }
 
 func (p *xlStorageDiskIDCheck) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) (err error) {
@@ -442,7 +489,7 @@ func (p *xlStorageDiskIDCheck) CreateFile(ctx context.Context, volume, path stri
 	}
 	defer done(&err)
 
-	return p.storage.CreateFile(ctx, volume, path, size, reader)
+	return p.storage.CreateFile(ctx, volume, path, size, io.NopCloser(reader))
 }
 
 func (p *xlStorageDiskIDCheck) ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error) {
@@ -452,12 +499,9 @@ func (p *xlStorageDiskIDCheck) ReadFileStream(ctx context.Context, volume, path 
 	}
 	defer done(&err)
 
-	rc, err := p.storage.ReadFileStream(ctx, volume, path, offset, length)
-	if err != nil {
-		return rc, err
-	}
-
-	return xioutil.NewDeadlineReader(rc, diskMaxTimeout), nil
+	return xioutil.WithDeadline[io.ReadCloser](ctx, globalDriveConfig.GetMaxTimeout(), func(ctx context.Context) (result io.ReadCloser, err error) {
+		return p.storage.ReadFileStream(ctx, volume, path, offset, length)
+	})
 }
 
 func (p *xlStorageDiskIDCheck) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) (err error) {
@@ -467,24 +511,25 @@ func (p *xlStorageDiskIDCheck) RenameFile(ctx context.Context, srcVolume, srcPat
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.RenameFile(ctx, srcVolume, srcPath, dstVolume, dstPath) })
 }
 
-func (p *xlStorageDiskIDCheck) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) (sign uint64, err error) {
+func (p *xlStorageDiskIDCheck) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (sign uint64, err error) {
 	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricRenameData, srcPath, fi.DataDir, dstVolume, dstPath)
 	if err != nil {
 		return 0, err
 	}
-	defer done(&err)
+	defer func() {
+		if driveQuorum && err == nil && !skipAccessChecks(dstVolume) {
+			p.storage.setWriteAttribute(p.totalWrites.Add(1))
+		}
+		done(&err)
+	}()
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
-	err = w.Run(func() error {
-		var ierr error
-		sign, ierr = p.storage.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath)
-		return ierr
+	return xioutil.WithDeadline[uint64](ctx, globalDriveConfig.GetMaxTimeout(), func(ctx context.Context) (result uint64, err error) {
+		return p.storage.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath, opts)
 	})
-	return sign, err
 }
 
 func (p *xlStorageDiskIDCheck) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) (err error) {
@@ -494,7 +539,7 @@ func (p *xlStorageDiskIDCheck) CheckParts(ctx context.Context, volume string, pa
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.CheckParts(ctx, volume, path, fi) })
 }
 
@@ -505,13 +550,13 @@ func (p *xlStorageDiskIDCheck) Delete(ctx context.Context, volume string, path s
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.Delete(ctx, volume, path, deleteOpts) })
 }
 
 // DeleteVersions deletes slice of versions, it can be same object
 // or multiple objects.
-func (p *xlStorageDiskIDCheck) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions) (errs []error) {
+func (p *xlStorageDiskIDCheck) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions, opts DeleteOptions) (errs []error) {
 	// Merely for tracing storage
 	path := ""
 	if len(versions) > 0 {
@@ -525,9 +570,35 @@ func (p *xlStorageDiskIDCheck) DeleteVersions(ctx context.Context, volume string
 		}
 		return errs
 	}
-	defer done(&err)
+	defer func() {
+		if driveQuorum && !skipAccessChecks(volume) {
+			var permanentDeletes uint64
+			var deleteMarkers uint64
 
-	errs = p.storage.DeleteVersions(ctx, volume, versions)
+			for i, nerr := range errs {
+				if nerr != nil {
+					continue
+				}
+				for _, fi := range versions[i].Versions {
+					if fi.Deleted {
+						// Delete markers are a write operation not a permanent delete.
+						deleteMarkers++
+						continue
+					}
+					permanentDeletes++
+				}
+			}
+			if deleteMarkers > 0 {
+				p.storage.setWriteAttribute(p.totalWrites.Add(deleteMarkers))
+			}
+			if permanentDeletes > 0 {
+				p.storage.setDeleteAttribute(p.totalDeletes.Add(permanentDeletes))
+			}
+		}
+		done(&err)
+	}()
+
+	errs = p.storage.DeleteVersions(ctx, volume, versions, opts)
 	for i := range errs {
 		if errs[i] != nil {
 			err = errs[i]
@@ -555,19 +626,36 @@ func (p *xlStorageDiskIDCheck) WriteAll(ctx context.Context, volume string, path
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.WriteAll(ctx, volume, path, b) })
 }
 
-func (p *xlStorageDiskIDCheck) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) (err error) {
+func (p *xlStorageDiskIDCheck) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool, opts DeleteOptions) (err error) {
 	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricDeleteVersion, volume, path)
 	if err != nil {
 		return err
 	}
-	defer done(&err)
+	defer func() {
+		defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
-	return w.Run(func() error { return p.storage.DeleteVersion(ctx, volume, path, fi, forceDelMarker) })
+		if driveQuorum && err == nil && !skipAccessChecks(volume) {
+			if opts.UndoWrite {
+				p.storage.setWriteAttribute(p.totalWrites.Add(^uint64(0)))
+				return
+			}
+
+			if fi.Deleted {
+				// Delete markers are a write operation not a permanent delete.
+				p.storage.setWriteAttribute(p.totalWrites.Add(1))
+				return
+			}
+
+			p.storage.setDeleteAttribute(p.totalDeletes.Add(1))
+		}
+	}()
+
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
+	return w.Run(func() error { return p.storage.DeleteVersion(ctx, volume, path, fi, forceDelMarker, opts) })
 }
 
 func (p *xlStorageDiskIDCheck) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo, opts UpdateMetadataOpts) (err error) {
@@ -577,7 +665,7 @@ func (p *xlStorageDiskIDCheck) UpdateMetadata(ctx context.Context, volume, path 
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.UpdateMetadata(ctx, volume, path, fi, opts) })
 }
 
@@ -588,26 +676,20 @@ func (p *xlStorageDiskIDCheck) WriteMetadata(ctx context.Context, volume, path s
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.WriteMetadata(ctx, volume, path, fi) })
 }
 
-func (p *xlStorageDiskIDCheck) ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
+func (p *xlStorageDiskIDCheck) ReadVersion(ctx context.Context, volume, path, versionID string, opts ReadOptions) (fi FileInfo, err error) {
 	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricReadVersion, volume, path)
 	if err != nil {
 		return fi, err
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
-	rerr := w.Run(func() error {
-		fi, err = p.storage.ReadVersion(ctx, volume, path, versionID, readData)
-		return err
+	return xioutil.WithDeadline[FileInfo](ctx, globalDriveConfig.GetMaxTimeout(), func(ctx context.Context) (result FileInfo, err error) {
+		return p.storage.ReadVersion(ctx, volume, path, versionID, opts)
 	})
-	if rerr != nil {
-		return fi, rerr
-	}
-	return fi, err
 }
 
 func (p *xlStorageDiskIDCheck) ReadAll(ctx context.Context, volume string, path string) (buf []byte, err error) {
@@ -617,15 +699,9 @@ func (p *xlStorageDiskIDCheck) ReadAll(ctx context.Context, volume string, path 
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
-	rerr := w.Run(func() error {
-		buf, err = p.storage.ReadAll(ctx, volume, path)
-		return err
+	return xioutil.WithDeadline[[]byte](ctx, globalDriveConfig.GetMaxTimeout(), func(ctx context.Context) (result []byte, err error) {
+		return p.storage.ReadAll(ctx, volume, path)
 	})
-	if rerr != nil {
-		return buf, rerr
-	}
-	return buf, err
 }
 
 func (p *xlStorageDiskIDCheck) ReadXL(ctx context.Context, volume string, path string, readData bool) (rf RawFileInfo, err error) {
@@ -635,15 +711,9 @@ func (p *xlStorageDiskIDCheck) ReadXL(ctx context.Context, volume string, path s
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
-	rerr := w.Run(func() error {
-		rf, err = p.storage.ReadXL(ctx, volume, path, readData)
-		return err
+	return xioutil.WithDeadline[RawFileInfo](ctx, globalDriveConfig.GetMaxTimeout(), func(ctx context.Context) (result RawFileInfo, err error) {
+		return p.storage.ReadXL(ctx, volume, path, readData)
 	})
-	if rerr != nil {
-		return rf, rerr
-	}
-	return rf, err
 }
 
 func (p *xlStorageDiskIDCheck) StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error) {
@@ -663,7 +733,7 @@ func (p *xlStorageDiskIDCheck) StatInfoFile(ctx context.Context, volume, path st
 func (p *xlStorageDiskIDCheck) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) (err error) {
 	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricReadMultiple, req.Bucket, req.Prefix)
 	if err != nil {
-		close(resp)
+		xioutil.SafeClose(resp)
 		return err
 	}
 	defer done(&err)
@@ -680,11 +750,11 @@ func (p *xlStorageDiskIDCheck) CleanAbandonedData(ctx context.Context, volume st
 	}
 	defer done(&err)
 
-	w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 	return w.Run(func() error { return p.storage.CleanAbandonedData(ctx, volume, path) })
 }
 
-func storageTrace(s storageMetric, startTime time.Time, duration time.Duration, path string, err string) madmin.TraceInfo {
+func storageTrace(s storageMetric, startTime time.Time, duration time.Duration, path string, err string, custom map[string]string) madmin.TraceInfo {
 	return madmin.TraceInfo{
 		TraceType: madmin.TraceStorage,
 		Time:      startTime,
@@ -693,6 +763,7 @@ func storageTrace(s storageMetric, startTime time.Time, duration time.Duration, 
 		Duration:  duration,
 		Path:      path,
 		Error:     err,
+		Custom:    custom,
 	}
 }
 
@@ -730,52 +801,44 @@ func (p *xlStorageDiskIDCheck) updateStorageMetrics(s storageMetric, paths ...st
 			context.DeadlineExceeded,
 			context.Canceled,
 		}...) {
-			atomic.AddUint64(&p.totalErrsAvailability, 1)
+			p.totalErrsAvailability.Add(1)
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				atomic.AddUint64(&p.totalErrsTimeout, 1)
+				p.totalErrsTimeout.Add(1)
 			}
 		}
+
 		p.apiLatencies[s].add(duration)
 
 		if trace {
+			custom := make(map[string]string, 2)
 			paths = append([]string{p.String()}, paths...)
 			var errStr string
 			if err != nil {
 				errStr = err.Error()
 			}
-			globalTrace.Publish(storageTrace(s, startTime, duration, strings.Join(paths, " "), errStr))
+			custom["total-errs-timeout"] = strconv.FormatUint(p.totalErrsTimeout.Load(), 10)
+			custom["total-errs-availability"] = strconv.FormatUint(p.totalErrsAvailability.Load(), 10)
+			globalTrace.Publish(storageTrace(s, startTime, duration, strings.Join(paths, " "), errStr, custom))
 		}
 	}
 }
 
 const (
-	diskHealthOK = iota
+	diskHealthOK int32 = iota
 	diskHealthFaulty
 )
-
-// diskMaxTimeoutOperation maximum wait time before we consider a drive
-// offline under active monitoring.
-var diskMaxTimeout = 2 * time.Minute
 
 // diskActiveMonitoring indicates if we have enabled "active" disk monitoring
 var diskActiveMonitoring = true
 
-func init() {
-	d := env.Get("_MINIO_DRIVE_MAX_TIMEOUT", "")
-	if d == "" {
-		d = env.Get("_MINIO_DISK_MAX_TIMEOUT", "")
-	}
-	if d != "" {
-		timeoutOperation, _ := time.ParseDuration(d)
-		if timeoutOperation < time.Second {
-			logger.Info("invalid _MINIO_DISK_MAX_TIMEOUT value: %s, minimum allowed is 1s, defaulting to '2 minutes'", d)
-		} else {
-			diskMaxTimeout = timeoutOperation
-		}
-	}
+// Indicates if users want to enable drive_quorum feature
+var driveQuorum bool
 
+func init() {
 	diskActiveMonitoring = (env.Get("_MINIO_DRIVE_ACTIVE_MONITORING", config.EnableOn) == config.EnableOn) ||
 		(env.Get("_MINIO_DISK_ACTIVE_MONITORING", config.EnableOn) == config.EnableOn)
+
+	driveQuorum = env.Get("_MINIO_DRIVE_QUORUM", config.EnableOff) == config.EnableOn
 }
 
 type diskHealthTracker struct {
@@ -786,24 +849,24 @@ type diskHealthTracker struct {
 	lastStarted int64
 
 	// Atomic status of disk.
-	status int32
+	status atomic.Int32
 
-	// Atomic number of requests blocking for a token.
-	blocked int32
+	// Atomic number of requests waiting for a token.
+	waiting atomic.Int32
 
 	// Concurrency tokens.
 	tokens chan struct{}
 }
 
 // newDiskHealthTracker creates a new disk health tracker.
-func newDiskHealthTracker(diskMaxConcurrent int) *diskHealthTracker {
+func newDiskHealthTracker(driveMaxConcurrent int) *diskHealthTracker {
 	d := diskHealthTracker{
 		lastSuccess: time.Now().UnixNano(),
 		lastStarted: time.Now().UnixNano(),
-		status:      diskHealthOK,
-		tokens:      make(chan struct{}, diskMaxConcurrent),
+		tokens:      make(chan struct{}, driveMaxConcurrent),
 	}
-	for i := 0; i < diskMaxConcurrent; i++ {
+	d.status.Store(diskHealthOK)
+	for i := 0; i < driveMaxConcurrent; i++ {
 		d.tokens <- struct{}{}
 	}
 	return &d
@@ -815,7 +878,7 @@ func (d *diskHealthTracker) logSuccess() {
 }
 
 func (d *diskHealthTracker) isFaulty() bool {
-	return atomic.LoadInt32(&d.status) == diskHealthFaulty
+	return d.status.Load() == diskHealthFaulty
 }
 
 type (
@@ -901,10 +964,9 @@ func (p *xlStorageDiskIDCheck) TrackDiskHealth(ctx context.Context, s storageMet
 // checking the disk status.
 // If nil is returned a token was picked up.
 func (p *xlStorageDiskIDCheck) waitForToken(ctx context.Context) (err error) {
-	atomic.AddInt32(&p.health.blocked, 1)
-	defer func() {
-		atomic.AddInt32(&p.health.blocked, -1)
-	}()
+	p.health.waiting.Add(1)
+	defer p.health.waiting.Add(-1)
+
 	// Avoid stampeding herd...
 	ticker := time.NewTicker(5*time.Second + time.Duration(rand.Int63n(int64(5*time.Second))))
 	defer ticker.Stop()
@@ -927,11 +989,11 @@ func (p *xlStorageDiskIDCheck) waitForToken(ctx context.Context) (err error) {
 // checkHealth should only be called when tokens have run out.
 // This will check if disk should be taken offline.
 func (p *xlStorageDiskIDCheck) checkHealth(ctx context.Context) (err error) {
-	if atomic.LoadInt32(&p.health.status) == diskHealthFaulty {
+	if p.health.status.Load() == diskHealthFaulty {
 		return errFaultyDisk
 	}
 	// Check if there are tokens.
-	if p.diskMaxConcurrent-len(p.health.tokens) < p.diskStartChecking {
+	if p.driveMaxConcurrent-len(p.health.tokens) < p.driveStartChecking {
 		return nil
 	}
 
@@ -949,46 +1011,57 @@ func (p *xlStorageDiskIDCheck) checkHealth(ctx context.Context) (err error) {
 	// If also more than 15 seconds since last success, take disk offline.
 	t = time.Since(time.Unix(0, atomic.LoadInt64(&p.health.lastSuccess)))
 	if t > maxTimeSinceLastSuccess {
-		if atomic.CompareAndSwapInt32(&p.health.status, diskHealthOK, diskHealthFaulty) {
+		if p.health.status.CompareAndSwap(diskHealthOK, diskHealthFaulty) {
 			logger.LogAlwaysIf(ctx, fmt.Errorf("node(%s): taking drive %s offline, time since last response %v", globalLocalNodeName, p.storage.String(), t.Round(time.Millisecond)))
-			go p.monitorDiskStatus(t)
+			p.health.waiting.Add(1)
+			go p.monitorDiskStatus(0, mustGetUUID())
 		}
 		return errFaultyDisk
 	}
 	return nil
 }
 
+// Make sure we do not write O_DIRECT aligned I/O because WrIteAll() ends
+// up using O_DIRECT codepath which internally utilizes p.health.tokens
+// we need to avoid using incoming I/O tokens as part of the healthcheck
+// monitoring I/O.
+var toWrite = []byte{2048: 42}
+
 // monitorDiskStatus should be called once when a drive has been marked offline.
 // Once the disk has been deemed ok, it will return to online status.
-func (p *xlStorageDiskIDCheck) monitorDiskStatus(spent time.Duration) {
+func (p *xlStorageDiskIDCheck) monitorDiskStatus(spent time.Duration, fn string) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 
-	fn := mustGetUUID()
 	for range t.C {
+		if contextCanceled(p.diskCtx) {
+			return
+		}
+
 		if len(p.health.tokens) == 0 {
 			// Queue is still full, no need to check.
 			continue
 		}
-		err := p.storage.WriteAll(context.Background(), minioMetaTmpBucket, fn, []byte{10000: 42})
+
+		err := p.storage.WriteAll(context.Background(), minioMetaTmpBucket, fn, toWrite)
 		if err != nil {
 			continue
 		}
+
 		b, err := p.storage.ReadAll(context.Background(), minioMetaTmpBucket, fn)
-		if err != nil || len(b) != 10001 {
+		if err != nil || len(b) != len(toWrite) {
 			continue
 		}
+
 		err = p.storage.Delete(context.Background(), minioMetaTmpBucket, fn, DeleteOptions{
 			Recursive: false,
-			Force:     false,
+			Immediate: false,
 		})
+
 		if err == nil {
-			t := time.Unix(0, atomic.LoadInt64(&p.health.lastSuccess))
-			if spent > 0 {
-				t = t.Add(spent)
-			}
-			logger.Info("node(%s): Read/Write/Delete successful, bringing drive %s online. Drive was offline for %s.", globalLocalNodeName, p.storage.String(), time.Since(t))
-			atomic.StoreInt32(&p.health.status, diskHealthOK)
+			logger.Info("node(%s): Read/Write/Delete successful, bringing drive %s online", globalLocalNodeName, p.storage.String())
+			p.health.status.Store(diskHealthOK)
+			p.health.waiting.Add(-1)
 			return
 		}
 	}
@@ -1007,19 +1080,19 @@ func (p *xlStorageDiskIDCheck) monitorDiskWritable(ctx context.Context) {
 
 	// if disk max timeout is smaller than checkEvery window
 	// reduce checks by a second.
-	if diskMaxTimeout <= checkEvery {
-		checkEvery = diskMaxTimeout - time.Second
+	if globalDriveConfig.GetMaxTimeout() <= checkEvery {
+		checkEvery = globalDriveConfig.GetMaxTimeout() - time.Second
 		if checkEvery <= 0 {
-			checkEvery = diskMaxTimeout
+			checkEvery = globalDriveConfig.GetMaxTimeout()
 		}
 	}
 
 	// if disk max timeout is smaller than skipIfSuccessBefore window
 	// reduce the skipIfSuccessBefore by a second.
-	if diskMaxTimeout <= skipIfSuccessBefore {
-		skipIfSuccessBefore = diskMaxTimeout - time.Second
+	if globalDriveConfig.GetMaxTimeout() <= skipIfSuccessBefore {
+		skipIfSuccessBefore = globalDriveConfig.GetMaxTimeout() - time.Second
 		if skipIfSuccessBefore <= 0 {
-			skipIfSuccessBefore = diskMaxTimeout
+			skipIfSuccessBefore = globalDriveConfig.GetMaxTimeout()
 		}
 	}
 
@@ -1027,8 +1100,6 @@ func (p *xlStorageDiskIDCheck) monitorDiskWritable(ctx context.Context) {
 	defer t.Stop()
 	fn := mustGetUUID()
 
-	// Be just above directio size.
-	toWrite := []byte{xioutil.DirectioAlignSize + 1: 42}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	monitor := func() bool {
@@ -1036,7 +1107,7 @@ func (p *xlStorageDiskIDCheck) monitorDiskWritable(ctx context.Context) {
 			return false
 		}
 
-		if atomic.LoadInt32(&p.health.status) != diskHealthOK {
+		if p.health.status.Load() != diskHealthOK {
 			return true
 		}
 
@@ -1046,9 +1117,10 @@ func (p *xlStorageDiskIDCheck) monitorDiskWritable(ctx context.Context) {
 		}
 
 		goOffline := func(err error, spent time.Duration) {
-			if atomic.CompareAndSwapInt32(&p.health.status, diskHealthOK, diskHealthFaulty) {
+			if p.health.status.CompareAndSwap(diskHealthOK, diskHealthFaulty) {
 				logger.LogAlwaysIf(ctx, fmt.Errorf("node(%s): taking drive %s offline: %v", globalLocalNodeName, p.storage.String(), err))
-				go p.monitorDiskStatus(spent)
+				p.health.waiting.Add(1)
+				go p.monitorDiskStatus(spent, fn)
 			}
 		}
 
@@ -1058,7 +1130,7 @@ func (p *xlStorageDiskIDCheck) monitorDiskWritable(ctx context.Context) {
 		dctx, dcancel := context.WithCancel(ctx)
 		started := time.Now()
 		go func() {
-			timeout := time.NewTimer(diskMaxTimeout)
+			timeout := time.NewTimer(globalDriveConfig.GetMaxTimeout())
 			select {
 			case <-dctx.Done():
 				if !timeout.Stop() {
@@ -1103,6 +1175,21 @@ func (p *xlStorageDiskIDCheck) monitorDiskWritable(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// checkID will check if the disk ID matches the provided ID.
+func (p *xlStorageDiskIDCheck) checkID(wantID string) (err error) {
+	if wantID == "" {
+		return nil
+	}
+	id, err := p.storage.GetDiskID()
+	if err != nil {
+		return err
+	}
+	if id != wantID {
+		return fmt.Errorf("disk ID %s does not match. disk reports %s", wantID, id)
+	}
+	return nil
 }
 
 // diskHealthCheckOK will check if the provided error is nil
