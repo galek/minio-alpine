@@ -56,6 +56,7 @@ import (
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/pkg/v2/certs"
+	"github.com/minio/pkg/v2/env"
 	xnet "github.com/minio/pkg/v2/net"
 )
 
@@ -389,6 +390,8 @@ var (
 
 	globalRemoteTargetTransport http.RoundTripper
 
+	globalHealthChkTransport http.RoundTripper
+
 	globalDNSCache = &dnscache.Resolver{
 		Timeout: 5 * time.Second,
 	}
@@ -412,6 +415,8 @@ var (
 	// and should never be mutated. Hold globalLocalDrivesMu to access.
 	globalLocalDrives   []StorageAPI
 	globalLocalDrivesMu sync.RWMutex
+
+	globalDriveMonitoring = env.Get("_MINIO_DRIVE_ACTIVE_MONITORING", config.EnableOn) == config.EnableOn
 
 	// Is MINIO_CI_CD set?
 	globalIsCICD bool
