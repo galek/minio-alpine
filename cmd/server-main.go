@@ -102,6 +102,12 @@ var ServerFlags = []cli.Flag{
 		Hidden: true,
 	},
 	cli.DurationFlag{
+		Name:   "conn-client-read-deadline",
+		Usage:  "custom connection READ deadline for incoming requests",
+		Hidden: true,
+		EnvVar: "MINIO_CONN_CLIENT_READ_DEADLINE",
+	},
+	cli.DurationFlag{
 		Name:   "conn-read-deadline",
 		Usage:  "custom connection READ deadline",
 		Hidden: true,
@@ -351,8 +357,9 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 	})
 
 	globalTCPOptions = xhttp.TCPOptions{
-		UserTimeout: int(ctxt.UserTimeout.Milliseconds()),
-		Interface:   ctxt.Interface,
+		UserTimeout:       int(ctxt.UserTimeout.Milliseconds()),
+		ClientReadTimeout: ctxt.ConnClientReadDeadline,
+		Interface:         ctxt.Interface,
 	}
 
 	// On macOS, if a process already listens on LOCALIPADDR:PORT, net.Listen() falls back
@@ -471,7 +478,7 @@ func bootstrapTraceMsg(msg string) {
 	globalBootstrapTracer.Record(info)
 
 	if serverDebugLog {
-		logger.Info(fmt.Sprint(time.Now().Round(time.Millisecond).Format(time.RFC3339), " bootstrap: ", msg))
+		fmt.Println(time.Now().Round(time.Millisecond).Format(time.RFC3339), " bootstrap: ", msg)
 	}
 
 	noSubs := globalTrace.NumSubscribers(madmin.TraceBootstrap) == 0
@@ -484,7 +491,7 @@ func bootstrapTraceMsg(msg string) {
 
 func bootstrapTrace(msg string, worker func()) {
 	if serverDebugLog {
-		logger.Info(fmt.Sprint(time.Now().Round(time.Millisecond).Format(time.RFC3339), " bootstrap: ", msg))
+		fmt.Println(time.Now().Round(time.Millisecond).Format(time.RFC3339), " bootstrap: ", msg)
 	}
 
 	now := time.Now()
@@ -644,6 +651,15 @@ func serverMain(ctx *cli.Context) {
 
 	setDefaultProfilerRates()
 
+	// Initialize globalConsoleSys system
+	bootstrapTrace("newConsoleLogger", func() {
+		globalConsoleSys = NewConsoleLogger(GlobalContext)
+		logger.AddSystemTarget(GlobalContext, globalConsoleSys)
+
+		// Set node name, only set for distributed setup.
+		globalConsoleSys.SetNodeName(globalLocalNodeName)
+	})
+
 	// Always load ENV variables from files first.
 	loadEnvVarsFromFiles()
 
@@ -664,15 +680,6 @@ func serverMain(ctx *cli.Context) {
 	// Load the root credentials from the shell environment or from
 	// the config file if not defined, set the default one.
 	loadRootCredentials()
-
-	// Initialize globalConsoleSys system
-	bootstrapTrace("newConsoleLogger", func() {
-		globalConsoleSys = NewConsoleLogger(GlobalContext)
-		logger.AddSystemTarget(GlobalContext, globalConsoleSys)
-
-		// Set node name, only set for distributed setup.
-		globalConsoleSys.SetNodeName(globalLocalNodeName)
-	})
 
 	// Perform any self-tests
 	bootstrapTrace("selftests", func() {
@@ -1024,8 +1031,8 @@ func serverMain(ctx *cli.Context) {
 	globalMinioClient.SetAppInfo("minio-perf-test", ReleaseTag)
 
 	if serverDebugLog {
-		logger.Info("== DEBUG Mode enabled ==")
-		logger.Info("Currently set environment settings:")
+		fmt.Println("== DEBUG Mode enabled ==")
+		fmt.Println("Currently set environment settings:")
 		ks := []string{
 			config.EnvAccessKey,
 			config.EnvSecretKey,
@@ -1037,9 +1044,9 @@ func serverMain(ctx *cli.Context) {
 			if slices.Contains(ks, strings.Split(v, "=")[0]) {
 				continue
 			}
-			logger.Info(v)
+			fmt.Println(v)
 		}
-		logger.Info("======")
+		fmt.Println("======")
 	}
 
 	daemon.SdNotify(false, daemon.SdNotifyReady)

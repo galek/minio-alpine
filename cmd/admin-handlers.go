@@ -1192,7 +1192,7 @@ type healInitParams struct {
 }
 
 // extractHealInitParams - Validates params for heal init API.
-func extractHealInitParams(vars map[string]string, qParms url.Values, r io.Reader) (hip healInitParams, err APIErrorCode) {
+func extractHealInitParams(vars map[string]string, qParams url.Values, r io.Reader) (hip healInitParams, err APIErrorCode) {
 	hip.bucket = vars[mgmtBucket]
 	hip.objPrefix = vars[mgmtPrefix]
 
@@ -1213,13 +1213,13 @@ func extractHealInitParams(vars map[string]string, qParms url.Values, r io.Reade
 		return
 	}
 
-	if len(qParms[mgmtClientToken]) > 0 {
-		hip.clientToken = qParms[mgmtClientToken][0]
+	if len(qParams[mgmtClientToken]) > 0 {
+		hip.clientToken = qParams[mgmtClientToken][0]
 	}
-	if _, ok := qParms[mgmtForceStart]; ok {
+	if _, ok := qParams[mgmtForceStart]; ok {
 		hip.forceStart = true
 	}
-	if _, ok := qParms[mgmtForceStop]; ok {
+	if _, ok := qParams[mgmtForceStop]; ok {
 		hip.forceStop = true
 	}
 
@@ -1935,7 +1935,7 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 	peers, _ := newPeerRestClients(globalEndpoints)
 	err = globalTrace.SubscribeJSON(traceOpts.TraceTypes(), traceCh, ctx.Done(), func(entry madmin.TraceInfo) bool {
 		return shouldTrace(entry, traceOpts)
-	})
+	}, nil)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -1984,7 +1984,6 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 // The ConsoleLogHandler handler sends console logs to the connected HTTP client.
 func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ConsoleLogAdminAction)
 	if objectAPI == nil {
 		return
@@ -2009,44 +2008,65 @@ func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Reque
 
 	setEventStreamHeaders(w)
 
-	logCh := make(chan log.Info, 4000)
-
+	logCh := make(chan log.Info, 1000)
 	peers, _ := newPeerRestClients(globalEndpoints)
-
+	encodedCh := make(chan []byte, 1000+len(peers)*1000)
 	err = globalConsoleSys.Subscribe(logCh, ctx.Done(), node, limitLines, logKind, nil)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
+	// Convert local entries to JSON
+	go func() {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case li := <-logCh:
+				if !li.SendLog(node, logKind) {
+					continue
+				}
+				buf.Reset()
+				if err := enc.Encode(li); err != nil {
+					continue
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case encodedCh <- append(grid.GetByteBuffer()[:0], buf.Bytes()...):
+				}
+			}
+		}
+	}()
 
+	// Collect from matching peers
 	for _, peer := range peers {
 		if peer == nil {
 			continue
 		}
 		if node == "" || strings.EqualFold(peer.host.Name, node) {
-			peer.ConsoleLog(logCh, ctx.Done())
+			peer.ConsoleLog(ctx, logKind, encodedCh)
 		}
 	}
 
-	enc := json.NewEncoder(w)
-
 	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
 	defer keepAliveTicker.Stop()
-
 	for {
 		select {
-		case log, ok := <-logCh:
+		case log, ok := <-encodedCh:
 			if !ok {
 				return
 			}
-			if log.SendLog(node, logKind) {
-				if err := enc.Encode(log); err != nil {
-					return
-				}
-				if len(logCh) == 0 {
-					// Flush if nothing is queued
-					w.(http.Flusher).Flush()
-				}
+			_, err = w.Write(log)
+			if err != nil {
+				return
+			}
+			grid.PutByteBuffer(log)
+			if len(logCh) == 0 {
+				// Flush if nothing is queued
+				w.(http.Flusher).Flush()
 			}
 		case <-keepAliveTicker.C:
 			if len(logCh) > 0 {
@@ -2201,7 +2221,10 @@ func getPoolsInfo(ctx context.Context, allDisks []madmin.Disk) (map[int]map[int]
 		return nil, errServerNotInitialized
 	}
 
-	z, _ := objectAPI.(*erasureServerPools)
+	z, ok := objectAPI.(*erasureServerPools)
+	if !ok {
+		return nil, errServerNotInitialized
+	}
 
 	poolsInfo := make(map[int]map[int]madmin.ErasureSetInfo)
 	for _, d := range allDisks {
@@ -2232,7 +2255,7 @@ func getPoolsInfo(ctx context.Context, allDisks []madmin.Disk) (map[int]map[int]
 	return poolsInfo, nil
 }
 
-func getServerInfo(ctx context.Context, poolsInfoEnabled bool, r *http.Request) madmin.InfoMessage {
+func getServerInfo(ctx context.Context, pools, metrics bool, r *http.Request) madmin.InfoMessage {
 	ldap := madmin.LDAP{}
 	if globalIAMSys.LDAPConfig.Enabled() {
 		ldapConn, err := globalIAMSys.LDAPConfig.LDAP.Connect()
@@ -2253,8 +2276,8 @@ func getServerInfo(ctx context.Context, poolsInfoEnabled bool, r *http.Request) 
 	// Get the notification target info
 	notifyTarget := fetchLambdaInfo()
 
-	local := getLocalServerProperty(globalEndpoints, r)
-	servers := globalNotificationSys.ServerInfo()
+	local := getLocalServerProperty(globalEndpoints, r, metrics)
+	servers := globalNotificationSys.ServerInfo(metrics)
 	servers = append(servers, local)
 
 	assignPoolNumbers(servers)
@@ -2308,7 +2331,7 @@ func getServerInfo(ctx context.Context, poolsInfoEnabled bool, r *http.Request) 
 			DrivesPerSet:     backendInfo.DrivesPerSet,
 		}
 
-		if poolsInfoEnabled {
+		if pools {
 			poolsInfo, _ = getPoolsInfo(ctx, allDisks)
 		}
 	}
@@ -2690,7 +2713,7 @@ func fetchHealthInfo(healthCtx context.Context, objectAPI ObjectLayer, query *ur
 		getAndWriteSysConfig()
 
 		if query.Get("minioinfo") == "true" {
-			infoMessage := getServerInfo(healthCtx, false, nil)
+			infoMessage := getServerInfo(healthCtx, false, true, nil)
 			servers := make([]madmin.ServerInfo, 0, len(infoMessage.Servers))
 			for _, server := range infoMessage.Servers {
 				anonEndpoint := anonAddr(server.Endpoint)
@@ -2878,8 +2901,10 @@ func (a adminAPIHandlers) ServerInfoHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	metrics := r.Form.Get(peerRESTMetrics) == "true"
+
 	// Marshal API response
-	jsonBytes, err := json.Marshal(getServerInfo(ctx, true, r))
+	jsonBytes, err := json.Marshal(getServerInfo(ctx, true, metrics, r))
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return

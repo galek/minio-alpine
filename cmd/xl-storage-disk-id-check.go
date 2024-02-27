@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/cachevalue"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 )
@@ -89,7 +90,7 @@ type xlStorageDiskIDCheck struct {
 	health       *diskHealthTracker
 	healthCheck  bool
 
-	metricsCache timedValue
+	metricsCache *cachevalue.Cache[DiskMetrics]
 	diskCtx      context.Context
 	diskCancel   context.CancelFunc
 }
@@ -97,7 +98,7 @@ type xlStorageDiskIDCheck struct {
 func (p *xlStorageDiskIDCheck) getMetrics() DiskMetrics {
 	p.metricsCache.Once.Do(func() {
 		p.metricsCache.TTL = 5 * time.Second
-		p.metricsCache.Update = func() (interface{}, error) {
+		p.metricsCache.Update = func() (DiskMetrics, error) {
 			diskMetric := DiskMetrics{
 				LastMinute: make(map[string]AccElem, len(p.apiLatencies)),
 				APICalls:   make(map[string]uint64, len(p.apiCalls)),
@@ -111,12 +112,8 @@ func (p *xlStorageDiskIDCheck) getMetrics() DiskMetrics {
 			return diskMetric, nil
 		}
 	})
-	m, _ := p.metricsCache.Get()
-	diskMetric := DiskMetrics{}
-	if m != nil {
-		diskMetric = m.(DiskMetrics)
-	}
 
+	diskMetric, _ := p.metricsCache.Get()
 	// Do not need this value to be cached.
 	diskMetric.TotalErrorsTimeout = p.totalErrsTimeout.Load()
 	diskMetric.TotalErrorsAvailability = p.totalErrsAvailability.Load()
@@ -180,9 +177,10 @@ func (e *lockedLastMinuteLatency) total() AccElem {
 
 func newXLStorageDiskIDCheck(storage *xlStorage, healthCheck bool) *xlStorageDiskIDCheck {
 	xl := xlStorageDiskIDCheck{
-		storage:     storage,
-		health:      newDiskHealthTracker(),
-		healthCheck: healthCheck && globalDriveMonitoring,
+		storage:      storage,
+		health:       newDiskHealthTracker(),
+		healthCheck:  healthCheck && globalDriveMonitoring,
+		metricsCache: cachevalue.New[DiskMetrics](),
 	}
 
 	xl.totalWrites.Store(xl.storage.getWriteAttribute())
@@ -299,12 +297,19 @@ func (p *xlStorageDiskIDCheck) DiskInfo(ctx context.Context, opts DiskInfoOption
 	defer si(&err)
 
 	if opts.NoOp {
+		if opts.Metrics {
+			info.Metrics = p.getMetrics()
+		}
 		info.Metrics.TotalWrites = p.totalWrites.Load()
 		info.Metrics.TotalDeletes = p.totalDeletes.Load()
 		info.Metrics.TotalWaiting = uint32(p.health.waiting.Load())
 		info.Metrics.TotalErrorsTimeout = p.totalErrsTimeout.Load()
 		info.Metrics.TotalErrorsAvailability = p.totalErrsAvailability.Load()
-		return
+		if p.health.isFaulty() {
+			// if disk is already faulty return faulty for 'mc admin info' output and prometheus alerts.
+			return info, errFaultyDisk
+		}
+		return info, nil
 	}
 
 	defer func() {
@@ -905,7 +910,7 @@ func (p *xlStorageDiskIDCheck) monitorDiskStatus(spent time.Duration, fn string)
 		})
 
 		if err == nil {
-			logger.Info("node(%s): Read/Write/Delete successful, bringing drive %s online", globalLocalNodeName, p.storage.String())
+			logger.Event(context.Background(), "node(%s): Read/Write/Delete successful, bringing drive %s online", globalLocalNodeName, p.storage.String())
 			p.health.status.Store(diskHealthOK)
 			p.health.waiting.Add(-1)
 			return

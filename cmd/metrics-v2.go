@@ -32,6 +32,7 @@ import (
 	"github.com/minio/kes-go"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/cachevalue"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
@@ -41,6 +42,8 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/procfs"
 )
+
+//go:generate msgp -file=$GOFILE -unexported -io=false
 
 var (
 	nodeCollector           *minioNodeCollector
@@ -328,7 +331,7 @@ type Metric struct {
 
 // MetricsGroup are a group of metrics that are initialized together.
 type MetricsGroup struct {
-	metricsCache     timedValue
+	metricsCache     *cachevalue.Cache[[]Metric] `msg:"-"`
 	cacheInterval    time.Duration
 	metricsGroupOpts MetricsGroupOpts
 }
@@ -352,10 +355,11 @@ type MetricsGroupOpts struct {
 // RegisterRead register the metrics populator function to be used
 // to populate new values upon cache invalidation.
 func (g *MetricsGroup) RegisterRead(read func(ctx context.Context) []Metric) {
+	g.metricsCache = cachevalue.New[[]Metric]()
 	g.metricsCache.Once.Do(func() {
-		g.metricsCache.Relax = true
+		g.metricsCache.ReturnLastGood = true
 		g.metricsCache.TTL = g.cacheInterval
-		g.metricsCache.Update = func() (interface{}, error) {
+		g.metricsCache.Update = func() ([]Metric, error) {
 			if g.metricsGroupOpts.dependGlobalObjectAPI {
 				objLayer := newObjectLayerFn()
 				// Service not initialized yet
@@ -418,14 +422,14 @@ func (g *MetricsGroup) RegisterRead(read func(ctx context.Context) []Metric) {
 	})
 }
 
-func (m *Metric) copyMetric() Metric {
+func (m *Metric) clone() Metric {
 	metric := Metric{
 		Description:          m.Description,
 		Value:                m.Value,
 		HistogramBucketLabel: m.HistogramBucketLabel,
-		StaticLabels:         make(map[string]string),
-		VariableLabels:       make(map[string]string),
-		Histogram:            make(map[string]uint64),
+		StaticLabels:         make(map[string]string, len(m.StaticLabels)),
+		VariableLabels:       make(map[string]string, len(m.VariableLabels)),
+		Histogram:            make(map[string]uint64, len(m.Histogram)),
 	}
 	for k, v := range m.StaticLabels {
 		metric.StaticLabels[k] = v
@@ -443,15 +447,14 @@ func (m *Metric) copyMetric() Metric {
 // once the TTL expires "read()" registered function is called
 // to return the new values and updated.
 func (g *MetricsGroup) Get() (metrics []Metric) {
-	c, _ := g.metricsCache.Get()
-	m, ok := c.([]Metric)
-	if !ok {
+	m, _ := g.metricsCache.Get()
+	if len(m) == 0 {
 		return []Metric{}
 	}
 
 	metrics = make([]Metric, 0, len(m))
 	for i := range m {
-		metrics = append(metrics, m[i].copyMetric())
+		metrics = append(metrics, m[i].clone())
 	}
 	return metrics
 }
@@ -536,7 +539,7 @@ func getNodeDriveTimeoutErrorsMD() MetricDescription {
 	}
 }
 
-func getNodeDriveAvailablityErrorsMD() MetricDescription {
+func getNodeDriveAvailabilityErrorsMD() MetricDescription {
 	return MetricDescription{
 		Namespace: nodeMetricNamespace,
 		Subsystem: driveSubsystem,
@@ -552,16 +555,6 @@ func getNodeDriveWaitingIOMD() MetricDescription {
 		Subsystem: driveSubsystem,
 		Name:      "io_waiting",
 		Help:      "Total number I/O operations waiting on drive",
-		Type:      counterMetric,
-	}
-}
-
-func getNodeDriveTokensIOMD() MetricDescription {
-	return MetricDescription{
-		Namespace: nodeMetricNamespace,
-		Subsystem: driveSubsystem,
-		Name:      "io_tokens",
-		Help:      "Total number concurrent I/O operations configured on drive",
 		Type:      counterMetric,
 	}
 }
@@ -3290,7 +3283,7 @@ func getBucketUsageMetrics(opts MetricsGroupOpts) *MetricsGroup {
 						Value:       float64(s.ProxyStats.GetTagFailedTotal),
 					})
 					metrics = append(metrics, Metric{
-						Description: getClusterReplProxiedRmvTaggingFailedOperationsMD(clusterMetricNamespace),
+						Description: getClusterReplProxiedRmvTaggingFailedOperationsMD(bucketMetricNamespace),
 						Value:       float64(s.ProxyStats.RmvTagFailedTotal),
 					})
 				}
@@ -3474,7 +3467,7 @@ func getLocalStorageMetrics(opts MetricsGroupOpts) *MetricsGroup {
 				})
 
 				metrics = append(metrics, Metric{
-					Description:    getNodeDriveAvailablityErrorsMD(),
+					Description:    getNodeDriveAvailabilityErrorsMD(),
 					Value:          float64(disk.Metrics.TotalErrorsAvailability),
 					VariableLabels: map[string]string{"drive": disk.DrivePath},
 				})
@@ -3482,12 +3475,6 @@ func getLocalStorageMetrics(opts MetricsGroupOpts) *MetricsGroup {
 				metrics = append(metrics, Metric{
 					Description:    getNodeDriveWaitingIOMD(),
 					Value:          float64(disk.Metrics.TotalWaiting),
-					VariableLabels: map[string]string{"drive": disk.DrivePath},
-				})
-
-				metrics = append(metrics, Metric{
-					Description:    getNodeDriveTokensIOMD(),
-					Value:          float64(disk.Metrics.TotalTokens),
 					VariableLabels: map[string]string{"drive": disk.DrivePath},
 				})
 
@@ -4005,6 +3992,7 @@ func collectMetric(metric Metric, labels []string, values []string, metricName s
 	}
 }
 
+//msgp:ignore minioBucketCollector
 type minioBucketCollector struct {
 	metricsGroups []*MetricsGroup
 	desc          *prometheus.Desc
@@ -4040,6 +4028,7 @@ func (c *minioBucketCollector) Collect(out chan<- prometheus.Metric) {
 	wg.Wait()
 }
 
+//msgp:ignore minioClusterCollector
 type minioClusterCollector struct {
 	metricsGroups []*MetricsGroup
 	desc          *prometheus.Desc
@@ -4099,6 +4088,8 @@ func ReportMetrics(ctx context.Context, metricsGroups []*MetricsGroup) <-chan Me
 }
 
 // minioNodeCollector is the Custom Collector
+//
+//msgp:ignore minioNodeCollector
 type minioNodeCollector struct {
 	metricsGroups []*MetricsGroup
 	desc          *prometheus.Desc

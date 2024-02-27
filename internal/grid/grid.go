@@ -45,7 +45,7 @@ const (
 	maxBufferSize = 64 << 10
 
 	// If there is a queue, merge up to this many messages.
-	maxMergeMessages = 20
+	maxMergeMessages = 30
 
 	// clientPingInterval will ping the remote handler every 15 seconds.
 	// Clients disconnect when we exceed 2 intervals.
@@ -184,12 +184,12 @@ func (m *lockedClientMap) Delete(id uint64) {
 
 func (m *lockedClientMap) Range(fn func(key uint64, value *muxClient) bool) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	for k, v := range m.m {
 		if !fn(k, v) {
 			break
 		}
 	}
-	m.mu.Unlock()
 }
 
 func (m *lockedClientMap) Clear() {

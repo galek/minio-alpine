@@ -43,6 +43,7 @@ import (
 	"github.com/klauspost/filepathx"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/cachevalue"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/disk"
 	xioutil "github.com/minio/minio/internal/ioutil"
@@ -112,7 +113,7 @@ type xlStorage struct {
 	formatLegacy    bool
 	formatLastCheck time.Time
 
-	diskInfoCache timedValue
+	diskInfoCache *cachevalue.Cache[DiskInfo]
 	sync.RWMutex
 
 	formatData []byte
@@ -229,14 +230,25 @@ func makeFormatErasureMetaVolumes(disk StorageAPI) error {
 
 // Initialize a new storage disk.
 func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
-	path := ep.Path
-	if path, err = getValidPath(path); err != nil {
-		return nil, err
+	s = &xlStorage{
+		drivePath:     ep.Path,
+		endpoint:      ep,
+		globalSync:    globalFSOSync,
+		diskInfoCache: cachevalue.New[DiskInfo](),
+		poolIndex:     -1,
+		setIndex:      -1,
+		diskIndex:     -1,
 	}
 
-	info, err := disk.GetInfo(path, true)
+	s.drivePath, err = getValidPath(ep.Path)
 	if err != nil {
-		return nil, err
+		s.drivePath = ep.Path
+		return s, err
+	}
+
+	info, err := disk.GetInfo(s.drivePath, true)
+	if err != nil {
+		return s, err
 	}
 
 	if !globalIsCICD && !globalIsErasureSD {
@@ -247,7 +259,7 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
 			// size less than or equal to the threshold as rootDrives.
 			rootDrive = info.Total <= globalRootDiskThreshold
 		} else {
-			rootDrive, err = disk.IsRootDisk(path, SlashSeparator)
+			rootDrive, err = disk.IsRootDisk(s.drivePath, SlashSeparator)
 			if err != nil {
 				return nil, err
 			}
@@ -255,15 +267,6 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
 		if rootDrive {
 			return nil, errDriveIsRoot
 		}
-	}
-
-	s = &xlStorage{
-		drivePath:  path,
-		endpoint:   ep,
-		globalSync: globalFSOSync,
-		poolIndex:  -1,
-		setIndex:   -1,
-		diskIndex:  -1,
 	}
 
 	// Sanitize before setting it
@@ -285,11 +288,11 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
 	formatData, formatFi, err := formatErasureMigrate(s.drivePath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		if os.IsPermission(err) {
-			return nil, errDiskAccessDenied
+			return s, errDiskAccessDenied
 		} else if isSysErrIO(err) {
-			return nil, errFaultyDisk
+			return s, errFaultyDisk
 		}
-		return nil, err
+		return s, err
 	}
 	s.formatData = formatData
 	s.formatFileInfo = formatFi
@@ -297,7 +300,7 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
 
 	// Create all necessary bucket folders if possible.
 	if err = makeFormatErasureMetaVolumes(s); err != nil {
-		return nil, err
+		return s, err
 	}
 
 	if len(s.formatData) > 0 {
@@ -731,7 +734,7 @@ func (s *xlStorage) setWriteAttribute(writeCount uint64) error {
 func (s *xlStorage) DiskInfo(_ context.Context, _ DiskInfoOptions) (info DiskInfo, err error) {
 	s.diskInfoCache.Once.Do(func() {
 		s.diskInfoCache.TTL = time.Second
-		s.diskInfoCache.Update = func() (interface{}, error) {
+		s.diskInfoCache.Update = func() (DiskInfo, error) {
 			dcinfo := DiskInfo{}
 			di, err := getDiskInfo(s.drivePath)
 			if err != nil {
@@ -757,11 +760,7 @@ func (s *xlStorage) DiskInfo(_ context.Context, _ DiskInfoOptions) (info DiskInf
 		}
 	})
 
-	v, err := s.diskInfoCache.Get()
-	if v != nil {
-		info = v.(DiskInfo)
-	}
-
+	info, err = s.diskInfoCache.Get()
 	info.MountPath = s.drivePath
 	info.Endpoint = s.endpoint.String()
 	info.Scanning = atomic.LoadInt32(&s.scanning) == 1
@@ -1085,6 +1084,11 @@ func (s *xlStorage) deleteVersions(ctx context.Context, volume, path string, fis
 	}
 
 	if len(buf) == 0 {
+		if errors.Is(err, errFileNotFound) && !skipAccessChecks(volume) {
+			if aerr := Access(volumeDir); aerr != nil && osIsNotExist(aerr) {
+				return errVolumeNotFound
+			}
+		}
 		return errFileNotFound
 	}
 
@@ -1146,7 +1150,7 @@ func (s *xlStorage) deleteVersions(ctx context.Context, volume, path string, fis
 		return s.WriteAll(ctx, volume, pathJoin(path, xlStorageFormatFile), buf)
 	}
 
-	return s.deleteFile(volumeDir, pathJoin(volumeDir, path), true, false)
+	return s.deleteFile(volumeDir, pathJoin(volumeDir, path, xlStorageFormatFile), true, false)
 }
 
 // DeleteVersions deletes slice of versions, it can be same object
@@ -1180,7 +1184,7 @@ func (s *xlStorage) moveToTrash(filePath string, recursive, immediatePurge bool)
 	}
 
 	// ENOSPC is a valid error from rename(); remove instead of rename in that case
-	if err == errDiskFull {
+	if errors.Is(err, errDiskFull) || isSysErrNoSpace(err) {
 		if recursive {
 			err = removeAll(filePath)
 		} else {
@@ -1307,7 +1311,7 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 		return s.WriteAll(ctx, volume, pathJoin(path, xlStorageFormatFile), buf)
 	}
 
-	return s.deleteFile(volumeDir, filePath, true, false)
+	return s.deleteFile(volumeDir, pathJoin(volumeDir, path, xlStorageFormatFile), true, false)
 }
 
 // Updates only metadata for a given version.
@@ -1696,7 +1700,7 @@ func (s *xlStorage) readAllData(ctx context.Context, volume, volumeDir string, f
 	}
 
 	if discard {
-		// This discard is mostly true for DELETEs
+		// This discard is mostly true for DELETEEs
 		// so we need to make sure we do not keep
 		// page-cache references after.
 		defer disk.Fdatasync(f)
@@ -2611,74 +2615,53 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	defer metaDataPoolPut(dstBuf)
 	if err != nil {
 		if legacyPreserved {
-			// Any failed rename calls un-roll previous transaction.
 			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 		}
 		return 0, errFileCorrupt
 	}
 
-	if srcDataPath != "" {
-		if err = s.WriteAll(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
-			if legacyPreserved {
-				// Any failed rename calls un-roll previous transaction.
-				s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
-			}
-			return 0, osErrToFileErr(err)
+	if err = s.WriteAll(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
+		if legacyPreserved {
+			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 		}
-		diskHealthCheckOK(ctx, err)
+		return 0, osErrToFileErr(err)
+	}
+	diskHealthCheckOK(ctx, err)
 
-		if !fi.Versioned && !fi.DataMov() && !fi.Healing() {
-			// Use https://man7.org/linux/man-pages/man2/rename.2.html if possible on unversioned bucket.
-			if err := Rename2(pathutil.Join(srcVolumeDir, srcPath), pathutil.Join(dstVolumeDir, dstPath)); err == nil {
-				return sign, nil
-			} // if Rename2 is not successful fallback.
-		}
-
+	if srcDataPath != "" && len(fi.Data) == 0 && fi.Size > 0 {
 		// renameAll only for objects that have xl.meta not saved inline.
-		if len(fi.Data) == 0 && fi.Size > 0 {
-			s.moveToTrash(dstDataPath, true, false)
-			if healing {
-				// If we are healing we should purge any legacyDataPath content,
-				// that was previously preserved during PutObject() call
-				// on a versioned bucket.
-				s.moveToTrash(legacyDataPath, true, false)
-			}
-			if err = renameAll(srcDataPath, dstDataPath, dstVolumeDir); err != nil {
-				if legacyPreserved {
-					// Any failed rename calls un-roll previous transaction.
-					s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
-				}
-				s.deleteFile(dstVolumeDir, dstDataPath, false, false)
-				return 0, osErrToFileErr(err)
-			}
+		s.moveToTrash(dstDataPath, true, false)
+		if healing {
+			// If we are healing we should purge any legacyDataPath content,
+			// that was previously preserved during PutObject() call
+			// on a versioned bucket.
+			s.moveToTrash(legacyDataPath, true, false)
 		}
-
-		// Commit meta-file
-		if err = renameAll(srcFilePath, dstFilePath, dstVolumeDir); err != nil {
+		if err = renameAll(srcDataPath, dstDataPath, dstVolumeDir); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.
 				s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 			}
-			s.deleteFile(dstVolumeDir, dstFilePath, false, false)
+			s.deleteFile(dstVolumeDir, dstDataPath, false, false)
 			return 0, osErrToFileErr(err)
 		}
+	}
 
-		// additionally only purge older data at the end of the transaction of new data-dir
-		// movement, this is to ensure that previous data references can co-exist for
-		// any recoverability.
-		if oldDstDataPath != "" {
-			s.moveToTrash(oldDstDataPath, true, false)
+	// Commit meta-file
+	if err = renameAll(srcFilePath, dstFilePath, dstVolumeDir); err != nil {
+		if legacyPreserved {
+			// Any failed rename calls un-roll previous transaction.
+			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 		}
-	} else {
-		// Write meta-file directly, no data
-		if err = s.WriteAll(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), dstBuf); err != nil {
-			if legacyPreserved {
-				// Any failed rename calls un-roll previous transaction.
-				s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
-			}
-			s.deleteFile(dstVolumeDir, dstFilePath, false, false)
-			return 0, err
-		}
+		s.deleteFile(dstVolumeDir, dstDataPath, false, false)
+		return 0, osErrToFileErr(err)
+	}
+
+	// additionally only purge older data at the end of the transaction of new data-dir
+	// movement, this is to ensure that previous data references can co-exist for
+	// any recoverability.
+	if oldDstDataPath != "" {
+		s.moveToTrash(oldDstDataPath, true, false)
 	}
 
 	if srcVolume != minioMetaMultipartBucket {
@@ -2884,14 +2867,22 @@ func (s *xlStorage) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp 
 		if req.MaxSize > 0 && int64(len(data)) > req.MaxSize {
 			r.Exists = true
 			r.Error = fmt.Sprintf("max size (%d) exceeded: %d", req.MaxSize, len(data))
-			resp <- r
-			continue
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case resp <- r:
+				continue
+			}
 		}
 		found++
 		r.Exists = true
 		r.Data = data
 		r.Modtime = mt
-		resp <- r
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case resp <- r:
+		}
 		if req.MaxResults > 0 && found >= req.MaxResults {
 			return nil
 		}

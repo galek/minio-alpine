@@ -264,13 +264,22 @@ func (s *erasureSets) connectDisks() {
 			disk.SetDiskLoc(s.poolIndex, setIndex, diskIndex)
 			disk.SetFormatData(formatData)
 			s.erasureDisks[setIndex][diskIndex] = disk
-			s.erasureDisksMu.Unlock()
 
-			if disk.IsLocal() && globalIsDistErasure {
+			if disk.IsLocal() {
 				globalLocalDrivesMu.Lock()
-				globalLocalSetDrives[s.poolIndex][setIndex][diskIndex] = disk
+				if globalIsDistErasure {
+					globalLocalSetDrives[s.poolIndex][setIndex][diskIndex] = disk
+				}
+				for i, ldisk := range globalLocalDrives {
+					_, k, l := ldisk.GetDiskLoc()
+					if k == setIndex && l == diskIndex {
+						globalLocalDrives[i] = disk
+						break
+					}
+				}
 				globalLocalDrivesMu.Unlock()
 			}
+			s.erasureDisksMu.Unlock()
 		}(endpoint)
 	}
 
@@ -316,15 +325,18 @@ func (s *erasureSets) GetLockers(setIndex int) func() ([]dsync.NetLocker, string
 	}
 }
 
+func (s *erasureSets) GetEndpointStrings(setIndex int) func() []string {
+	return func() []string {
+		eps := make([]string, s.setDriveCount)
+		copy(eps, s.endpointStrings[setIndex*s.setDriveCount:setIndex*s.setDriveCount+s.setDriveCount])
+		return eps
+	}
+}
+
 func (s *erasureSets) GetEndpoints(setIndex int) func() []Endpoint {
 	return func() []Endpoint {
-		s.erasureDisksMu.RLock()
-		defer s.erasureDisksMu.RUnlock()
-
 		eps := make([]Endpoint, s.setDriveCount)
-		for i := 0; i < s.setDriveCount; i++ {
-			eps[i] = s.endpoints.Endpoints[setIndex*s.setDriveCount+i]
-		}
+		copy(eps, s.endpoints.Endpoints[setIndex*s.setDriveCount:setIndex*s.setDriveCount+s.setDriveCount])
 		return eps
 	}
 }
@@ -454,7 +466,6 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 						return
 					}
 					disk.SetDiskLoc(s.poolIndex, m, n)
-					s.endpointStrings[m*setDriveCount+n] = disk.String()
 					s.erasureDisks[m][n] = disk
 				}(disk, i, j)
 			}
@@ -469,6 +480,7 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 				getDisks:           s.GetDisks(i),
 				getLockers:         s.GetLockers(i),
 				getEndpoints:       s.GetEndpoints(i),
+				getEndpointStrings: s.GetEndpointStrings(i),
 				nsMutex:            mutex,
 			}
 		}(i)
@@ -562,18 +574,11 @@ func auditObjectErasureSet(ctx context.Context, object string, set *erasureObjec
 		return
 	}
 
-	object = decodeDirObject(object)
-	endpoints := set.getEndpoints()
-	disksEndpoints := make([]string, 0, len(endpoints))
-	for _, endpoint := range endpoints {
-		disksEndpoints = append(disksEndpoints, endpoint.String())
-	}
-
 	op := auditObjectOp{
-		Name:  object,
+		Name:  decodeDirObject(object),
 		Pool:  set.poolIndex + 1,
 		Set:   set.setIndex + 1,
-		Disks: disksEndpoints,
+		Disks: set.getEndpointStrings(),
 	}
 
 	logger.GetReqInfo(ctx).AppendTags("objectLocation", op)
@@ -1155,9 +1160,18 @@ func (s *erasureSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.H
 
 				s.erasureDisks[m][n] = disk
 
-				if disk.IsLocal() && globalIsDistErasure {
+				if disk.IsLocal() {
 					globalLocalDrivesMu.Lock()
-					globalLocalSetDrives[s.poolIndex][m][n] = disk
+					if globalIsDistErasure {
+						globalLocalSetDrives[s.poolIndex][m][n] = disk
+					}
+					for i, ldisk := range globalLocalDrives {
+						_, k, l := ldisk.GetDiskLoc()
+						if k == m && l == n {
+							globalLocalDrives[i] = disk
+							break
+						}
+					}
 					globalLocalDrivesMu.Unlock()
 				}
 			}

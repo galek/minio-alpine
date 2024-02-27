@@ -160,9 +160,10 @@ type serverCtxt struct {
 	FTP  []string
 	SFTP []string
 
-	UserTimeout       time.Duration
-	ConnReadDeadline  time.Duration
-	ConnWriteDeadline time.Duration
+	UserTimeout            time.Duration
+	ConnReadDeadline       time.Duration
+	ConnWriteDeadline      time.Duration
+	ConnClientReadDeadline time.Duration
 
 	ShutdownTimeout     time.Duration
 	IdleTimeout         time.Duration
@@ -310,7 +311,8 @@ var (
 	// Time when the server is started
 	globalBootTime = UTCNow()
 
-	globalActiveCred auth.Credentials
+	globalActiveCred         auth.Credentials
+	globalSiteReplicatorCred siteReplicatorCred
 
 	// Captures if root credentials are set via ENV.
 	globalCredViaEnv bool
@@ -418,7 +420,7 @@ var (
 	globalServiceFreezeMu  sync.Mutex // Updates.
 
 	// List of local drives to this node, this is only set during server startup,
-	// and should never be mutated. Hold globalLocalDrivesMu to access.
+	// and is only mutated by HealFormat. Hold globalLocalDrivesMu to access.
 	globalLocalDrives   []StorageAPI
 	globalLocalDrivesMu sync.RWMutex
 

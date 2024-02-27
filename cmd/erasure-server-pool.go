@@ -39,6 +39,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/bpool"
+	"github.com/minio/minio/internal/cachevalue"
 	"github.com/minio/minio/internal/config/storageclass"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
@@ -72,15 +73,15 @@ func (z *erasureServerPools) SinglePool() bool {
 func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServerPools) (ObjectLayer, error) {
 	var (
 		deploymentID       string
-		distributionAlgo   string
 		commonParityDrives int
 		err                error
 
 		formats      = make([]*formatErasureV3, len(endpointServerPools))
 		storageDisks = make([][]StorageAPI, len(endpointServerPools))
 		z            = &erasureServerPools{
-			serverPools: make([]*erasureSets, len(endpointServerPools)),
-			s3Peer:      NewS3PeerSys(endpointServerPools),
+			serverPools:      make([]*erasureSets, len(endpointServerPools)),
+			s3Peer:           NewS3PeerSys(endpointServerPools),
+			distributionAlgo: formatErasureVersionV3DistributionAlgoV3,
 		}
 	)
 
@@ -126,7 +127,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 
 		bootstrapTrace("waitForFormatErasure: loading disks", func() {
 			storageDisks[i], formats[i], err = waitForFormatErasure(local, ep.Endpoints, i+1,
-				ep.SetCount, ep.DrivesPerSet, deploymentID, distributionAlgo)
+				ep.SetCount, ep.DrivesPerSet, deploymentID)
 		})
 		if err != nil {
 			return nil, err
@@ -135,10 +136,6 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 		if deploymentID == "" {
 			// all pools should have same deployment ID
 			deploymentID = formats[i].ID
-		}
-
-		if distributionAlgo == "" {
-			distributionAlgo = formats[i].Erasure.DistributionAlgo
 		}
 
 		// Validate if users brought different DeploymentID pools.
@@ -155,10 +152,6 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 
 		if deploymentID != "" && bytes.Equal(z.deploymentID[:], []byte{}) {
 			z.deploymentID = uuid.MustParse(deploymentID)
-		}
-
-		if distributionAlgo != "" && z.distributionAlgo == "" {
-			z.distributionAlgo = distributionAlgo
 		}
 
 		for _, storageDisk := range storageDisks[i] {
@@ -1009,20 +1002,10 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 	}
 
 	object = encodeDirObject(object)
-
 	if z.SinglePool() {
-		if !isMinioMetaBucketName(bucket) {
-			avail, err := hasSpaceFor(getDiskInfos(ctx, z.serverPools[0].getHashedSet(object).getDisks()...), data.Size())
-			if err != nil {
-				logger.LogOnceIf(ctx, err, "erasure-write-quorum")
-				return ObjectInfo{}, toObjectErr(errErasureWriteQuorum)
-			}
-			if !avail {
-				return ObjectInfo{}, toObjectErr(errDiskFull)
-			}
-		}
 		return z.serverPools[0].PutObject(ctx, bucket, object, data, opts)
 	}
+
 	if !opts.NoLock {
 		ns := z.NewNSLock(bucket, object)
 		lkctx, err := ns.GetLock(ctx, globalOperationTimeout)
@@ -1204,6 +1187,13 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 }
 
 func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error) {
+	if err := checkCopyObjArgs(ctx, srcBucket, srcObject); err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := checkCopyObjArgs(ctx, dstBucket, dstObject); err != nil {
+		return ObjectInfo{}, err
+	}
+
 	srcObject = encodeDirObject(srcObject)
 	dstObject = encodeDirObject(dstObject)
 
@@ -1582,21 +1572,11 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 
 // Initiate a new multipart upload on a hashedSet based on object name.
 func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (*NewMultipartUploadResult, error) {
-	if err := checkNewMultipartArgs(ctx, bucket, object, z); err != nil {
+	if err := checkNewMultipartArgs(ctx, bucket, object); err != nil {
 		return nil, err
 	}
 
 	if z.SinglePool() {
-		if !isMinioMetaBucketName(bucket) {
-			avail, err := hasSpaceFor(getDiskInfos(ctx, z.serverPools[0].getHashedSet(object).getDisks()...), -1)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return nil, toObjectErr(errErasureWriteQuorum)
-			}
-			if !avail {
-				return nil, toObjectErr(errDiskFull)
-			}
-		}
 		return z.serverPools[0].NewMultipartUpload(ctx, bucket, object, opts)
 	}
 
@@ -1629,7 +1609,7 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 
 // Copies a part of an object from source hashedSet to destination hashedSet.
 func (z *erasureServerPools) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset int64, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (PartInfo, error) {
-	if err := checkNewMultipartArgs(ctx, srcBucket, srcObject, z); err != nil {
+	if err := checkNewMultipartArgs(ctx, srcBucket, srcObject); err != nil {
 		return PartInfo{}, err
 	}
 
@@ -1639,7 +1619,7 @@ func (z *erasureServerPools) CopyObjectPart(ctx context.Context, srcBucket, srcO
 
 // PutObjectPart - writes part of an object to hashedSet based on the object name.
 func (z *erasureServerPools) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (PartInfo, error) {
-	if err := checkPutObjectPartArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err := checkPutObjectPartArgs(ctx, bucket, object, uploadID); err != nil {
 		return PartInfo{}, err
 	}
 
@@ -1671,7 +1651,7 @@ func (z *erasureServerPools) PutObjectPart(ctx context.Context, bucket, object, 
 }
 
 func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) (MultipartInfo, error) {
-	if err := checkListPartsArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err := checkListPartsArgs(ctx, bucket, object, uploadID); err != nil {
 		return MultipartInfo{}, err
 	}
 
@@ -1702,7 +1682,7 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 
 // ListObjectParts - lists all uploaded parts to an object in hashedSet.
 func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts ObjectOptions) (ListPartsInfo, error) {
-	if err := checkListPartsArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err := checkListPartsArgs(ctx, bucket, object, uploadID); err != nil {
 		return ListPartsInfo{}, err
 	}
 
@@ -1731,7 +1711,7 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 
 // Aborts an in-progress multipart operation on hashedSet based on the object name.
 func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error {
-	if err := checkAbortMultipartArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err := checkAbortMultipartArgs(ctx, bucket, object, uploadID); err != nil {
 		return err
 	}
 
@@ -1762,7 +1742,7 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 
 // CompleteMultipartUpload - completes a pending multipart transaction, on hashedSet based on object name.
 func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	if err = checkCompleteMultipartArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err = checkCompleteMultipartArgs(ctx, bucket, object, uploadID); err != nil {
 		return objInfo, err
 	}
 
@@ -1840,12 +1820,6 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 		}
 	}
 
-	if err != nil && !isErrBucketNotFound(err) {
-		if !opts.NoRecreate {
-			z.s3Peer.MakeBucket(ctx, bucket, MakeBucketOptions{})
-		}
-	}
-
 	if err == nil {
 		// Purge the entire bucket metadata entirely.
 		z.deleteAll(context.Background(), minioMetaBucket, pathJoin(bucketMetaPrefix, bucket))
@@ -1867,7 +1841,7 @@ func (z *erasureServerPools) deleteAll(ctx context.Context, bucket, prefix strin
 	}
 }
 
-var listBucketsCache timedValue
+var listBucketsCache = cachevalue.New[[]BucketInfo]()
 
 // List all buckets from one of the serverPools, we are not doing merge
 // sort here just for simplification. As per design it is assumed
@@ -1877,8 +1851,9 @@ func (z *erasureServerPools) ListBuckets(ctx context.Context, opts BucketOptions
 		listBucketsCache.Once.Do(func() {
 			listBucketsCache.TTL = time.Second
 
-			listBucketsCache.Relax = true
-			listBucketsCache.Update = func() (interface{}, error) {
+			listBucketsCache.ReturnLastGood = true
+			listBucketsCache.NoWait = true
+			listBucketsCache.Update = func() ([]BucketInfo, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				buckets, err = z.s3Peer.ListBuckets(ctx, opts)
 				cancel()
@@ -1895,12 +1870,7 @@ func (z *erasureServerPools) ListBuckets(ctx context.Context, opts BucketOptions
 			}
 		})
 
-		v, _ := listBucketsCache.Get()
-		if v != nil {
-			return v.([]BucketInfo), nil
-		}
-
-		return buckets, nil
+		return listBucketsCache.Get()
 	}
 
 	buckets, err = z.s3Peer.ListBuckets(ctx, opts)
@@ -1958,11 +1928,7 @@ func (z *erasureServerPools) HealFormat(ctx context.Context, dryRun bool) (madmi
 }
 
 func (z *erasureServerPools) HealBucket(ctx context.Context, bucket string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
-	// Attempt heal on the bucket metadata, ignore any failures
-	hopts := opts
-	hopts.Recreate = false
-	defer z.HealObject(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, bucket, bucketMetadataFile), "", hopts)
-
+	// .metadata.bin healing is not needed here, it is automatically healed via read() call.
 	return z.s3Peer.HealBucket(ctx, bucket, opts)
 }
 
@@ -2298,53 +2264,21 @@ type HealthOptions struct {
 // was queried
 type HealthResult struct {
 	Healthy       bool
+	HealthyRead   bool
 	HealingDrives int
 	ESHealth      []struct {
 		Maintenance   bool
 		PoolID, SetID int
 		Healthy       bool
+		HealthyRead   bool
 		HealthyDrives int
 		HealingDrives int
 		ReadQuorum    int
 		WriteQuorum   int
 	}
 	WriteQuorum   int
+	ReadQuorum    int
 	UsingDefaults bool
-}
-
-// ReadHealth returns if the cluster can serve read requests
-func (z *erasureServerPools) ReadHealth(ctx context.Context) bool {
-	erasureSetUpCount := make([][]int, len(z.serverPools))
-	for i := range z.serverPools {
-		erasureSetUpCount[i] = make([]int, len(z.serverPools[i].sets))
-	}
-
-	diskIDs := globalNotificationSys.GetLocalDiskIDs(ctx)
-	diskIDs = append(diskIDs, getLocalDiskIDs(z))
-
-	for _, localDiskIDs := range diskIDs {
-		for _, id := range localDiskIDs {
-			poolIdx, setIdx, _, err := z.getPoolAndSet(id)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				continue
-			}
-			erasureSetUpCount[poolIdx][setIdx]++
-		}
-	}
-
-	b := z.BackendInfo()
-	poolReadQuorums := make([]int, len(b.StandardSCData))
-	copy(poolReadQuorums, b.StandardSCData)
-
-	for poolIdx := range erasureSetUpCount {
-		for setIdx := range erasureSetUpCount[poolIdx] {
-			if erasureSetUpCount[poolIdx][setIdx] < poolReadQuorums[poolIdx] {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // Health - returns current status of the object layer health,
@@ -2415,9 +2349,20 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 		}
 	}
 
+	var maximumReadQuorum int
+	for _, readQuorum := range poolReadQuorums {
+		if maximumReadQuorum == 0 {
+			maximumReadQuorum = readQuorum
+		}
+		if readQuorum > maximumReadQuorum {
+			maximumReadQuorum = readQuorum
+		}
+	}
+
 	result := HealthResult{
 		Healthy:       true,
 		WriteQuorum:   maximumWriteQuorum,
+		ReadQuorum:    maximumReadQuorum,
 		UsingDefaults: usingDefaults, // indicates if config was not initialized and we are using defaults on this node.
 	}
 
@@ -2427,6 +2372,7 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 				Maintenance                  bool
 				PoolID, SetID                int
 				Healthy                      bool
+				HealthyRead                  bool
 				HealthyDrives, HealingDrives int
 				ReadQuorum, WriteQuorum      int
 			}{
@@ -2434,6 +2380,7 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 				SetID:         setIdx,
 				PoolID:        poolIdx,
 				Healthy:       erasureSetUpCount[poolIdx][setIdx].online >= poolWriteQuorums[poolIdx],
+				HealthyRead:   erasureSetUpCount[poolIdx][setIdx].online >= poolReadQuorums[poolIdx],
 				HealthyDrives: erasureSetUpCount[poolIdx][setIdx].online,
 				HealingDrives: erasureSetUpCount[poolIdx][setIdx].healing,
 				ReadQuorum:    poolReadQuorums[poolIdx],
@@ -2445,6 +2392,12 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 				logger.LogIf(logger.SetReqInfo(ctx, reqInfo),
 					fmt.Errorf("Write quorum may be lost on pool: %d, set: %d, expected write quorum: %d",
 						poolIdx, setIdx, poolWriteQuorums[poolIdx]))
+			}
+			result.HealthyRead = erasureSetUpCount[poolIdx][setIdx].online >= poolReadQuorums[poolIdx]
+			if !result.HealthyRead {
+				logger.LogIf(logger.SetReqInfo(ctx, reqInfo),
+					fmt.Errorf("Read quorum may be lost on pool: %d, set: %d, expected read quorum: %d",
+						poolIdx, setIdx, poolReadQuorums[poolIdx]))
 			}
 		}
 	}

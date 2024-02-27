@@ -614,7 +614,7 @@ func TestHealingDanglingObject(t *testing.T) {
 	resetGlobalHealState()
 	defer resetGlobalHealState()
 
-	// Set globalStoragClass.STANDARD to EC:4 for this test
+	// Set globalStorageClass.STANDARD to EC:4 for this test
 	saveSC := globalStorageClass
 	defer func() {
 		globalStorageClass.Update(saveSC)
@@ -1645,7 +1645,6 @@ func TestHealLastDataShard(t *testing.T) {
 
 			_, err = obj.PutObject(ctx, bucket, object,
 				mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
-
 			if err != nil {
 				t.Fatal(err)
 			}
