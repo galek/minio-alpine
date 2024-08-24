@@ -45,7 +45,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/logger/message/log"
+	"github.com/minio/pkg/v3/logger/message/log"
 )
 
 // To abstract a node over network.
@@ -53,7 +53,8 @@ type peerRESTServer struct{}
 
 var (
 	// Types & Wrappers
-	aoMetricsGroup         = grid.NewArrayOf[*Metric](func() *Metric { return &Metric{} })
+	aoBucketInfo           = grid.NewArrayOf[*BucketInfo](func() *BucketInfo { return &BucketInfo{} })
+	aoMetricsGroup         = grid.NewArrayOf[*MetricV2](func() *MetricV2 { return &MetricV2{} })
 	madminBgHealState      = grid.NewJSONPool[madmin.BgHealState]()
 	madminCPUs             = grid.NewJSONPool[madmin.CPUs]()
 	madminMemInfo          = grid.NewJSONPool[madmin.MemInfo]()
@@ -87,9 +88,9 @@ var (
 	getNetInfoRPC                  = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.NetInfo]](grid.HandlerGetNetInfo, grid.NewMSS, madminNetInfo.NewJSON)
 	getOSInfoRPC                   = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.OSInfo]](grid.HandlerGetOSInfo, grid.NewMSS, madminOSInfo.NewJSON)
 	getPartitionsRPC               = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.Partitions]](grid.HandlerGetPartitions, grid.NewMSS, madminPartitions.NewJSON)
-	getPeerBucketMetricsRPC        = grid.NewSingleHandler[*grid.MSS, *grid.Array[*Metric]](grid.HandlerGetPeerBucketMetrics, grid.NewMSS, aoMetricsGroup.New)
-	getPeerMetricsRPC              = grid.NewSingleHandler[*grid.MSS, *grid.Array[*Metric]](grid.HandlerGetPeerMetrics, grid.NewMSS, aoMetricsGroup.New)
-	getResourceMetricsRPC          = grid.NewSingleHandler[*grid.MSS, *grid.Array[*Metric]](grid.HandlerGetResourceMetrics, grid.NewMSS, aoMetricsGroup.New)
+	getPeerBucketMetricsRPC        = grid.NewSingleHandler[*grid.MSS, *grid.Array[*MetricV2]](grid.HandlerGetPeerBucketMetrics, grid.NewMSS, aoMetricsGroup.New)
+	getPeerMetricsRPC              = grid.NewSingleHandler[*grid.MSS, *grid.Array[*MetricV2]](grid.HandlerGetPeerMetrics, grid.NewMSS, aoMetricsGroup.New)
+	getResourceMetricsRPC          = grid.NewSingleHandler[*grid.MSS, *grid.Array[*MetricV2]](grid.HandlerGetResourceMetrics, grid.NewMSS, aoMetricsGroup.New)
 	getProcInfoRPC                 = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.ProcInfo]](grid.HandlerGetProcInfo, grid.NewMSS, madminProcInfo.NewJSON)
 	getSRMetricsRPC                = grid.NewSingleHandler[*grid.MSS, *SRMetricsSummary](grid.HandlerGetSRMetrics, grid.NewMSS, func() *SRMetricsSummary { return &SRMetricsSummary{} })
 	getSysConfigRPC                = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.SysConfig]](grid.HandlerGetSysConfig, grid.NewMSS, madminSysConfig.NewJSON)
@@ -97,6 +98,7 @@ var (
 	getSysServicesRPC              = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.SysServices]](grid.HandlerGetSysServices, grid.NewMSS, madminSysServices.NewJSON)
 	headBucketRPC                  = grid.NewSingleHandler[*grid.MSS, *VolInfo](grid.HandlerHeadBucket, grid.NewMSS, func() *VolInfo { return &VolInfo{} })
 	healBucketRPC                  = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerHealBucket, grid.NewMSS, grid.NewNoPayload)
+	listBucketsRPC                 = grid.NewSingleHandler[*BucketOptions, *grid.Array[*BucketInfo]](grid.HandlerListBuckets, func() *BucketOptions { return &BucketOptions{} }, aoBucketInfo.New)
 	loadBucketMetadataRPC          = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadBucketMetadata, grid.NewMSS, grid.NewNoPayload).IgnoreNilConn()
 	loadGroupRPC                   = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadGroup, grid.NewMSS, grid.NewNoPayload)
 	loadPolicyMappingRPC           = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadPolicyMapping, grid.NewMSS, grid.NewNoPayload).IgnoreNilConn()
@@ -347,7 +349,7 @@ func (s *peerRESTServer) DownloadProfilingDataHandler(w http.ResponseWriter, r *
 		s.writeErrorResponse(w, err)
 		return
 	}
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(profileData))
+	peersLogIf(ctx, gob.NewEncoder(w).Encode(profileData))
 }
 
 func (s *peerRESTServer) LocalStorageInfoHandler(mss *grid.MSS) (*grid.JSON[madmin.StorageInfo], *grid.RemoteErr) {
@@ -366,7 +368,7 @@ func (s *peerRESTServer) LocalStorageInfoHandler(mss *grid.MSS) (*grid.JSON[madm
 
 // ServerInfoHandler - returns Server Info
 func (s *peerRESTServer) ServerInfoHandler(params *grid.MSS) (*grid.JSON[madmin.ServerProperties], *grid.RemoteErr) {
-	r := http.Request{Host: globalMinioHost}
+	r := http.Request{Host: globalLocalNodeName}
 	metrics, err := strconv.ParseBool(params.Get(peerRESTMetrics))
 	if err != nil {
 		return nil, grid.NewRemoteErr(err)
@@ -377,37 +379,37 @@ func (s *peerRESTServer) ServerInfoHandler(params *grid.MSS) (*grid.JSON[madmin.
 
 // GetCPUsHandler - returns CPU info.
 func (s *peerRESTServer) GetCPUsHandler(_ *grid.MSS) (*grid.JSON[madmin.CPUs], *grid.RemoteErr) {
-	info := madmin.GetCPUs(context.Background(), globalMinioHost)
+	info := madmin.GetCPUs(context.Background(), globalLocalNodeName)
 	return madminCPUs.NewJSONWith(&info), nil
 }
 
 // GetNetInfoHandler - returns network information.
 func (s *peerRESTServer) GetNetInfoHandler(_ *grid.MSS) (*grid.JSON[madmin.NetInfo], *grid.RemoteErr) {
-	info := madmin.GetNetInfo(globalMinioHost, globalInternodeInterface)
+	info := madmin.GetNetInfo(globalLocalNodeName, globalInternodeInterface)
 	return madminNetInfo.NewJSONWith(&info), nil
 }
 
 // GetPartitionsHandler - returns disk partition information.
 func (s *peerRESTServer) GetPartitionsHandler(_ *grid.MSS) (*grid.JSON[madmin.Partitions], *grid.RemoteErr) {
-	info := madmin.GetPartitions(context.Background(), globalMinioHost)
+	info := madmin.GetPartitions(context.Background(), globalLocalNodeName)
 	return madminPartitions.NewJSONWith(&info), nil
 }
 
 // GetOSInfoHandler - returns operating system's information.
 func (s *peerRESTServer) GetOSInfoHandler(_ *grid.MSS) (*grid.JSON[madmin.OSInfo], *grid.RemoteErr) {
-	info := madmin.GetOSInfo(context.Background(), globalMinioHost)
+	info := madmin.GetOSInfo(context.Background(), globalLocalNodeName)
 	return madminOSInfo.NewJSONWith(&info), nil
 }
 
 // GetProcInfoHandler - returns this MinIO process information.
 func (s *peerRESTServer) GetProcInfoHandler(_ *grid.MSS) (*grid.JSON[madmin.ProcInfo], *grid.RemoteErr) {
-	info := madmin.GetProcInfo(context.Background(), globalMinioHost)
+	info := madmin.GetProcInfo(context.Background(), globalLocalNodeName)
 	return madminProcInfo.NewJSONWith(&info), nil
 }
 
 // GetMemInfoHandler - returns memory information.
 func (s *peerRESTServer) GetMemInfoHandler(_ *grid.MSS) (*grid.JSON[madmin.MemInfo], *grid.RemoteErr) {
-	info := madmin.GetMemInfo(context.Background(), globalMinioHost)
+	info := madmin.GetMemInfo(context.Background(), globalLocalNodeName)
 	return madminMemInfo.NewJSONWith(&info), nil
 }
 
@@ -443,20 +445,20 @@ func (s *peerRESTServer) GetMetricsHandler(v *grid.URLValues) (*grid.JSON[madmin
 // GetSysConfigHandler - returns system config information.
 // (only the config that are of concern to minio)
 func (s *peerRESTServer) GetSysConfigHandler(_ *grid.MSS) (*grid.JSON[madmin.SysConfig], *grid.RemoteErr) {
-	info := madmin.GetSysConfig(context.Background(), globalMinioHost)
+	info := madmin.GetSysConfig(context.Background(), globalLocalNodeName)
 	return madminSysConfig.NewJSONWith(&info), nil
 }
 
 // GetSysServicesHandler - returns system services information.
 // (only the services that are of concern to minio)
 func (s *peerRESTServer) GetSysServicesHandler(_ *grid.MSS) (*grid.JSON[madmin.SysServices], *grid.RemoteErr) {
-	info := madmin.GetSysServices(context.Background(), globalMinioHost)
+	info := madmin.GetSysServices(context.Background(), globalLocalNodeName)
 	return madminSysServices.NewJSONWith(&info), nil
 }
 
 // GetSysErrorsHandler - returns system level errors
 func (s *peerRESTServer) GetSysErrorsHandler(_ *grid.MSS) (*grid.JSON[madmin.SysErrors], *grid.RemoteErr) {
-	info := madmin.GetSysErrors(context.Background(), globalMinioHost)
+	info := madmin.GetSysErrors(context.Background(), globalLocalNodeName)
 	return madminSysErrors.NewJSONWith(&info), nil
 }
 
@@ -467,7 +469,7 @@ func (s *peerRESTServer) DeleteBucketMetadataHandler(mss *grid.MSS) (np grid.NoP
 		return np, grid.NewRemoteErr(errors.New("Bucket name is missing"))
 	}
 
-	globalReplicationStats.Delete(bucketName)
+	globalReplicationStats.Load().Delete(bucketName)
 	globalBucketMetadataSys.Remove(bucketName)
 	globalBucketTargetSys.Delete(bucketName)
 	globalEventNotifier.RemoveNotification(bucketName)
@@ -481,12 +483,12 @@ func (s *peerRESTServer) DeleteBucketMetadataHandler(mss *grid.MSS) (np grid.NoP
 
 // GetAllBucketStatsHandler - fetches bucket replication stats for all buckets from this peer.
 func (s *peerRESTServer) GetAllBucketStatsHandler(mss *grid.MSS) (*BucketStatsMap, *grid.RemoteErr) {
-	replicationStats := globalReplicationStats.GetAll()
+	replicationStats := globalReplicationStats.Load().GetAll()
 	bucketStatsMap := make(map[string]BucketStats, len(replicationStats))
 	for k, v := range replicationStats {
 		bucketStatsMap[k] = BucketStats{
 			ReplicationStats: v,
-			ProxyStats:       globalReplicationStats.getProxyStats(k),
+			ProxyStats:       globalReplicationStats.Load().getProxyStats(k),
 		}
 	}
 	return &BucketStatsMap{Stats: bucketStatsMap, Timestamp: time.Now()}, nil
@@ -499,11 +501,14 @@ func (s *peerRESTServer) GetBucketStatsHandler(vars *grid.MSS) (*BucketStats, *g
 	if bucketName == "" {
 		return nil, grid.NewRemoteErrString("Bucket name is missing")
 	}
-
+	st := globalReplicationStats.Load()
+	if st == nil {
+		return &BucketStats{}, nil
+	}
 	bs := BucketStats{
-		ReplicationStats: globalReplicationStats.Get(bucketName),
-		QueueStats:       ReplicationQueueStats{Nodes: []ReplQNodeStats{globalReplicationStats.getNodeQueueStats(bucketName)}},
-		ProxyStats:       globalReplicationStats.getProxyStats(bucketName),
+		ReplicationStats: st.Get(bucketName),
+		QueueStats:       ReplicationQueueStats{Nodes: []ReplQNodeStats{st.getNodeQueueStats(bucketName)}},
+		ProxyStats:       st.getProxyStats(bucketName),
 	}
 	return &bs, nil
 }
@@ -514,9 +519,11 @@ func (s *peerRESTServer) GetSRMetricsHandler(mss *grid.MSS) (*SRMetricsSummary, 
 	if objAPI == nil {
 		return nil, grid.NewRemoteErr(errServerNotInitialized)
 	}
-
-	sm := globalReplicationStats.getSRMetricsForNode()
-	return &sm, nil
+	if st := globalReplicationStats.Load(); st != nil {
+		sm := st.getSRMetricsForNode()
+		return &sm, nil
+	}
+	return &SRMetricsSummary{}, nil
 }
 
 // LoadBucketMetadataHandler - reloads in memory bucket metadata
@@ -662,7 +669,7 @@ var errUnsupportedSignal = fmt.Errorf("unsupported signal")
 
 func waitingDrivesNode() map[string]madmin.DiskMetrics {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	errs := make([]error, len(localDrives))
@@ -690,6 +697,18 @@ func (s *peerRESTServer) SignalServiceHandler(vars *grid.MSS) (np grid.NoPayload
 	si, err := strconv.Atoi(signalString)
 	if err != nil {
 		return np, grid.NewRemoteErr(err)
+	}
+
+	// Wait until the specified time before executing the signal.
+	if t := vars.Get(peerRESTExecAt); t != "" {
+		execAt, err := time.Parse(time.RFC3339Nano, vars.Get(peerRESTExecAt))
+		if err != nil {
+			logger.LogIf(GlobalContext, "signalservice", err)
+			execAt = time.Now().Add(restartUpdateDelay)
+		}
+		if d := time.Until(execAt); d > 0 {
+			time.Sleep(d)
+		}
 	}
 	signal := serviceSignal(si)
 	switch signal {
@@ -813,7 +832,7 @@ func (s *peerRESTServer) ListenHandler(ctx context.Context, v *grid.URLValues, o
 			buf.Reset()
 			tmpEvt.Records[0] = ev
 			if err := enc.Encode(tmpEvt); err != nil {
-				logger.LogOnceIf(ctx, err, "event: Encode failed")
+				peersLogOnceIf(ctx, err, "event: Encode failed")
 				continue
 			}
 			out <- grid.NewBytesWithCopyOf(buf.Bytes())
@@ -864,7 +883,7 @@ func (s *peerRESTServer) ReloadSiteReplicationConfigHandler(mss *grid.MSS) (np g
 		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	logger.LogIf(context.Background(), globalSiteReplicationSys.Init(context.Background(), objAPI))
+	peersLogIf(context.Background(), globalSiteReplicationSys.Init(context.Background(), objAPI))
 	return
 }
 
@@ -937,7 +956,7 @@ func (s *peerRESTServer) LoadTransitionTierConfigHandler(mss *grid.MSS) (np grid
 	go func() {
 		err := globalTierConfigMgr.Reload(context.Background(), newObjectLayerFn())
 		if err != nil {
-			logger.LogIf(context.Background(), fmt.Errorf("Failed to reload remote tier config %s", err))
+			peersLogIf(context.Background(), fmt.Errorf("Failed to reload remote tier config %s", err))
 		}
 	}()
 
@@ -998,9 +1017,9 @@ func (s *peerRESTServer) GetBandwidth(params *grid.URLValues) (*bandwidth.Bucket
 	return globalBucketMonitor.GetReport(selectBuckets), nil
 }
 
-func (s *peerRESTServer) GetResourceMetrics(_ *grid.MSS) (*grid.Array[*Metric], *grid.RemoteErr) {
-	res := make([]*Metric, 0, len(resourceMetricsGroups))
-	populateAndPublish(resourceMetricsGroups, func(m Metric) bool {
+func (s *peerRESTServer) GetResourceMetrics(_ *grid.MSS) (*grid.Array[*MetricV2], *grid.RemoteErr) {
+	res := make([]*MetricV2, 0, len(resourceMetricsGroups))
+	populateAndPublish(resourceMetricsGroups, func(m MetricV2) bool {
 		if m.VariableLabels == nil {
 			m.VariableLabels = make(map[string]string, 1)
 		}
@@ -1012,9 +1031,9 @@ func (s *peerRESTServer) GetResourceMetrics(_ *grid.MSS) (*grid.Array[*Metric], 
 }
 
 // GetPeerMetrics gets the metrics to be federated across peers.
-func (s *peerRESTServer) GetPeerMetrics(_ *grid.MSS) (*grid.Array[*Metric], *grid.RemoteErr) {
-	res := make([]*Metric, 0, len(peerMetricsGroups))
-	populateAndPublish(peerMetricsGroups, func(m Metric) bool {
+func (s *peerRESTServer) GetPeerMetrics(_ *grid.MSS) (*grid.Array[*MetricV2], *grid.RemoteErr) {
+	res := make([]*MetricV2, 0, len(peerMetricsGroups))
+	populateAndPublish(peerMetricsGroups, func(m MetricV2) bool {
 		if m.VariableLabels == nil {
 			m.VariableLabels = make(map[string]string, 1)
 		}
@@ -1026,9 +1045,9 @@ func (s *peerRESTServer) GetPeerMetrics(_ *grid.MSS) (*grid.Array[*Metric], *gri
 }
 
 // GetPeerBucketMetrics gets the metrics to be federated across peers.
-func (s *peerRESTServer) GetPeerBucketMetrics(_ *grid.MSS) (*grid.Array[*Metric], *grid.RemoteErr) {
-	res := make([]*Metric, 0, len(bucketPeerMetricsGroups))
-	populateAndPublish(bucketPeerMetricsGroups, func(m Metric) bool {
+func (s *peerRESTServer) GetPeerBucketMetrics(_ *grid.MSS) (*grid.Array[*MetricV2], *grid.RemoteErr) {
+	res := make([]*MetricV2, 0, len(bucketPeerMetricsGroups))
+	populateAndPublish(bucketPeerMetricsGroups, func(m MetricV2) bool {
 		if m.VariableLabels == nil {
 			m.VariableLabels = make(map[string]string, 1)
 		}
@@ -1057,6 +1076,13 @@ func (s *peerRESTServer) SpeedTestHandler(w http.ResponseWriter, r *http.Request
 	storageClass := r.Form.Get(peerRESTStorageClass)
 	bucketName := r.Form.Get(peerRESTBucket)
 	enableSha256 := r.Form.Get(peerRESTEnableSha256) == "true"
+	enableMultipart := r.Form.Get(peerRESTEnableMultipart) == "true"
+
+	u, ok := globalIAMSys.GetUser(r.Context(), r.Form.Get(peerRESTAccessKey))
+	if !ok {
+		s.writeErrorResponse(w, errAuthentication)
+		return
+	}
 
 	size, err := strconv.Atoi(sizeStr)
 	if err != nil {
@@ -1076,19 +1102,21 @@ func (s *peerRESTServer) SpeedTestHandler(w http.ResponseWriter, r *http.Request
 	done := keepHTTPResponseAlive(w)
 
 	result, err := selfSpeedTest(r.Context(), speedTestOpts{
-		objectSize:   size,
-		concurrency:  concurrent,
-		duration:     duration,
-		storageClass: storageClass,
-		bucketName:   bucketName,
-		enableSha256: enableSha256,
+		objectSize:      size,
+		concurrency:     concurrent,
+		duration:        duration,
+		storageClass:    storageClass,
+		bucketName:      bucketName,
+		enableSha256:    enableSha256,
+		enableMultipart: enableMultipart,
+		creds:           u.Credentials,
 	})
 	if err != nil {
 		result.Error = err.Error()
 	}
 
 	done(nil)
-	logger.LogIf(r.Context(), gob.NewEncoder(w).Encode(result))
+	peersLogIf(r.Context(), gob.NewEncoder(w).Encode(result))
 }
 
 // GetLastDayTierStatsHandler - returns per-tier stats in the last 24hrs for this server
@@ -1137,7 +1165,7 @@ func (s *peerRESTServer) DriveSpeedTestHandler(w http.ResponseWriter, r *http.Re
 	result := driveSpeedTest(r.Context(), opts)
 	done(nil)
 
-	logger.LogIf(r.Context(), gob.NewEncoder(w).Encode(result))
+	peersLogIf(r.Context(), gob.NewEncoder(w).Encode(result))
 }
 
 // GetReplicationMRFHandler - returns replication MRF for bucket
@@ -1150,7 +1178,7 @@ func (s *peerRESTServer) GetReplicationMRFHandler(w http.ResponseWriter, r *http
 	vars := mux.Vars(r)
 	bucketName := vars[peerRESTBucket]
 	ctx := newContext(r, w, "GetReplicationMRF")
-	re, err := globalReplicationPool.getMRF(ctx, bucketName)
+	re, err := globalReplicationPool.Get().getMRF(ctx, bucketName)
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
@@ -1184,7 +1212,7 @@ func (s *peerRESTServer) DevNull(w http.ResponseWriter, r *http.Request) {
 			// If there is a disconnection before globalNetPerfMinDuration (we give a margin of error of 1 sec)
 			// would mean the network is not stable. Logging here will help in debugging network issues.
 			if time.Since(connectTime) < (globalNetPerfMinDuration - time.Second) {
-				logger.LogIf(ctx, err)
+				peersLogIf(ctx, err)
 			}
 		}
 		if err != nil {
@@ -1206,7 +1234,7 @@ func (s *peerRESTServer) NetSpeedTestHandler(w http.ResponseWriter, r *http.Requ
 		duration = time.Second * 10
 	}
 	result := netperf(r.Context(), duration.Round(time.Second))
-	logger.LogIf(r.Context(), gob.NewEncoder(w).Encode(result))
+	peersLogIf(r.Context(), gob.NewEncoder(w).Encode(result))
 }
 
 func (s *peerRESTServer) HealBucketHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
@@ -1226,7 +1254,20 @@ func (s *peerRESTServer) HealBucketHandler(mss *grid.MSS) (np grid.NoPayload, ne
 	return np, nil
 }
 
-// HeadBucketHandler implements peer BuckeInfo call, returns bucket create date.
+func (s *peerRESTServer) ListBucketsHandler(opts *BucketOptions) (*grid.Array[*BucketInfo], *grid.RemoteErr) {
+	buckets, err := listBucketsLocal(context.Background(), *opts)
+	if err != nil {
+		return nil, grid.NewRemoteErr(err)
+	}
+	res := aoBucketInfo.New()
+	for i := range buckets {
+		bucket := buckets[i]
+		res.Append(&bucket)
+	}
+	return res, nil
+}
+
+// HeadBucketHandler implements peer BucketInfo call, returns bucket create date.
 func (s *peerRESTServer) HeadBucketHandler(mss *grid.MSS) (info *VolInfo, nerr *grid.RemoteErr) {
 	bucket := mss.Get(peerS3Bucket)
 	if isMinioMetaBucket(bucket) {
@@ -1332,6 +1373,7 @@ func registerPeerRESTHandlers(router *mux.Router, gm *grid.Manager) {
 	logger.FatalIf(getSysServicesRPC.Register(gm, server.GetSysServicesHandler), "unable to register handler")
 	logger.FatalIf(headBucketRPC.Register(gm, server.HeadBucketHandler), "unable to register handler")
 	logger.FatalIf(healBucketRPC.Register(gm, server.HealBucketHandler), "unable to register handler")
+	logger.FatalIf(listBucketsRPC.Register(gm, server.ListBucketsHandler), "unable to register handler")
 	logger.FatalIf(listenRPC.RegisterNoInput(gm, server.ListenHandler), "unable to register handler")
 	logger.FatalIf(loadBucketMetadataRPC.Register(gm, server.LoadBucketMetadataHandler), "unable to register handler")
 	logger.FatalIf(loadGroupRPC.Register(gm, server.LoadGroupHandler), "unable to register handler")

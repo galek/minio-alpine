@@ -28,7 +28,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/grid"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // Storage REST server, storageRESTReceiver and StorageRESTClient are
@@ -315,6 +315,7 @@ func newStorageRESTHTTPServerClient(t testing.TB) *storageRESTClient {
 	url.Path = t.TempDir()
 
 	globalMinioHost, globalMinioPort = mustSplitHostPort(url.Host)
+	globalNodeAuthToken, _ = authenticateNode(globalActiveCred.AccessKey, globalActiveCred.SecretKey)
 
 	endpoint, err := NewEndpoint(url.String())
 	if err != nil {

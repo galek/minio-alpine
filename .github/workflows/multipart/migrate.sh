@@ -24,11 +24,6 @@ if [ ! -f ./mc ]; then
 		chmod +x mc
 fi
 
-(
-	cd ./docs/debugging/s3-check-md5
-	go install -v
-)
-
 export RELEASE=RELEASE.2023-08-29T23-07-35Z
 
 docker-compose -f docker-compose-site1.yaml up -d
@@ -48,10 +43,10 @@ sleep 30s
 
 sleep 5
 
-s3-check-md5 -h
+./s3-check-md5 -h
 
-failed_count_site1=$(s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site1-nginx:9001 -bucket testbucket 2>&1 | grep FAILED | wc -l)
-failed_count_site2=$(s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site2-nginx:9002 -bucket testbucket 2>&1 | grep FAILED | wc -l)
+failed_count_site1=$(./s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site1-nginx:9001 -bucket testbucket 2>&1 | grep FAILED | wc -l)
+failed_count_site2=$(./s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site2-nginx:9002 -bucket testbucket 2>&1 | grep FAILED | wc -l)
 
 if [ $failed_count_site1 -ne 0 ]; then
 	echo "failed with multipart on site1 uploads"
@@ -67,8 +62,8 @@ fi
 
 sleep 5
 
-failed_count_site1=$(s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site1-nginx:9001 -bucket testbucket 2>&1 | grep FAILED | wc -l)
-failed_count_site2=$(s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site2-nginx:9002 -bucket testbucket 2>&1 | grep FAILED | wc -l)
+failed_count_site1=$(./s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site1-nginx:9001 -bucket testbucket 2>&1 | grep FAILED | wc -l)
+failed_count_site2=$(./s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site2-nginx:9002 -bucket testbucket 2>&1 | grep FAILED | wc -l)
 
 ## we do not need to fail here, since we are going to test
 ## upgrading to master, healing and being able to recover
@@ -96,8 +91,8 @@ for i in $(seq 1 10); do
 	./mc admin heal -r --remove --json site2/ 2>&1 >/dev/null
 done
 
-failed_count_site1=$(s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site1-nginx:9001 -bucket testbucket 2>&1 | grep FAILED | wc -l)
-failed_count_site2=$(s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site2-nginx:9002 -bucket testbucket 2>&1 | grep FAILED | wc -l)
+failed_count_site1=$(./s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site1-nginx:9001 -bucket testbucket 2>&1 | grep FAILED | wc -l)
+failed_count_site2=$(./s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://site2-nginx:9002 -bucket testbucket 2>&1 | grep FAILED | wc -l)
 
 if [ $failed_count_site1 -ne 0 ]; then
 	echo "failed with multipart on site1 uploads"
@@ -106,6 +101,43 @@ fi
 
 if [ $failed_count_site2 -ne 0 ]; then
 	echo "failed with multipart on site2 uploads"
+	exit 1
+fi
+
+# Add user group test
+./mc admin user add site1 site-replication-issue-user site-replication-issue-password
+./mc admin group add site1 site-replication-issue-group site-replication-issue-user
+
+max_wait_attempts=30
+wait_interval=5
+
+attempt=1
+while true; do
+	diff <(./mc admin group info site1 site-replication-issue-group) <(./mc admin group info site2 site-replication-issue-group)
+
+	if [[ $? -eq 0 ]]; then
+		echo "Outputs are consistent."
+		break
+	fi
+
+	remaining_attempts=$((max_wait_attempts - attempt))
+	if ((attempt >= max_wait_attempts)); then
+		echo "Outputs remain inconsistent after $max_wait_attempts attempts. Exiting with error."
+		exit 1
+	else
+		echo "Outputs are inconsistent. Waiting for $wait_interval seconds (attempt $attempt/$max_wait_attempts)."
+		sleep $wait_interval
+	fi
+
+	((attempt++))
+done
+
+status=$(./mc admin group info site1 site-replication-issue-group --json | jq .groupStatus | tr -d '"')
+
+if [[ $status == "enabled" ]]; then
+	echo "Success"
+else
+	echo "Expected status: enabled, actual status: $status"
 	exit 1
 fi
 

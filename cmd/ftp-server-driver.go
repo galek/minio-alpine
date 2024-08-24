@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -33,7 +34,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio/internal/auth"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/v3/mimedb"
 	ftp "goftp.io/server/v2"
 )
 
@@ -82,8 +83,13 @@ func (m *minioFileInfo) Mode() os.FileMode {
 	return os.ModePerm
 }
 
+var minFileDate = time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC) // Workaround for Filezilla
+
 func (m *minioFileInfo) ModTime() time.Time {
-	return m.info.LastModified
+	if !m.info.LastModified.IsZero() {
+		return m.info.LastModified
+	}
+	return minFileDate
 }
 
 func (m *minioFileInfo) IsDir() bool {
@@ -99,7 +105,7 @@ type ftpMetrics struct{}
 
 var globalFtpMetrics ftpMetrics
 
-func ftpTrace(s *ftp.Context, startTime time.Time, source, path string, err error) madmin.TraceInfo {
+func ftpTrace(s *ftp.Context, startTime time.Time, source, objPath string, err error, sz int64) madmin.TraceInfo {
 	var errStr string
 	if err != nil {
 		errStr = err.Error()
@@ -108,34 +114,42 @@ func ftpTrace(s *ftp.Context, startTime time.Time, source, path string, err erro
 		TraceType: madmin.TraceFTP,
 		Time:      startTime,
 		NodeName:  globalLocalNodeName,
-		FuncName:  fmt.Sprintf("ftp USER=%s COMMAND=%s PARAM=%s ISLOGIN=%t, Source=%s", s.Sess.LoginUser(), s.Cmd, s.Param, s.Sess.IsLogin(), source),
+		FuncName:  s.Cmd,
 		Duration:  time.Since(startTime),
-		Path:      path,
+		Path:      objPath,
 		Error:     errStr,
+		Bytes:     sz,
+		Custom: map[string]string{
+			"user":   s.Sess.LoginUser(),
+			"cmd":    s.Cmd,
+			"param":  s.Param,
+			"login":  fmt.Sprintf("%t", s.Sess.IsLogin()),
+			"source": source,
+		},
 	}
 }
 
-func (m *ftpMetrics) log(s *ftp.Context, paths ...string) func(err error) {
+func (m *ftpMetrics) log(s *ftp.Context, paths ...string) func(sz int64, err error) {
 	startTime := time.Now()
 	source := getSource(2)
-	return func(err error) {
-		globalTrace.Publish(ftpTrace(s, startTime, source, strings.Join(paths, " "), err))
+	return func(sz int64, err error) {
+		globalTrace.Publish(ftpTrace(s, startTime, source, strings.Join(paths, " "), err, sz))
 	}
 }
 
 // Stat implements ftpDriver
-func (driver *ftpDriver) Stat(ctx *ftp.Context, path string) (fi os.FileInfo, err error) {
-	stopFn := globalFtpMetrics.log(ctx, path)
-	defer stopFn(err)
+func (driver *ftpDriver) Stat(ctx *ftp.Context, objPath string) (fi os.FileInfo, err error) {
+	stopFn := globalFtpMetrics.log(ctx, objPath)
+	defer stopFn(0, err)
 
-	if path == SlashSeparator {
+	if objPath == SlashSeparator {
 		return &minioFileInfo{
 			p:     SlashSeparator,
 			isDir: true,
 		}, nil
 	}
 
-	bucket, object := path2BucketObject(path)
+	bucket, object := path2BucketObject(objPath)
 	if bucket == "" {
 		return nil, errors.New("bucket name cannot be empty")
 	}
@@ -182,9 +196,9 @@ func (driver *ftpDriver) Stat(ctx *ftp.Context, path string) (fi os.FileInfo, er
 }
 
 // ListDir implements ftpDriver
-func (driver *ftpDriver) ListDir(ctx *ftp.Context, path string, callback func(os.FileInfo) error) (err error) {
-	stopFn := globalFtpMetrics.log(ctx, path)
-	defer stopFn(err)
+func (driver *ftpDriver) ListDir(ctx *ftp.Context, objPath string, callback func(os.FileInfo) error) (err error) {
+	stopFn := globalFtpMetrics.log(ctx, objPath)
+	defer stopFn(0, err)
 
 	clnt, err := driver.getMinIOClient(ctx)
 	if err != nil {
@@ -194,7 +208,7 @@ func (driver *ftpDriver) ListDir(ctx *ftp.Context, path string, callback func(os
 	cctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bucket, prefix := path2BucketObject(path)
+	bucket, prefix := path2BucketObject(objPath)
 	if bucket == "" {
 		buckets, err := clnt.ListBuckets(cctx)
 		if err != nil {
@@ -246,7 +260,7 @@ func (driver *ftpDriver) ListDir(ctx *ftp.Context, path string, callback func(os
 
 func (driver *ftpDriver) CheckPasswd(c *ftp.Context, username, password string) (ok bool, err error) {
 	stopFn := globalFtpMetrics.log(c, username)
-	defer stopFn(err)
+	defer stopFn(0, err)
 
 	if globalIAMSys.LDAPConfig.Enabled() {
 		sa, _, err := globalIAMSys.getServiceAccount(context.Background(), username)
@@ -254,11 +268,11 @@ func (driver *ftpDriver) CheckPasswd(c *ftp.Context, username, password string) 
 			return false, err
 		}
 		if errors.Is(err, errNoSuchServiceAccount) {
-			ldapUserDN, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(username, password)
+			lookupRes, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(username, password)
 			if err != nil {
 				return false, err
 			}
-			ldapPolicies, _ := globalIAMSys.PolicyDBGet(ldapUserDN, groupDistNames...)
+			ldapPolicies, _ := globalIAMSys.PolicyDBGet(lookupRes.NormDN, groupDistNames...)
 			return len(ldapPolicies) > 0, nil
 		}
 		return subtle.ConstantTimeCompare([]byte(sa.Credentials.SecretKey), []byte(password)) == 1, nil
@@ -284,11 +298,11 @@ func (driver *ftpDriver) getMinIOClient(ctx *ftp.Context) (*minio.Client, error)
 
 		var mcreds *credentials.Credentials
 		if errors.Is(err, errNoSuchServiceAccount) {
-			targetUser, targetGroups, err := globalIAMSys.LDAPConfig.LookupUserDN(ctx.Sess.LoginUser())
+			lookupResult, targetGroups, err := globalIAMSys.LDAPConfig.LookupUserDN(ctx.Sess.LoginUser())
 			if err != nil {
 				return nil, err
 			}
-			ldapPolicies, _ := globalIAMSys.PolicyDBGet(targetUser, targetGroups...)
+			ldapPolicies, _ := globalIAMSys.PolicyDBGet(lookupResult.NormDN, targetGroups...)
 			if len(ldapPolicies) == 0 {
 				return nil, errAuthentication
 			}
@@ -298,8 +312,15 @@ func (driver *ftpDriver) getMinIOClient(ctx *ftp.Context) (*minio.Client, error)
 			}
 			claims := make(map[string]interface{})
 			claims[expClaim] = UTCNow().Add(expiryDur).Unix()
-			claims[ldapUser] = targetUser
+
+			claims[ldapUser] = lookupResult.NormDN
+			claims[ldapActualUser] = lookupResult.ActualDN
 			claims[ldapUserN] = ctx.Sess.LoginUser()
+
+			// Add LDAP attributes that were looked up into the claims.
+			for attribKey, attribValue := range lookupResult.Attributes {
+				claims[ldapAttribPrefix+attribKey] = attribValue
+			}
 
 			cred, err := auth.GetNewCredentialsWithMetadata(claims, globalActiveCred.SecretKey)
 			if err != nil {
@@ -308,7 +329,7 @@ func (driver *ftpDriver) getMinIOClient(ctx *ftp.Context) (*minio.Client, error)
 
 			// Set the parent of the temporary access key, this is useful
 			// in obtaining service accounts by this cred.
-			cred.ParentUser = targetUser
+			cred.ParentUser = lookupResult.NormDN
 
 			// Set this value to LDAP groups, LDAP user can be part
 			// of large number of groups
@@ -323,7 +344,7 @@ func (driver *ftpDriver) getMinIOClient(ctx *ftp.Context) (*minio.Client, error)
 			}
 
 			// Call hook for site replication.
-			logger.LogIf(context.Background(), globalSiteReplicationSys.IAMChangeHook(context.Background(), madmin.SRIAMItem{
+			replLogIf(context.Background(), globalSiteReplicationSys.IAMChangeHook(context.Background(), madmin.SRIAMItem{
 				Type: madmin.SRIAMItemSTSAcc,
 				STSCredential: &madmin.SRSTSCredential{
 					AccessKey:    cred.AccessKey,
@@ -361,11 +382,11 @@ func (driver *ftpDriver) getMinIOClient(ctx *ftp.Context) (*minio.Client, error)
 }
 
 // DeleteDir implements ftpDriver
-func (driver *ftpDriver) DeleteDir(ctx *ftp.Context, path string) (err error) {
-	stopFn := globalFtpMetrics.log(ctx, path)
-	defer stopFn(err)
+func (driver *ftpDriver) DeleteDir(ctx *ftp.Context, objPath string) (err error) {
+	stopFn := globalFtpMetrics.log(ctx, objPath)
+	defer stopFn(0, err)
 
-	bucket, prefix := path2BucketObject(path)
+	bucket, prefix := path2BucketObject(objPath)
 	if bucket == "" {
 		return errors.New("deleting all buckets not allowed")
 	}
@@ -411,11 +432,11 @@ func (driver *ftpDriver) DeleteDir(ctx *ftp.Context, path string) (err error) {
 }
 
 // DeleteFile implements ftpDriver
-func (driver *ftpDriver) DeleteFile(ctx *ftp.Context, path string) (err error) {
-	stopFn := globalFtpMetrics.log(ctx, path)
-	defer stopFn(err)
+func (driver *ftpDriver) DeleteFile(ctx *ftp.Context, objPath string) (err error) {
+	stopFn := globalFtpMetrics.log(ctx, objPath)
+	defer stopFn(0, err)
 
-	bucket, object := path2BucketObject(path)
+	bucket, object := path2BucketObject(objPath)
 	if bucket == "" {
 		return errors.New("bucket name cannot be empty")
 	}
@@ -429,19 +450,19 @@ func (driver *ftpDriver) DeleteFile(ctx *ftp.Context, path string) (err error) {
 }
 
 // Rename implements ftpDriver
-func (driver *ftpDriver) Rename(ctx *ftp.Context, fromPath string, toPath string) (err error) {
-	stopFn := globalFtpMetrics.log(ctx, fromPath, toPath)
-	defer stopFn(err)
+func (driver *ftpDriver) Rename(ctx *ftp.Context, fromObjPath string, toObjPath string) (err error) {
+	stopFn := globalFtpMetrics.log(ctx, fromObjPath, toObjPath)
+	defer stopFn(0, err)
 
 	return NotImplemented{}
 }
 
 // MakeDir implements ftpDriver
-func (driver *ftpDriver) MakeDir(ctx *ftp.Context, path string) (err error) {
-	stopFn := globalFtpMetrics.log(ctx, path)
-	defer stopFn(err)
+func (driver *ftpDriver) MakeDir(ctx *ftp.Context, objPath string) (err error) {
+	stopFn := globalFtpMetrics.log(ctx, objPath)
+	defer stopFn(0, err)
 
-	bucket, prefix := path2BucketObject(path)
+	bucket, prefix := path2BucketObject(objPath)
 	if bucket == "" {
 		return errors.New("bucket name cannot be empty")
 	}
@@ -452,26 +473,23 @@ func (driver *ftpDriver) MakeDir(ctx *ftp.Context, path string) (err error) {
 	}
 
 	if prefix == "" {
-		return clnt.MakeBucket(context.Background(), bucket, minio.MakeBucketOptions{Region: globalSite.Region})
+		return clnt.MakeBucket(context.Background(), bucket, minio.MakeBucketOptions{Region: globalSite.Region()})
 	}
 
 	dirPath := buildMinioDir(prefix)
 
-	_, err = clnt.PutObject(context.Background(), bucket, dirPath, bytes.NewReader([]byte("")), 0,
-		// Always send Content-MD5 to succeed with bucket with
-		// locking enabled. There is no performance hit since
-		// this is always an empty object
-		minio.PutObjectOptions{SendContentMd5: true},
-	)
+	_, err = clnt.PutObject(context.Background(), bucket, dirPath, bytes.NewReader([]byte("")), 0, minio.PutObjectOptions{
+		DisableContentSha256: true,
+	})
 	return err
 }
 
 // GetFile implements ftpDriver
-func (driver *ftpDriver) GetFile(ctx *ftp.Context, path string, offset int64) (n int64, rc io.ReadCloser, err error) {
-	stopFn := globalFtpMetrics.log(ctx, path)
-	defer stopFn(err)
+func (driver *ftpDriver) GetFile(ctx *ftp.Context, objPath string, offset int64) (n int64, rc io.ReadCloser, err error) {
+	stopFn := globalFtpMetrics.log(ctx, objPath)
+	defer stopFn(n, err)
 
-	bucket, object := path2BucketObject(path)
+	bucket, object := path2BucketObject(objPath)
 	if bucket == "" {
 		return 0, nil, errors.New("bucket name cannot be empty")
 	}
@@ -501,16 +519,16 @@ func (driver *ftpDriver) GetFile(ctx *ftp.Context, path string, offset int64) (n
 	if err != nil {
 		return 0, nil, err
 	}
-
-	return info.Size - offset, obj, nil
+	n = info.Size - offset
+	return n, obj, nil
 }
 
 // PutFile implements ftpDriver
-func (driver *ftpDriver) PutFile(ctx *ftp.Context, path string, data io.Reader, offset int64) (n int64, err error) {
-	stopFn := globalFtpMetrics.log(ctx, path)
-	defer stopFn(err)
+func (driver *ftpDriver) PutFile(ctx *ftp.Context, objPath string, data io.Reader, offset int64) (n int64, err error) {
+	stopFn := globalFtpMetrics.log(ctx, objPath)
+	defer stopFn(n, err)
 
-	bucket, object := path2BucketObject(path)
+	bucket, object := path2BucketObject(objPath)
 	if bucket == "" {
 		return 0, errors.New("bucket name cannot be empty")
 	}
@@ -526,8 +544,9 @@ func (driver *ftpDriver) PutFile(ctx *ftp.Context, path string, data io.Reader, 
 	}
 
 	info, err := clnt.PutObject(context.Background(), bucket, object, data, -1, minio.PutObjectOptions{
-		ContentType:    "application/octet-stream",
-		SendContentMd5: true,
+		ContentType:          mimedb.TypeByExtension(path.Ext(object)),
+		DisableContentSha256: true,
 	})
-	return info.Size, err
+	n = info.Size
+	return n, err
 }

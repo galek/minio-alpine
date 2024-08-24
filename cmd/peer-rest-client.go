@@ -36,7 +36,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/rest"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // client to talk to peer Nodes.
@@ -83,7 +83,7 @@ func newPeerRESTClient(peer *xnet.Host, gridHost string) *peerRESTClient {
 			// Lazy initialization of grid connection.
 			// When we create this peer client, the grid connection is likely not yet initialized.
 			if gridHost == "" {
-				logger.LogOnceIf(context.Background(), fmt.Errorf("gridHost is empty for peer %s", peer.String()), peer.String()+":gridHost")
+				bugLogIf(context.Background(), fmt.Errorf("gridHost is empty for peer %s", peer.String()), peer.String()+":gridHost")
 				return nil
 			}
 			gc := gridConn.Load()
@@ -96,7 +96,7 @@ func newPeerRESTClient(peer *xnet.Host, gridHost string) *peerRESTClient {
 			}
 			gc = gm.Connection(gridHost)
 			if gc == nil {
-				logger.LogOnceIf(context.Background(), fmt.Errorf("gridHost %q not found for peer %s", gridHost, peer.String()), peer.String()+":gridHost")
+				bugLogIf(context.Background(), fmt.Errorf("gridHost %q not found for peer %s", gridHost, peer.String()), peer.String()+":gridHost")
 				return nil
 			}
 			gridConn.Store(gc)
@@ -108,15 +108,8 @@ func newPeerRESTClient(peer *xnet.Host, gridHost string) *peerRESTClient {
 // Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
 // permanently. The only way to restore the connection is at the xl-sets layer by xlsets.monitorAndConnectEndpoints()
 // after verifying format.json
-func (client *peerRESTClient) call(method string, values url.Values, body io.Reader, length int64) (respBody io.ReadCloser, err error) {
-	return client.callWithContext(GlobalContext, method, values, body, length)
-}
-
-// Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
-// permanently. The only way to restore the connection is at the xl-sets layer by xlsets.monitorAndConnectEndpoints()
-// after verifying format.json
 func (client *peerRESTClient) callWithContext(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (respBody io.ReadCloser, err error) {
-	if client == nil || !client.IsOnline() {
+	if client == nil {
 		return nil, errPeerNotReachable
 	}
 
@@ -129,6 +122,10 @@ func (client *peerRESTClient) callWithContext(ctx context.Context, method string
 		return respBody, nil
 	}
 
+	if xnet.IsNetworkOrHostDown(err, true) {
+		return nil, errPeerNotReachable
+	}
+
 	return nil, err
 }
 
@@ -139,7 +136,11 @@ func (client *peerRESTClient) String() string {
 
 // IsOnline returns true if the peer client is online.
 func (client *peerRESTClient) IsOnline() bool {
-	return client.restClient.IsOnline()
+	conn := client.gridConn()
+	if conn == nil {
+		return false
+	}
+	return client.restClient.IsOnline() || conn.State() == grid.StateConnected
 }
 
 // Close - marks the client as closed.
@@ -149,8 +150,8 @@ func (client *peerRESTClient) Close() error {
 }
 
 // GetLocks - fetch older locks for a remote node.
-func (client *peerRESTClient) GetLocks() (lockMap map[string][]lockRequesterInfo, err error) {
-	resp, err := getLocksRPC.Call(context.Background(), client.gridConn(), grid.NewMSS())
+func (client *peerRESTClient) GetLocks(ctx context.Context) (lockMap map[string][]lockRequesterInfo, err error) {
+	resp, err := getLocksRPC.Call(ctx, client.gridConn(), grid.NewMSS())
 	if err != nil || resp == nil {
 		return nil, err
 	}
@@ -158,16 +159,16 @@ func (client *peerRESTClient) GetLocks() (lockMap map[string][]lockRequesterInfo
 }
 
 // LocalStorageInfo - fetch server information for a remote node.
-func (client *peerRESTClient) LocalStorageInfo(metrics bool) (info StorageInfo, err error) {
-	resp, err := localStorageInfoRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) LocalStorageInfo(ctx context.Context, metrics bool) (info StorageInfo, err error) {
+	resp, err := localStorageInfoRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTMetrics: strconv.FormatBool(metrics),
 	}))
 	return resp.ValueOrZero(), err
 }
 
 // ServerInfo - fetch server information for a remote node.
-func (client *peerRESTClient) ServerInfo(metrics bool) (info madmin.ServerProperties, err error) {
-	resp, err := serverInfoRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{peerRESTMetrics: strconv.FormatBool(metrics)}))
+func (client *peerRESTClient) ServerInfo(ctx context.Context, metrics bool) (info madmin.ServerProperties, err error) {
+	resp, err := serverInfoRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{peerRESTMetrics: strconv.FormatBool(metrics)}))
 	return resp.ValueOrZero(), err
 }
 
@@ -249,10 +250,10 @@ func (client *peerRESTClient) GetProcInfo(ctx context.Context) (info madmin.Proc
 }
 
 // StartProfiling - Issues profiling command on the peer node.
-func (client *peerRESTClient) StartProfiling(profiler string) error {
+func (client *peerRESTClient) StartProfiling(ctx context.Context, profiler string) error {
 	values := make(url.Values)
 	values.Set(peerRESTProfiler, profiler)
-	respBody, err := client.call(peerRESTMethodStartProfiling, values, nil, -1)
+	respBody, err := client.callWithContext(ctx, peerRESTMethodStartProfiling, values, nil, -1)
 	if err != nil {
 		return err
 	}
@@ -261,8 +262,8 @@ func (client *peerRESTClient) StartProfiling(profiler string) error {
 }
 
 // DownloadProfileData - download profiled data from a remote node.
-func (client *peerRESTClient) DownloadProfileData() (data map[string][]byte, err error) {
-	respBody, err := client.call(peerRESTMethodDownloadProfilingData, nil, nil, -1)
+func (client *peerRESTClient) DownloadProfileData(ctx context.Context) (data map[string][]byte, err error) {
+	respBody, err := client.callWithContext(ctx, peerRESTMethodDownloadProfilingData, nil, nil, -1)
 	if err != nil {
 		return
 	}
@@ -272,8 +273,8 @@ func (client *peerRESTClient) DownloadProfileData() (data map[string][]byte, err
 }
 
 // GetBucketStats - load bucket statistics
-func (client *peerRESTClient) GetBucketStats(bucket string) (BucketStats, error) {
-	resp, err := getBucketStatsRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) GetBucketStats(ctx context.Context, bucket string) (BucketStats, error) {
+	resp, err := getBucketStatsRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTBucket: bucket,
 	}))
 	if err != nil || resp == nil {
@@ -283,8 +284,8 @@ func (client *peerRESTClient) GetBucketStats(bucket string) (BucketStats, error)
 }
 
 // GetSRMetrics loads site replication metrics, optionally for a specific bucket
-func (client *peerRESTClient) GetSRMetrics() (SRMetricsSummary, error) {
-	resp, err := getSRMetricsRPC.Call(context.Background(), client.gridConn(), grid.NewMSS())
+func (client *peerRESTClient) GetSRMetrics(ctx context.Context) (SRMetricsSummary, error) {
+	resp, err := getSRMetricsRPC.Call(ctx, client.gridConn(), grid.NewMSS())
 	if err != nil || resp == nil {
 		return SRMetricsSummary{}, err
 	}
@@ -292,8 +293,8 @@ func (client *peerRESTClient) GetSRMetrics() (SRMetricsSummary, error) {
 }
 
 // GetAllBucketStats - load replication stats for all buckets
-func (client *peerRESTClient) GetAllBucketStats() (BucketStatsMap, error) {
-	resp, err := getAllBucketStatsRPC.Call(context.Background(), client.gridConn(), grid.NewMSS())
+func (client *peerRESTClient) GetAllBucketStats(ctx context.Context) (BucketStatsMap, error) {
+	resp, err := getAllBucketStatsRPC.Call(ctx, client.gridConn(), grid.NewMSS())
 	if err != nil || resp == nil {
 		return BucketStatsMap{}, err
 	}
@@ -301,40 +302,40 @@ func (client *peerRESTClient) GetAllBucketStats() (BucketStatsMap, error) {
 }
 
 // LoadBucketMetadata - load bucket metadata
-func (client *peerRESTClient) LoadBucketMetadata(bucket string) error {
-	_, err := loadBucketMetadataRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) LoadBucketMetadata(ctx context.Context, bucket string) error {
+	_, err := loadBucketMetadataRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTBucket: bucket,
 	}))
 	return err
 }
 
 // DeleteBucketMetadata - Delete bucket metadata
-func (client *peerRESTClient) DeleteBucketMetadata(bucket string) error {
-	_, err := deleteBucketMetadataRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) DeleteBucketMetadata(ctx context.Context, bucket string) error {
+	_, err := deleteBucketMetadataRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTBucket: bucket,
 	}))
 	return err
 }
 
 // DeletePolicy - delete a specific canned policy.
-func (client *peerRESTClient) DeletePolicy(policyName string) (err error) {
-	_, err = deletePolicyRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) DeletePolicy(ctx context.Context, policyName string) (err error) {
+	_, err = deletePolicyRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTPolicy: policyName,
 	}))
 	return err
 }
 
 // LoadPolicy - reload a specific canned policy.
-func (client *peerRESTClient) LoadPolicy(policyName string) (err error) {
-	_, err = loadPolicyRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) LoadPolicy(ctx context.Context, policyName string) (err error) {
+	_, err = loadPolicyRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTPolicy: policyName,
 	}))
 	return err
 }
 
 // LoadPolicyMapping - reload a specific policy mapping
-func (client *peerRESTClient) LoadPolicyMapping(userOrGroup string, userType IAMUserType, isGroup bool) error {
-	_, err := loadPolicyMappingRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) LoadPolicyMapping(ctx context.Context, userOrGroup string, userType IAMUserType, isGroup bool) error {
+	_, err := loadPolicyMappingRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTUserOrGroup: userOrGroup,
 		peerRESTUserType:    strconv.Itoa(int(userType)),
 		peerRESTIsGroup:     strconv.FormatBool(isGroup),
@@ -343,24 +344,24 @@ func (client *peerRESTClient) LoadPolicyMapping(userOrGroup string, userType IAM
 }
 
 // DeleteUser - delete a specific user.
-func (client *peerRESTClient) DeleteUser(accessKey string) (err error) {
-	_, err = deleteUserRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) DeleteUser(ctx context.Context, accessKey string) (err error) {
+	_, err = deleteUserRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTUser: accessKey,
 	}))
 	return err
 }
 
 // DeleteServiceAccount - delete a specific service account.
-func (client *peerRESTClient) DeleteServiceAccount(accessKey string) (err error) {
-	_, err = deleteSvcActRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) DeleteServiceAccount(ctx context.Context, accessKey string) (err error) {
+	_, err = deleteSvcActRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTUser: accessKey,
 	}))
 	return err
 }
 
 // LoadUser - reload a specific user.
-func (client *peerRESTClient) LoadUser(accessKey string, temp bool) (err error) {
-	_, err = loadUserRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) LoadUser(ctx context.Context, accessKey string, temp bool) (err error) {
+	_, err = loadUserRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTUser:     accessKey,
 		peerRESTUserTemp: strconv.FormatBool(temp),
 	}))
@@ -368,16 +369,16 @@ func (client *peerRESTClient) LoadUser(accessKey string, temp bool) (err error) 
 }
 
 // LoadServiceAccount - reload a specific service account.
-func (client *peerRESTClient) LoadServiceAccount(accessKey string) (err error) {
-	_, err = loadSvcActRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) LoadServiceAccount(ctx context.Context, accessKey string) (err error) {
+	_, err = loadSvcActRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTUser: accessKey,
 	}))
 	return err
 }
 
 // LoadGroup - send load group command to peers.
-func (client *peerRESTClient) LoadGroup(group string) error {
-	_, err := loadGroupRPC.Call(context.Background(), client.gridConn(), grid.NewMSSWith(map[string]string{
+func (client *peerRESTClient) LoadGroup(ctx context.Context, group string) error {
+	_, err := loadGroupRPC.Call(ctx, client.gridConn(), grid.NewMSSWith(map[string]string{
 		peerRESTGroup: group,
 	}))
 	return err
@@ -419,17 +420,20 @@ func (client *peerRESTClient) CommitBinary(ctx context.Context) error {
 }
 
 // SignalService - sends signal to peer nodes.
-func (client *peerRESTClient) SignalService(sig serviceSignal, subSys string, dryRun bool) error {
+func (client *peerRESTClient) SignalService(sig serviceSignal, subSys string, dryRun bool, execAt *time.Time) error {
 	values := grid.NewMSS()
 	values.Set(peerRESTSignal, strconv.Itoa(int(sig)))
 	values.Set(peerRESTDryRun, strconv.FormatBool(dryRun))
 	values.Set(peerRESTSubSys, subSys)
+	if execAt != nil {
+		values.Set(peerRESTExecAt, execAt.Format(time.RFC3339Nano))
+	}
 	_, err := signalServiceRPC.Call(context.Background(), client.gridConn(), values)
 	return err
 }
 
-func (client *peerRESTClient) BackgroundHealStatus() (madmin.BgHealState, error) {
-	resp, err := getBackgroundHealStatusRPC.Call(context.Background(), client.gridConn(), grid.NewMSS())
+func (client *peerRESTClient) BackgroundHealStatus(ctx context.Context) (madmin.BgHealState, error) {
+	resp, err := getBackgroundHealStatusRPC.Call(ctx, client.gridConn(), grid.NewMSS())
 	return resp.ValueOrZero(), err
 }
 
@@ -500,7 +504,7 @@ func (client *peerRESTClient) doTrace(ctx context.Context, traceCh chan<- []byte
 
 	payload, err := json.Marshal(traceOpts)
 	if err != nil {
-		logger.LogIf(ctx, err)
+		bugLogIf(ctx, err)
 		return
 	}
 
@@ -628,7 +632,7 @@ func newPeerRestClients(endpoints EndpointServerPools) (remote, all []*peerRESTC
 		remote = append(remote, all[i])
 	}
 	if len(all) != len(remote)+1 {
-		logger.LogIf(context.Background(), fmt.Errorf("WARNING: Expected number of all hosts (%v) to be remote +1 (%v)", len(all), len(remote)))
+		peersLogIf(context.Background(), fmt.Errorf("Expected number of all hosts (%v) to be remote +1 (%v)", len(all), len(remote)), logger.WarningKind)
 	}
 	return remote, all
 }
@@ -641,13 +645,13 @@ func (client *peerRESTClient) MonitorBandwidth(ctx context.Context, buckets []st
 	return getBandwidthRPC.Call(ctx, client.gridConn(), values)
 }
 
-func (client *peerRESTClient) GetResourceMetrics(ctx context.Context) (<-chan Metric, error) {
+func (client *peerRESTClient) GetResourceMetrics(ctx context.Context) (<-chan MetricV2, error) {
 	resp, err := getResourceMetricsRPC.Call(ctx, client.gridConn(), grid.NewMSS())
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan Metric)
-	go func(ch chan<- Metric) {
+	ch := make(chan MetricV2)
+	go func(ch chan<- MetricV2) {
 		defer close(ch)
 		for _, m := range resp.Value() {
 			if m == nil {
@@ -663,12 +667,12 @@ func (client *peerRESTClient) GetResourceMetrics(ctx context.Context) (<-chan Me
 	return ch, nil
 }
 
-func (client *peerRESTClient) GetPeerMetrics(ctx context.Context) (<-chan Metric, error) {
+func (client *peerRESTClient) GetPeerMetrics(ctx context.Context) (<-chan MetricV2, error) {
 	resp, err := getPeerMetricsRPC.Call(ctx, client.gridConn(), grid.NewMSS())
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan Metric)
+	ch := make(chan MetricV2)
 	go func() {
 		defer close(ch)
 		for _, m := range resp.Value() {
@@ -685,12 +689,12 @@ func (client *peerRESTClient) GetPeerMetrics(ctx context.Context) (<-chan Metric
 	return ch, nil
 }
 
-func (client *peerRESTClient) GetPeerBucketMetrics(ctx context.Context) (<-chan Metric, error) {
+func (client *peerRESTClient) GetPeerBucketMetrics(ctx context.Context) (<-chan MetricV2, error) {
 	resp, err := getPeerBucketMetricsRPC.Call(ctx, client.gridConn(), grid.NewMSS())
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan Metric)
+	ch := make(chan MetricV2)
 	go func() {
 		defer close(ch)
 		for _, m := range resp.Value() {
@@ -715,6 +719,8 @@ func (client *peerRESTClient) SpeedTest(ctx context.Context, opts speedTestOpts)
 	values.Set(peerRESTStorageClass, opts.storageClass)
 	values.Set(peerRESTBucket, opts.bucketName)
 	values.Set(peerRESTEnableSha256, strconv.FormatBool(opts.enableSha256))
+	values.Set(peerRESTEnableMultipart, strconv.FormatBool(opts.enableMultipart))
+	values.Set(peerRESTAccessKey, opts.creds.AccessKey)
 
 	respBody, err := client.callWithContext(context.Background(), peerRESTMethodSpeedTest, values, nil, -1)
 	if err != nil {

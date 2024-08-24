@@ -102,7 +102,7 @@ func (gcs *warmBackendGCS) InUse(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func newWarmBackendGCS(conf madmin.TierGCS, _ string) (*warmBackendGCS, error) {
+func newWarmBackendGCS(conf madmin.TierGCS, tier string) (*warmBackendGCS, error) {
 	// Validation code
 	if conf.Creds == "" {
 		return nil, errors.New("empty credentials unsupported")
@@ -117,7 +117,11 @@ func newWarmBackendGCS(conf madmin.TierGCS, _ string) (*warmBackendGCS, error) {
 		return nil, err
 	}
 
-	client, err := storage.NewClient(context.Background(), option.WithCredentialsJSON(credsJSON), option.WithScopes(storage.ScopeReadWrite))
+	client, err := storage.NewClient(context.Background(),
+		option.WithCredentialsJSON(credsJSON),
+		option.WithScopes(storage.ScopeReadWrite),
+		option.WithUserAgent(fmt.Sprintf("gcs-tier-%s", tier)+SlashSeparator+ReleaseTag),
+	)
 	if err != nil {
 		return nil, err
 	}

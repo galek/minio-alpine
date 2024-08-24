@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"os"
 	"testing"
-	"time"
 
 	jwtgo "github.com/golang-jwt/jwt/v4"
 	xjwt "github.com/minio/minio/internal/jwt"
@@ -108,7 +107,7 @@ func BenchmarkParseJWTStandardClaims(b *testing.B) {
 	}
 
 	creds := globalActiveCred
-	token, err := authenticateNode(creds.AccessKey, creds.SecretKey, "")
+	token, err := authenticateNode(creds.AccessKey, creds.SecretKey)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -139,7 +138,7 @@ func BenchmarkParseJWTMapClaims(b *testing.B) {
 	}
 
 	creds := globalActiveCred
-	token, err := authenticateNode(creds.AccessKey, creds.SecretKey, "")
+	token, err := authenticateNode(creds.AccessKey, creds.SecretKey)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -177,15 +176,15 @@ func BenchmarkAuthenticateNode(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			fn(creds.AccessKey, creds.SecretKey, "aud")
+			fn(creds.AccessKey, creds.SecretKey)
 		}
 	})
 	b.Run("cached", func(b *testing.B) {
-		fn := cachedAuthenticateNode(time.Second)
+		fn := newCachedAuthToken()
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			fn(creds.AccessKey, creds.SecretKey, "aud")
+			fn()
 		}
 	})
 }

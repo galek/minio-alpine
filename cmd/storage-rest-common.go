@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -20,7 +20,7 @@ package cmd
 //go:generate msgp -file $GOFILE -unexported
 
 const (
-	storageRESTVersion       = "v57" // Remove TotalTokens from DiskMetrics
+	storageRESTVersion       = "v63" // Introduce RenamePart and ReadParts API
 	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
 	storageRESTPrefix        = minioReservedBucketPath + "/storage"
 )
@@ -28,47 +28,50 @@ const (
 const (
 	storageRESTMethodHealth = "/health"
 
-	storageRESTMethodAppendFile     = "/appendfile"
-	storageRESTMethodCreateFile     = "/createfile"
-	storageRESTMethodWriteAll       = "/writeall"
-	storageRESTMethodReadVersion    = "/readversion"
-	storageRESTMethodReadXL         = "/readxl"
-	storageRESTMethodReadAll        = "/readall"
-	storageRESTMethodReadFile       = "/readfile"
-	storageRESTMethodReadFileStream = "/readfilestream"
-	storageRESTMethodListDir        = "/listdir"
-	storageRESTMethodDeleteVersions = "/deleteverions"
-	storageRESTMethodRenameFile     = "/renamefile"
-	storageRESTMethodVerifyFile     = "/verifyfile"
-	storageRESTMethodStatInfoFile   = "/statfile"
-	storageRESTMethodReadMultiple   = "/readmultiple"
-	storageRESTMethodCleanAbandoned = "/cleanabandoned"
+	storageRESTMethodAppendFile     = "/afile"
+	storageRESTMethodCreateFile     = "/cfile"
+	storageRESTMethodWriteAll       = "/wall"
+	storageRESTMethodReadVersion    = "/rver"
+	storageRESTMethodReadXL         = "/rxl"
+	storageRESTMethodReadAll        = "/rall"
+	storageRESTMethodReadFile       = "/rfile"
+	storageRESTMethodReadFileStream = "/rfilest"
+	storageRESTMethodListDir        = "/ls"
+	storageRESTMethodDeleteVersions = "/dvers"
+	storageRESTMethodRenameFile     = "/rfile"
+	storageRESTMethodVerifyFile     = "/vfile"
+	storageRESTMethodStatInfoFile   = "/sfile"
+	storageRESTMethodReadMultiple   = "/rmpl"
+	storageRESTMethodCleanAbandoned = "/cln"
+	storageRESTMethodDeleteBulk     = "/dblk"
+	storageRESTMethodReadParts      = "/rps"
 )
 
 const (
-	storageRESTVolume        = "volume"
-	storageRESTVolumes       = "volumes"
-	storageRESTDirPath       = "dir-path"
-	storageRESTFilePath      = "file-path"
-	storageRESTVersionID     = "version-id"
-	storageRESTReadData      = "read-data"
-	storageRESTHealing       = "healing"
-	storageRESTTotalVersions = "total-versions"
-	storageRESTSrcVolume     = "source-volume"
-	storageRESTSrcPath       = "source-path"
-	storageRESTDstVolume     = "destination-volume"
-	storageRESTDstPath       = "destination-path"
-	storageRESTOffset        = "offset"
-	storageRESTLength        = "length"
-	storageRESTCount         = "count"
-	storageRESTBitrotAlgo    = "bitrot-algo"
-	storageRESTBitrotHash    = "bitrot-hash"
-	storageRESTDiskID        = "disk-id"
-	storageRESTForceDelete   = "force-delete"
-	storageRESTGlob          = "glob"
-	storageRESTMetrics       = "metrics"
-	storageRESTDriveQuorum   = "drive-quorum"
-	storageRESTOrigVolume    = "orig-volume"
+	storageRESTVolume           = "vol"
+	storageRESTVolumes          = "vols"
+	storageRESTDirPath          = "dpath"
+	storageRESTFilePath         = "fp"
+	storageRESTVersionID        = "vid"
+	storageRESTHealing          = "heal"
+	storageRESTTotalVersions    = "tvers"
+	storageRESTSrcVolume        = "svol"
+	storageRESTSrcPath          = "spath"
+	storageRESTDstVolume        = "dvol"
+	storageRESTDstPath          = "dpath"
+	storageRESTOffset           = "offset"
+	storageRESTLength           = "length"
+	storageRESTCount            = "count"
+	storageRESTBitrotAlgo       = "balg"
+	storageRESTBitrotHash       = "bhash"
+	storageRESTDiskID           = "did"
+	storageRESTForceDelete      = "fdel"
+	storageRESTGlob             = "glob"
+	storageRESTMetrics          = "metrics"
+	storageRESTDriveQuorum      = "dquorum"
+	storageRESTOrigVolume       = "ovol"
+	storageRESTInclFreeVersions = "incl-fv"
+	storageRESTRange            = "rng"
 )
 
 type nsScannerOptions struct {

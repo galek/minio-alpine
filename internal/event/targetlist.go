@@ -26,10 +26,12 @@ import (
 
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/store"
-	"github.com/minio/pkg/v2/workers"
+	"github.com/minio/pkg/v3/workers"
 )
 
 const (
+	logSubsys = "notify"
+
 	// The maximum allowed number of concurrent Send() calls to all configured notifications targets
 	maxConcurrentAsyncSend = 50000
 )
@@ -290,7 +292,7 @@ func (list *TargetList) sendSync(event Event, targetIDset TargetIDSet) {
 				list.incFailedEvents(id)
 				reqInfo := &logger.ReqInfo{}
 				reqInfo.AppendTags("targetID", id.String())
-				logger.LogOnceIf(logger.SetReqInfo(context.Background(), reqInfo), err, id.String())
+				logger.LogOnceIf(logger.SetReqInfo(context.Background(), reqInfo), logSubsys, err, id.String())
 			}
 		}(id, target)
 	}
@@ -309,11 +311,11 @@ func (list *TargetList) sendAsync(event Event, targetIDset TargetIDSet) {
 		return
 	default:
 		list.eventsSkipped.Add(1)
-		err := fmt.Errorf("concurrent target notifications exceeded %d, notification endpoint is too slow to accept events on incoming requests", maxConcurrentAsyncSend)
+		err := fmt.Errorf("concurrent target notifications exceeded %d, configured notification target is too slow to accept events for the incoming request rate", maxConcurrentAsyncSend)
 		for id := range targetIDset {
 			reqInfo := &logger.ReqInfo{}
 			reqInfo.AppendTags("targetID", id.String())
-			logger.LogOnceIf(logger.SetReqInfo(context.Background(), reqInfo), err, id.String())
+			logger.LogOnceIf(logger.SetReqInfo(context.Background(), reqInfo), logSubsys, err, id.String())
 		}
 		return
 	}

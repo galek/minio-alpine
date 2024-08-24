@@ -19,6 +19,8 @@ package cmd
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -158,7 +160,7 @@ func TestObjectToPartOffset(t *testing.T) {
 }
 
 func TestFindFileInfoInQuorum(t *testing.T) {
-	getNFInfo := func(n int, quorum int, t int64, dataDir string, succModTimes []time.Time) []FileInfo {
+	getNFInfo := func(n int, quorum int, t int64, dataDir string, succModTimes []time.Time, numVersions []int) []FileInfo {
 		fi := newFileInfo("test", 8, 8)
 		fi.AddObjectPart(1, "etag", 100, 100, UTCNow(), nil, nil)
 		fi.ModTime = time.Unix(t, 0)
@@ -171,6 +173,9 @@ func TestFindFileInfoInQuorum(t *testing.T) {
 				fis[i].SuccessorModTime = succModTimes[i]
 				fis[i].IsLatest = succModTimes[i].IsZero()
 			}
+			if numVersions != nil {
+				fis[i].NumVersions = numVersions[i]
+			}
 			quorum--
 			if quorum == 0 {
 				break
@@ -182,58 +187,85 @@ func TestFindFileInfoInQuorum(t *testing.T) {
 	commonSuccModTime := time.Date(2023, time.August, 25, 0, 0, 0, 0, time.UTC)
 	succModTimesInQuorum := make([]time.Time, 16)
 	succModTimesNoQuorum := make([]time.Time, 16)
+	commonNumVersions := 2
+	numVersionsInQuorum := make([]int, 16)
+	numVersionsNoQuorum := make([]int, 16)
 	for i := 0; i < 16; i++ {
 		if i < 4 {
 			continue
 		}
 		succModTimesInQuorum[i] = commonSuccModTime
+		numVersionsInQuorum[i] = commonNumVersions
 		if i < 9 {
 			continue
 		}
 		succModTimesNoQuorum[i] = commonSuccModTime
+		numVersionsNoQuorum[i] = commonNumVersions
 	}
 	tests := []struct {
 		fis                 []FileInfo
 		modTime             time.Time
 		succmodTimes        []time.Time
+		numVersions         []int
 		expectedErr         error
 		expectedQuorum      int
 		expectedSuccModTime time.Time
+		expectedNumVersions int
 		expectedIsLatest    bool
 	}{
 		{
-			fis:            getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", nil),
+			fis:            getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", nil, nil),
 			modTime:        time.Unix(1603863445, 0),
 			expectedErr:    nil,
 			expectedQuorum: 8,
 		},
 		{
-			fis:            getNFInfo(16, 7, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", nil),
+			fis:            getNFInfo(16, 7, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", nil, nil),
 			modTime:        time.Unix(1603863445, 0),
-			expectedErr:    errErasureReadQuorum,
+			expectedErr:    InsufficientReadQuorum{},
 			expectedQuorum: 8,
 		},
 		{
-			fis:            getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", nil),
+			fis:            getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", nil, nil),
 			modTime:        time.Unix(1603863445, 0),
-			expectedErr:    errErasureReadQuorum,
+			expectedErr:    InsufficientReadQuorum{},
 			expectedQuorum: 0,
 		},
 		{
-			fis:                 getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", succModTimesInQuorum),
+			fis:                 getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", succModTimesInQuorum, nil),
 			modTime:             time.Unix(1603863445, 0),
+			succmodTimes:        succModTimesInQuorum,
 			expectedErr:         nil,
 			expectedQuorum:      12,
 			expectedSuccModTime: commonSuccModTime,
 			expectedIsLatest:    false,
 		},
 		{
-			fis:                 getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", succModTimesNoQuorum),
+			fis:                 getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", succModTimesNoQuorum, nil),
 			modTime:             time.Unix(1603863445, 0),
+			succmodTimes:        succModTimesNoQuorum,
 			expectedErr:         nil,
 			expectedQuorum:      12,
 			expectedSuccModTime: time.Time{},
 			expectedIsLatest:    true,
+		},
+		{
+			fis:                 getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", nil, numVersionsInQuorum),
+			modTime:             time.Unix(1603863445, 0),
+			numVersions:         numVersionsInQuorum,
+			expectedErr:         nil,
+			expectedQuorum:      12,
+			expectedIsLatest:    true,
+			expectedNumVersions: 2,
+		},
+		{
+			fis:                 getNFInfo(16, 16, 1603863445, "36a21454-a2ca-11eb-bbaa-93a81c686f21", nil, numVersionsNoQuorum),
+			modTime:             time.Unix(1603863445, 0),
+			numVersions:         numVersionsNoQuorum,
+			expectedErr:         nil,
+			expectedQuorum:      12,
+			expectedIsLatest:    true,
+			expectedNumVersions: 0,
 		},
 	}
 
@@ -241,7 +273,9 @@ func TestFindFileInfoInQuorum(t *testing.T) {
 		test := test
 		t.Run("", func(t *testing.T) {
 			fi, err := findFileInfoInQuorum(context.Background(), test.fis, test.modTime, "", test.expectedQuorum)
-			if err != test.expectedErr {
+			_, ok1 := err.(InsufficientReadQuorum)
+			_, ok2 := test.expectedErr.(InsufficientReadQuorum)
+			if ok1 != ok2 {
 				t.Errorf("Expected %s, got %s", test.expectedErr, err)
 			}
 			if test.succmodTimes != nil {
@@ -250,6 +284,11 @@ func TestFindFileInfoInQuorum(t *testing.T) {
 				}
 				if test.expectedIsLatest != fi.IsLatest {
 					t.Errorf("Expected IsLatest to be %v but got %v", test.expectedIsLatest, fi.IsLatest)
+				}
+			}
+			if test.numVersions != nil && test.expectedNumVersions > 0 {
+				if test.expectedNumVersions != fi.NumVersions {
+					t.Errorf("Expected Numversions to be %d but got %d", test.expectedNumVersions, fi.NumVersions)
 				}
 			}
 		})
@@ -320,5 +359,126 @@ func TestSkipTierFreeVersion(t *testing.T) {
 	fi.SetSkipTierFreeVersion()
 	if ok := fi.SkipTierFreeVersion(); !ok {
 		t.Fatal("Expected SkipTierFreeVersion to be set on FileInfo but wasn't")
+	}
+}
+
+func TestListObjectParities(t *testing.T) {
+	mkMetaArr := func(N, parity, agree int) []FileInfo {
+		fi := newFileInfo("obj-1", N-parity, parity)
+		fi.TransitionTier = "WARM-TIER"
+		fi.TransitionedObjName = mustGetUUID()
+		fi.TransitionStatus = "complete"
+		fi.Size = 1 << 20
+
+		metaArr := make([]FileInfo, N)
+		for i := range N {
+			fi.Erasure.Index = i + 1
+			metaArr[i] = fi
+			if i < agree {
+				continue
+			}
+			metaArr[i].TransitionTier, metaArr[i].TransitionedObjName = "", ""
+			metaArr[i].TransitionStatus = ""
+		}
+		return metaArr
+	}
+	mkParities := func(N, agreedParity, disagreedParity, agree int) []int {
+		ps := make([]int, N)
+		for i := range N {
+			if i < agree {
+				ps[i] = agreedParity
+				continue
+			}
+			ps[i] = disagreedParity // disagree
+		}
+		return ps
+	}
+
+	mkTest := func(N, parity, agree int) (res struct {
+		metaArr  []FileInfo
+		errs     []error
+		parities []int
+		parity   int
+	},
+	) {
+		res.metaArr = mkMetaArr(N, parity, agree)
+		res.parities = mkParities(N, N-(N/2+1), parity, agree)
+		res.errs = make([]error, N)
+		if agree >= N/2+1 { // simple majority consensus
+			res.parity = N - (N/2 + 1)
+		} else {
+			res.parity = -1
+		}
+		return res
+	}
+
+	nonTieredTest := func(N, parity, agree int) (res struct {
+		metaArr  []FileInfo
+		errs     []error
+		parities []int
+		parity   int
+	},
+	) {
+		fi := newFileInfo("obj-1", N-parity, parity)
+		fi.Size = 1 << 20
+		metaArr := make([]FileInfo, N)
+		parities := make([]int, N)
+		for i := range N {
+			fi.Erasure.Index = i + 1
+			metaArr[i] = fi
+			parities[i] = parity
+			if i < agree {
+				continue
+			}
+			metaArr[i].Erasure.Index = 0 // creates invalid fi on remaining drives
+			parities[i] = -1             // invalid fi are assigned parity -1
+		}
+		res.metaArr = metaArr
+		res.parities = parities
+		res.errs = make([]error, N)
+		if agree >= N-parity {
+			res.parity = parity
+		} else {
+			res.parity = -1
+		}
+
+		return res
+	}
+	tests := []struct {
+		metaArr  []FileInfo
+		errs     []error
+		parities []int
+		parity   int
+	}{
+		// More than simple majority consensus
+		mkTest(15, 3, 11),
+		// No simple majority consensus
+		mkTest(15, 3, 7),
+		// Exact simple majority consensus
+		mkTest(15, 3, 8),
+		// More than simple majority consensus
+		mkTest(16, 4, 11),
+		// No simple majority consensus
+		mkTest(16, 4, 8),
+		// Exact simple majority consensus
+		mkTest(16, 4, 9),
+		// non-tiered object require read quorum of EcM
+		nonTieredTest(15, 3, 12),
+		// non-tiered object with fewer than EcM in consensus
+		nonTieredTest(15, 3, 11),
+		// non-tiered object require read quorum of EcM
+		nonTieredTest(16, 4, 12),
+		// non-tiered object with fewer than EcM in consensus
+		nonTieredTest(16, 4, 11),
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("Test %d", i+1), func(t *testing.T) {
+			if got := listObjectParities(test.metaArr, test.errs); !slices.Equal(got, test.parities) {
+				t.Fatalf("Expected parities %v but got %v", test.parities, got)
+			}
+			if got := commonParity(test.parities, len(test.metaArr)/2); got != test.parity {
+				t.Fatalf("Expected common parity %v but got %v", test.parity, got)
+			}
+		})
 	}
 }

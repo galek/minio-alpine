@@ -18,7 +18,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -36,8 +35,6 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
-	"github.com/minio/minio/internal/hash"
-	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
 	"github.com/valyala/bytebufferpool"
 )
@@ -189,6 +186,22 @@ type replicationAllStatsV1 struct {
 	Targets      map[string]replicationStats
 	ReplicaSize  uint64 `msg:"ReplicaSize,omitempty"`
 	ReplicaCount uint64 `msg:"ReplicaCount,omitempty"`
+}
+
+// empty returns true if the replicationAllStats is empty (contains no entries).
+func (r *replicationAllStats) empty() bool {
+	if r == nil {
+		return true
+	}
+	if r.ReplicaSize != 0 || r.ReplicaCount != 0 {
+		return false
+	}
+	for _, v := range r.Targets {
+		if !v.Empty() {
+			return false
+		}
+	}
+	return true
 }
 
 // clone creates a deep-copy clone.
@@ -523,20 +536,18 @@ func (d *dataUsageCache) searchParent(h dataUsageHash) *dataUsageHash {
 	want := h.Key()
 	if idx := strings.LastIndexByte(want, '/'); idx >= 0 {
 		if v := d.find(want[:idx]); v != nil {
-			for child := range v.Children {
-				if child == want {
-					found := hashPath(want[:idx])
-					return &found
-				}
+			_, ok := v.Children[want]
+			if ok {
+				found := hashPath(want[:idx])
+				return &found
 			}
 		}
 	}
 	for k, v := range d.Cache {
-		for child := range v.Children {
-			if child == want {
-				found := dataUsageHash(k)
-				return &found
-			}
+		_, ok := v.Children[want]
+		if ok {
+			found := dataUsageHash(k)
+			return &found
 		}
 	}
 	return nil
@@ -621,7 +632,7 @@ func (d *dataUsageCache) copyWithChildren(src *dataUsageCache, hash dataUsageHas
 	d.Cache[hash.Key()] = e
 	for ch := range e.Children {
 		if ch == hash.Key() {
-			logger.LogIf(GlobalContext, errors.New("dataUsageCache.copyWithChildren: Circular reference"))
+			scannerLogIf(GlobalContext, errors.New("dataUsageCache.copyWithChildren: Circular reference"))
 			return
 		}
 		d.copyWithChildren(src, dataUsageHash(ch), &hash)
@@ -715,6 +726,53 @@ func (d *dataUsageCache) reduceChildrenOf(path dataUsageHash, limit int, compact
 		// Remove top entry and subtract removed children.
 		remove -= removing
 		leaves = leaves[1:]
+	}
+}
+
+// forceCompact will force compact the cache of the top entry.
+// If the number of children is more than limit*100, it will compact self.
+// When above the limit a cleanup will also be performed to remove any possible abandoned entries.
+func (d *dataUsageCache) forceCompact(limit int) {
+	if d == nil || len(d.Cache) <= limit {
+		return
+	}
+	top := hashPath(d.Info.Name).Key()
+	topE := d.find(top)
+	if topE == nil {
+		scannerLogIf(GlobalContext, errors.New("forceCompact: root not found"))
+		return
+	}
+	// If off by 2 orders of magnitude, compact self and log error.
+	if len(topE.Children) > dataScannerForceCompactAtFolders {
+		// If we still have too many children, compact self.
+		scannerLogOnceIf(GlobalContext, fmt.Errorf("forceCompact: %q has %d children. Force compacting. Expect reduced scanner performance", d.Info.Name, len(topE.Children)), d.Info.Name)
+		d.reduceChildrenOf(hashPath(d.Info.Name), limit, true)
+	}
+	if len(d.Cache) <= limit {
+		return
+	}
+
+	// Check for abandoned entries.
+	found := make(map[string]struct{}, len(d.Cache))
+
+	// Mark all children recursively
+	var mark func(entry dataUsageEntry)
+	mark = func(entry dataUsageEntry) {
+		for k := range entry.Children {
+			found[k] = struct{}{}
+			if ch, ok := d.Cache[k]; ok {
+				mark(ch)
+			}
+		}
+	}
+	found[top] = struct{}{}
+	mark(*topE)
+
+	// Delete all entries not found.
+	for k := range d.Cache {
+		if _, ok := found[k]; !ok {
+			delete(d.Cache, k)
+		}
 	}
 }
 
@@ -901,6 +959,9 @@ func (d *dataUsageCache) sizeRecursive(path string) *dataUsageEntry {
 		return root
 	}
 	flat := d.flatten(*root)
+	if flat.ReplicationStats.empty() {
+		flat.ReplicationStats = nil
+	}
 	return &flat
 }
 
@@ -989,11 +1050,23 @@ func (d *dataUsageCache) load(ctx context.Context, store objectIO, name string) 
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		r, err := store.GetObjectNInfo(ctx, dataUsageBucket, name, nil, http.Header{}, ObjectOptions{NoLock: true})
+		r, err := store.GetObjectNInfo(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, name), nil, http.Header{}, ObjectOptions{NoLock: true})
 		if err != nil {
 			switch err.(type) {
 			case ObjectNotFound, BucketNotFound:
-				return false, nil
+				r, err = store.GetObjectNInfo(ctx, dataUsageBucket, name, nil, http.Header{}, ObjectOptions{NoLock: true})
+				if err != nil {
+					switch err.(type) {
+					case ObjectNotFound, BucketNotFound:
+						return false, nil
+					case InsufficientReadQuorum, StorageErr:
+						return true, nil
+					}
+					return false, err
+				}
+				err = d.deserialize(r)
+				r.Close()
+				return err != nil, nil
 			case InsufficientReadQuorum, StorageErr:
 				return true, nil
 			}
@@ -1024,7 +1097,7 @@ func (d *dataUsageCache) load(ctx context.Context, store objectIO, name string) 
 	}
 
 	if retries == 5 {
-		logger.LogOnceIf(ctx, fmt.Errorf("maximum retry reached to load the data usage cache `%s`", name), "retry-loading-data-usage-cache")
+		scannerLogOnceIf(ctx, fmt.Errorf("maximum retry reached to load the data usage cache `%s`", name), "retry-loading-data-usage-cache")
 	}
 
 	return nil
@@ -1054,24 +1127,11 @@ func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) 
 	}
 
 	save := func(name string, timeout time.Duration) error {
-		hr, err := hash.NewReader(ctx, bytes.NewReader(buf.Bytes()), int64(buf.Len()), "", "", int64(buf.Len()))
-		if err != nil {
-			return err
-		}
-
 		// Abandon if more than a minute, so we don't hold up scanner.
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		_, err = store.PutObject(ctx,
-			dataUsageBucket,
-			name,
-			NewPutObjReader(hr),
-			ObjectOptions{NoLock: true})
-		if isErrBucketNotFound(err) {
-			return nil
-		}
-		return err
+		return saveConfig(ctx, store, pathJoin(bucketMetaPrefix, name), buf.Bytes())
 	}
 	defer save(name+".bkp", 5*time.Second) // Keep a backup as well
 

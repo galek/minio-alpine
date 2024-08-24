@@ -32,7 +32,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 const (
@@ -49,13 +49,13 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 	locationConstraint := createBucketLocationConfiguration{}
 	err := xmlDecoder(r.Body, &locationConstraint, r.ContentLength)
 	if err != nil && r.ContentLength != 0 {
-		logger.LogOnceIf(GlobalContext, err, "location-constraint-xml-parsing")
+		internalLogOnceIf(GlobalContext, err, "location-constraint-xml-parsing")
 		// Treat all other failures as XML parsing errors.
 		return "", ErrMalformedXML
 	} // else for both err as nil or io.EOF
 	location = locationConstraint.Location
 	if location == "" {
-		location = globalSite.Region
+		location = globalSite.Region()
 	}
 	if !isValidLocation(location) {
 		return location, ErrInvalidRegion
@@ -67,7 +67,8 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 // Validates input location is same as configured region
 // of MinIO server.
 func isValidLocation(location string) bool {
-	return globalSite.Region == "" || globalSite.Region == location
+	region := globalSite.Region()
+	return region == "" || region == location
 }
 
 // Supported headers that needs to be extracted.
@@ -82,6 +83,33 @@ var supportedHeaders = []string{
 	xhttp.AmzObjectTagging,
 	"expires",
 	xhttp.AmzBucketReplicationStatus,
+	"X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
+	"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
+	"X-Minio-Replication-Server-Side-Encryption-Iv",
+	"X-Minio-Replication-Encrypted-Multipart",
+	"X-Minio-Replication-Actual-Object-Size",
+	ReplicationSsecChecksumHeader,
+	// Add more supported headers here.
+}
+
+// mapping of internal headers to allowed replication headers
+var validSSEReplicationHeaders = map[string]string{
+	"X-Minio-Internal-Server-Side-Encryption-Sealed-Key":     "X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
+	"X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm": "X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
+	"X-Minio-Internal-Server-Side-Encryption-Iv":             "X-Minio-Replication-Server-Side-Encryption-Iv",
+	"X-Minio-Internal-Encrypted-Multipart":                   "X-Minio-Replication-Encrypted-Multipart",
+	"X-Minio-Internal-Actual-Object-Size":                    "X-Minio-Replication-Actual-Object-Size",
+	// Add more supported headers here.
+}
+
+// mapping of replication headers to internal headers
+var replicationToInternalHeaders = map[string]string{
+	"X-Minio-Replication-Server-Side-Encryption-Sealed-Key":     "X-Minio-Internal-Server-Side-Encryption-Sealed-Key",
+	"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm": "X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm",
+	"X-Minio-Replication-Server-Side-Encryption-Iv":             "X-Minio-Internal-Server-Side-Encryption-Iv",
+	"X-Minio-Replication-Encrypted-Multipart":                   "X-Minio-Internal-Encrypted-Multipart",
+	"X-Minio-Replication-Actual-Object-Size":                    "X-Minio-Internal-Actual-Object-Size",
+	ReplicationSsecChecksumHeader:                               ReplicationSsecChecksumHeader,
 	// Add more supported headers here.
 }
 
@@ -164,7 +192,7 @@ func extractMetadata(ctx context.Context, mimesHeader ...textproto.MIMEHeader) (
 // extractMetadata extracts metadata from map values.
 func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
 	if v == nil {
-		logger.LogIf(ctx, errInvalidArgument)
+		bugLogIf(ctx, errInvalidArgument)
 		return errInvalidArgument
 	}
 
@@ -178,7 +206,11 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 	for _, supportedHeader := range supportedHeaders {
 		value, ok := nv[http.CanonicalHeaderKey(supportedHeader)]
 		if ok {
-			m[supportedHeader] = strings.Join(value, ",")
+			if v, ok := replicationToInternalHeaders[supportedHeader]; ok {
+				m[v] = strings.Join(value, ",")
+			} else {
+				m[supportedHeader] = strings.Join(value, ",")
+			}
 		}
 	}
 
@@ -212,7 +244,7 @@ func extractReqParams(r *http.Request) map[string]string {
 		return nil
 	}
 
-	region := globalSite.Region
+	region := globalSite.Region()
 	cred := getReqAccessCred(r, region)
 
 	principalID := cred.AccessKey
@@ -296,8 +328,8 @@ func collectAPIStats(api string, f http.HandlerFunc) http.HandlerFunc {
 
 		bucket, _ := path2BucketObject(resource)
 
-		_, err = globalBucketMetadataSys.Get(bucket) // check if this bucket exists.
-		countBktStat := bucket != "" && bucket != minioReservedBucket && err == nil
+		meta, err := globalBucketMetadataSys.Get(bucket) // check if this bucket exists.
+		countBktStat := bucket != "" && bucket != minioReservedBucket && err == nil && !meta.Created.IsZero()
 		if countBktStat {
 			globalBucketHTTPStats.updateHTTPStats(bucket, api, nil)
 		}
@@ -366,12 +398,6 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	desc := "Do not upgrade one server at a time - please follow the recommended guidelines mentioned here https://github.com/minio/minio#upgrading-minio for your environment"
 	switch {
-	case strings.HasPrefix(r.URL.Path, peerS3Prefix):
-		writeErrorResponseString(r.Context(), w, APIError{
-			Code:           "XMinioPeerS3VersionMismatch",
-			Description:    desc,
-			HTTPStatusCode: http.StatusUpgradeRequired,
-		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, peerRESTPrefix):
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioPeerVersionMismatch",
@@ -436,7 +462,7 @@ func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, e
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			success = false
 			if err != nil && !errors.Is(err, context.Canceled) {
-				logger.LogIf(GlobalContext, err)
+				replLogIf(GlobalContext, err)
 			}
 		},
 	})

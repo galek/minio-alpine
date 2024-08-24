@@ -24,12 +24,15 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/klauspost/filepathx"
 )
 
 var (
@@ -56,7 +59,7 @@ func main() {
 		}
 
 		// Prompt for decryption key if no --key or --private-key are provided
-		if len(privateKey) == 0 {
+		if len(privateKey) == 0 && !*stdin {
 			reader := bufio.NewReader(os.Stdin)
 			fmt.Print("Enter Decryption Key: ")
 
@@ -67,7 +70,7 @@ func main() {
 		}
 	}
 
-	var inputFileName, outputFileName string
+	var inputs []string
 
 	// Parse parameters
 	switch {
@@ -82,22 +85,34 @@ func main() {
 			fatalErr(err)
 		}
 		fatalErr(json.Unmarshal(got, &input))
-		inputFileName = input.File
+		inputs = []string{input.File}
 		*keyHex = input.Key
 	case len(flag.Args()) == 1:
-		inputFileName = flag.Args()[0]
+		var err error
+		inputs, err = filepathx.Glob(flag.Args()[0])
+		fatalErr(err)
 	default:
 		flag.Usage()
 		fatalIf(true, "Only 1 file can be decrypted")
 		os.Exit(1)
 	}
+	for _, input := range inputs {
+		processFile(input, privateKey)
+	}
+}
 
+func processFile(inputFileName string, privateKey []byte) {
 	// Calculate the output file name
+	var outputFileName string
 	switch {
 	case strings.HasSuffix(inputFileName, ".enc"):
 		outputFileName = strings.TrimSuffix(inputFileName, ".enc") + ".zip"
 	case strings.HasSuffix(inputFileName, ".zip"):
 		outputFileName = strings.TrimSuffix(inputFileName, ".zip") + ".decrypted.zip"
+	case strings.Contains(inputFileName, ".enc."):
+		outputFileName = strings.Replace(inputFileName, ".enc.", ".", 1) + ".zip"
+	default:
+		outputFileName = inputFileName + ".decrypted"
 	}
 
 	// Backup any already existing output file
@@ -117,18 +132,23 @@ func main() {
 	fatalErr(err)
 
 	// Decrypt the inspect data
+	msg := fmt.Sprintf("output written to %s", outputFileName)
+
 	switch {
 	case *keyHex != "":
-		err = extractInspectV1(*keyHex, input, output)
+		err = extractInspectV1(*keyHex, input, output, msg)
 	case len(privateKey) != 0:
-		err = extractInspectV2(privateKey, input, output)
+		err = extractInspectV2(privateKey, input, output, msg)
 	}
 	output.Close()
 	if err != nil {
-		os.Remove(outputFileName)
+
+		var keep keepFileErr
+		if !errors.As(err, &keep) {
+			os.Remove(outputFileName)
+		}
 		fatalErr(err)
 	}
-	fmt.Println("output written to", outputFileName)
 
 	// Export xl.meta to stdout
 	if *export {

@@ -29,7 +29,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 func (api objectAPIHandlers) ListenNotificationHandler(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +132,7 @@ func (api objectAPIHandlers) ListenNotificationHandler(w http.ResponseWriter, r 
 				buf.Reset()
 				tmpEvt.Records[0] = ev
 				if err := enc.Encode(tmpEvt); err != nil {
-					logger.LogOnceIf(ctx, err, "event: Encode failed")
+					bugLogIf(ctx, err, "event: Encode failed")
 					continue
 				}
 				mergeCh <- append(grid.GetByteBuffer()[:0], buf.Bytes()...)

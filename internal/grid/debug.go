@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/mux"
 )
 
@@ -50,6 +49,7 @@ const (
 	debugSetClientPingDuration
 	debugAddToDeadline
 	debugIsOutgoingClosed
+	debugBlockInboundMessages
 )
 
 // TestGrid contains a grid of servers for testing purposes.
@@ -81,26 +81,27 @@ func SetupTestGrid(n int) (*TestGrid, error) {
 	res.cancel = cancel
 	for i, host := range hosts {
 		manager, err := NewManager(ctx, ManagerOptions{
-			Dialer: dialer.DialContext,
-			Local:  host,
-			Hosts:  hosts,
-			AuthRequest: func(r *http.Request) error {
-				return nil
-			},
-			AddAuth:      func(aud string) string { return aud },
+			Dialer: ConnectWS(dialer.DialContext,
+				dummyNewToken,
+				nil),
+			Local:        host,
+			Hosts:        hosts,
+			AuthFn:       dummyNewToken,
+			AuthToken:    dummyTokenValidate,
 			BlockConnect: ready,
+			RoutePath:    RoutePath,
 		})
 		if err != nil {
 			return nil, err
 		}
 		m := mux.NewRouter()
-		m.Handle(RoutePath, manager.Handler())
+		m.Handle(RoutePath, manager.Handler(dummyRequestValidate))
 		res.Managers = append(res.Managers, manager)
 		res.Servers = append(res.Servers, startHTTPServer(listeners[i], m))
 		res.Listeners = append(res.Listeners, listeners[i])
 		res.Mux = append(res.Mux, m)
 	}
-	xioutil.SafeClose(ready)
+	close(ready)
 	for _, m := range res.Managers {
 		for _, remote := range m.Targets() {
 			if err := m.Connection(remote).WaitForConnect(ctx); err != nil {
@@ -162,4 +163,19 @@ func startHTTPServer(listener net.Listener, handler http.Handler) (server *httpt
 	server.Listener = listener
 	server.Start()
 	return server
+}
+
+func dummyRequestValidate(r *http.Request) error {
+	return nil
+}
+
+func dummyTokenValidate(token string) error {
+	if token == "debug" {
+		return nil
+	}
+	return fmt.Errorf("invalid token. want empty, got %s", token)
+}
+
+func dummyNewToken() string {
+	return "debug"
 }

@@ -24,18 +24,40 @@ import (
 	"time"
 
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/kms"
 )
 
 const unavailable = "offline"
+
+func checkHealth(w http.ResponseWriter) ObjectLayer {
+	objLayer := newObjectLayerFn()
+	if objLayer == nil {
+		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
+		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
+		return nil
+	}
+
+	if !globalBucketMetadataSys.Initialized() {
+		w.Header().Set(xhttp.MinIOServerStatus, "bucket-metadata-offline")
+		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
+		return nil
+	}
+
+	if !globalIAMSys.Initialized() {
+		w.Header().Set(xhttp.MinIOServerStatus, "iam-offline")
+		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
+		return nil
+	}
+
+	return objLayer
+}
 
 // ClusterCheckHandler returns if the server is ready for requests.
 func ClusterCheckHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ClusterCheckHandler")
 
-	objLayer := newObjectLayerFn()
+	objLayer := checkHealth(w)
 	if objLayer == nil {
-		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
-		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
 		return
 	}
 
@@ -71,10 +93,8 @@ func ClusterCheckHandler(w http.ResponseWriter, r *http.Request) {
 func ClusterReadCheckHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ClusterReadCheckHandler")
 
-	objLayer := newObjectLayerFn()
+	objLayer := checkHealth(w)
 	if objLayer == nil {
-		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
-		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
 		return
 	}
 
@@ -134,7 +154,7 @@ func ReadinessCheckHandler(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
 		defer cancel()
 
-		if _, err := GlobalKMS.Stat(ctx); err != nil {
+		if _, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{AssociatedData: kms.Context{"healthcheck": ""}}); err != nil {
 			switch r.Method {
 			case http.MethodHead:
 				apiErr := toAPIError(r.Context(), err)

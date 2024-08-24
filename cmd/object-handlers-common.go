@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/minio/minio/internal/amztime"
@@ -138,7 +139,7 @@ func checkCopyObjectPreconditions(ctx context.Context, w http.ResponseWriter, r 
 //	x-minio-source-etag
 func checkPreconditionsPUT(ctx context.Context, w http.ResponseWriter, r *http.Request, objInfo ObjectInfo, opts ObjectOptions) bool {
 	// Return false for methods other than PUT.
-	if r.Method != http.MethodPut {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
 		return false
 	}
 	// If the object doesn't have a modtime (IsZero), or the modtime
@@ -185,7 +186,7 @@ func checkPreconditionsPUT(ctx context.Context, w http.ResponseWriter, r *http.R
 		if isETagEqual(objInfo.ETag, ifNoneMatchETagHeader) {
 			// If the object ETag matches with the specified ETag.
 			writeHeaders()
-			w.WriteHeader(http.StatusNotModified)
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPreconditionFailed), r.URL)
 			return true
 		}
 	}
@@ -247,10 +248,19 @@ func checkPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	}
 
 	// Check if the part number is correct.
-	if opts.PartNumber > 1 && opts.PartNumber > len(objInfo.Parts) {
-		// According to S3 we don't need to set any object information here.
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidPartNumber), r.URL)
-		return true
+	if opts.PartNumber > 1 {
+		partFound := false
+		for _, pi := range objInfo.Parts {
+			if pi.Number == opts.PartNumber {
+				partFound = true
+				break
+			}
+		}
+		if !partFound {
+			// According to S3 we don't need to set any object information here.
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidPartNumber), r.URL)
+			return true
+		}
 	}
 
 	// If-None-Match : Return the object only if its entity tag (ETag) is different from the
@@ -325,13 +335,16 @@ func canonicalizeETag(etag string) string {
 // isETagEqual return true if the canonical representations of two ETag strings
 // are equal, false otherwise
 func isETagEqual(left, right string) bool {
+	if strings.TrimSpace(right) == "*" {
+		return true
+	}
 	return canonicalizeETag(left) == canonicalizeETag(right)
 }
 
 // setPutObjHeaders sets all the necessary headers returned back
 // upon a success Put/Copy/CompleteMultipart/Delete requests
 // to activate delete only headers set delete as true
-func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool) {
+func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool, h http.Header) {
 	// We must not use the http.Header().Set method here because some (broken)
 	// clients expect the ETag header key to be literally "ETag" - not "Etag" (case-sensitive).
 	// Therefore, we have to set the ETag directly as map entry.
@@ -353,7 +366,7 @@ func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool) {
 			lc.SetPredictionHeaders(w, objInfo.ToLifecycleOpts())
 		}
 	}
-	hash.AddChecksumHeader(w, objInfo.decryptChecksums(0))
+	hash.AddChecksumHeader(w, objInfo.decryptChecksums(0, h))
 }
 
 func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toDel []ObjectToDelete, lcEvent lifecycle.Event) {

@@ -32,7 +32,7 @@ import (
 
 	"github.com/minio/madmin-go/v3"
 	minio "github.com/minio/minio-go/v7"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 func runAllIAMConcurrencyTests(suite *TestSuiteIAM, c *check) {
@@ -120,9 +120,12 @@ func (s *TestSuiteIAM) TestDeleteUserRace(c *check) {
 			c.Fatalf("Unable to set user: %v", err)
 		}
 
-		err = s.adm.SetPolicy(ctx, policy, accessKey, false)
-		if err != nil {
-			c.Fatalf("Unable to set policy: %v", err)
+		userReq := madmin.PolicyAssociationReq{
+			Policies: []string{policy},
+			User:     accessKey,
+		}
+		if _, err := s.adm.AttachPolicy(ctx, userReq); err != nil {
+			c.Fatalf("Unable to attach policy: %v", err)
 		}
 
 		accessKeys[i] = accessKey

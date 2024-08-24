@@ -54,6 +54,8 @@ const (
 
 	// Total length of the alpha numeric table.
 	alphaNumericTableLen = byte(len(alphaNumericTable))
+
+	reservedChars = "=,"
 )
 
 // Common errors generated for access and secret key validation.
@@ -62,10 +64,16 @@ var (
 	ErrInvalidSecretKeyLength   = fmt.Errorf("secret key length should be between %d and %d", secretKeyMinLen, secretKeyMaxLen)
 	ErrNoAccessKeyWithSecretKey = fmt.Errorf("access key must be specified if secret key is specified")
 	ErrNoSecretKeyWithAccessKey = fmt.Errorf("secret key must be specified if access key is specified")
+	ErrContainsReservedChars    = fmt.Errorf("access key contains one of reserved characters '=' or ','")
 )
 
 // AnonymousCredentials simply points to empty credentials
 var AnonymousCredentials = Credentials{}
+
+// ContainsReservedChars - returns whether the input string contains reserved characters.
+func ContainsReservedChars(s string) bool {
+	return strings.ContainsAny(s, reservedChars)
+}
 
 // IsAccessKeyValid - validate access key for right length.
 func IsAccessKeyValid(accessKey string) bool {
@@ -154,6 +162,14 @@ func (cred Credentials) IsTemp() bool {
 func (cred Credentials) IsServiceAccount() bool {
 	_, ok := cred.Claims[iamPolicyClaimNameSA]
 	return cred.ParentUser != "" && ok
+}
+
+// IsImpliedPolicy - returns if the policy is implied via ParentUser or not.
+func (cred Credentials) IsImpliedPolicy() bool {
+	if cred.IsServiceAccount() {
+		return cred.Claims[iamPolicyClaimNameSA] == "inherited-policy"
+	}
+	return false
 }
 
 // IsValid - returns whether credential is valid or not.

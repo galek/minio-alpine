@@ -110,7 +110,7 @@ func kmsKeyIDFromMetadata(metadata map[string]string) string {
 //
 // DecryptETags uses a KMS bulk decryption API, if available, which
 // is more efficient than decrypting ETags sequentually.
-func DecryptETags(ctx context.Context, k kms.KMS, objects []ObjectInfo) error {
+func DecryptETags(ctx context.Context, k *kms.KMS, objects []ObjectInfo) error {
 	const BatchSize = 250 // We process the objects in batches - 250 is a reasonable default.
 	var (
 		metadata = make([]map[string]string, 0, BatchSize)
@@ -134,11 +134,16 @@ func DecryptETags(ctx context.Context, k kms.KMS, objects []ObjectInfo) error {
 		SSES3SinglePartObjects := make(map[int]bool)
 		for i, object := range batch {
 			if kind, ok := crypto.IsEncrypted(object.UserDefined); ok && kind == crypto.S3 && !crypto.IsMultiPart(object.UserDefined) {
-				SSES3SinglePartObjects[i] = true
-
-				metadata = append(metadata, object.UserDefined)
-				buckets = append(buckets, object.Bucket)
-				names = append(names, object.Name)
+				ETag, err := etag.Parse(object.ETag)
+				if err != nil {
+					continue
+				}
+				if ETag.IsEncrypted() {
+					SSES3SinglePartObjects[i] = true
+					metadata = append(metadata, object.UserDefined)
+					buckets = append(buckets, object.Bucket)
+					names = append(names, object.Name)
+				}
 			}
 		}
 
@@ -190,7 +195,7 @@ func DecryptETags(ctx context.Context, k kms.KMS, objects []ObjectInfo) error {
 				if err != nil {
 					return err
 				}
-				if SSES3SinglePartObjects[i] && ETag.IsEncrypted() {
+				if SSES3SinglePartObjects[i] {
 					ETag, err = etag.Decrypt(keys[0][:], ETag)
 					if err != nil {
 						return err
@@ -267,7 +272,11 @@ func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byt
 		if err != nil {
 			return err
 		}
-		oldKey, err := GlobalKMS.DecryptKey(keyID, kmsKey, kms.Context{bucket: path.Join(bucket, object)})
+		oldKey, err := GlobalKMS.Decrypt(ctx, &kms.DecryptRequest{
+			Name:           keyID,
+			Ciphertext:     kmsKey,
+			AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
+		})
 		if err != nil {
 			return err
 		}
@@ -276,7 +285,10 @@ func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byt
 			return err
 		}
 
-		newKey, err := GlobalKMS.GenerateKey(ctx, "", kms.Context{bucket: path.Join(bucket, object)})
+		newKey, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
+			Name:           GlobalKMS.DefaultKey,
+			AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
+		})
 		if err != nil {
 			return err
 		}
@@ -312,7 +324,10 @@ func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byt
 		if _, ok := kmsCtx[bucket]; !ok {
 			kmsCtx[bucket] = path.Join(bucket, object)
 		}
-		newKey, err := GlobalKMS.GenerateKey(ctx, newKeyID, kmsCtx)
+		newKey, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
+			Name:           newKeyID,
+			AssociatedData: kmsCtx,
+		})
 		if err != nil {
 			return err
 		}
@@ -352,7 +367,9 @@ func newEncryptMetadata(ctx context.Context, kind crypto.Type, keyID string, key
 		if GlobalKMS == nil {
 			return crypto.ObjectKey{}, errKMSNotConfigured
 		}
-		key, err := GlobalKMS.GenerateKey(ctx, "", kms.Context{bucket: path.Join(bucket, object)})
+		key, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
+			AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
+		})
 		if err != nil {
 			return crypto.ObjectKey{}, err
 		}
@@ -379,7 +396,10 @@ func newEncryptMetadata(ctx context.Context, kind crypto.Type, keyID string, key
 		if _, ok := kmsCtx[bucket]; !ok {
 			kmsCtx[bucket] = path.Join(bucket, object)
 		}
-		key, err := GlobalKMS.GenerateKey(ctx, keyID, kmsCtx)
+		key, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
+			Name:           keyID,
+			AssociatedData: kmsCtx,
+		})
 		if err != nil {
 			if errors.Is(err, kes.ErrKeyNotFound) {
 				return crypto.ObjectKey{}, errKMSKeyNotFound
@@ -475,11 +495,10 @@ func EncryptRequest(content io.Reader, r *http.Request, bucket, object string, m
 func decryptObjectMeta(key []byte, bucket, object string, metadata map[string]string) ([]byte, error) {
 	switch kind, _ := crypto.IsEncrypted(metadata); kind {
 	case crypto.S3:
-		KMS := GlobalKMS
-		if KMS == nil {
+		if GlobalKMS == nil {
 			return nil, errKMSNotConfigured
 		}
-		objectKey, err := crypto.S3.UnsealObjectKey(KMS, metadata, bucket, object)
+		objectKey, err := crypto.S3.UnsealObjectKey(GlobalKMS, metadata, bucket, object)
 		if err != nil {
 			return nil, err
 		}
@@ -724,8 +743,9 @@ func (d *DecryptBlocksReader) Read(p []byte) (int, error) {
 // but has an invalid size.
 func (o ObjectInfo) DecryptedSize() (int64, error) {
 	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
-		return 0, errors.New("Cannot compute decrypted size of an unencrypted object")
+		return -1, errors.New("Cannot compute decrypted size of an unencrypted object")
 	}
+
 	if !o.isMultipart() {
 		size, err := sio.DecryptedSize(uint64(o.Size))
 		if err != nil {
@@ -738,7 +758,7 @@ func (o ObjectInfo) DecryptedSize() (int64, error) {
 	for _, part := range o.Parts {
 		partSize, err := sio.DecryptedSize(uint64(part.Size))
 		if err != nil {
-			return 0, errObjectTampered
+			return -1, errObjectTampered
 		}
 		size += int64(partSize)
 	}
@@ -1011,7 +1031,9 @@ func DecryptObjectInfo(info *ObjectInfo, r *http.Request) (encrypted bool, err e
 	if encrypted {
 		if crypto.SSEC.IsEncrypted(info.UserDefined) {
 			if !(crypto.SSEC.IsRequested(headers) || crypto.SSECopy.IsRequested(headers)) {
-				return encrypted, errEncryptedObject
+				if r.Header.Get(xhttp.MinIOSourceReplicationRequest) != "true" {
+					return encrypted, errEncryptedObject
+				}
 			}
 		}
 
@@ -1063,13 +1085,16 @@ func metadataEncrypter(key crypto.ObjectKey) objectMetaEncryptFn {
 }
 
 // metadataDecrypter reverses metadataEncrypter.
-func (o *ObjectInfo) metadataDecrypter() objectMetaDecryptFn {
+func (o *ObjectInfo) metadataDecrypter(h http.Header) objectMetaDecryptFn {
 	return func(baseKey string, input []byte) ([]byte, error) {
 		if len(input) == 0 {
 			return input, nil
 		}
-
-		key, err := decryptObjectMeta(nil, o.Bucket, o.Name, o.UserDefined)
+		var key []byte
+		if k, err := crypto.SSEC.ParseHTTP(h); err == nil {
+			key = k[:]
+		}
+		key, err := decryptObjectMeta(key, o.Bucket, o.Name, o.UserDefined)
 		if err != nil {
 			return nil, err
 		}
@@ -1079,17 +1104,17 @@ func (o *ObjectInfo) metadataDecrypter() objectMetaDecryptFn {
 	}
 }
 
-// decryptChecksums will attempt to decode checksums and return it/them if set.
+// decryptPartsChecksums will attempt to decode checksums and return it/them if set.
 // if part > 0, and we have the checksum for the part that will be returned.
-func (o *ObjectInfo) decryptPartsChecksums() {
+func (o *ObjectInfo) decryptPartsChecksums(h http.Header) {
 	data := o.Checksum
 	if len(data) == 0 {
 		return
 	}
 	if _, encrypted := crypto.IsEncrypted(o.UserDefined); encrypted {
-		decrypted, err := o.metadataDecrypter()("object-checksum", data)
+		decrypted, err := o.metadataDecrypter(h)("object-checksum", data)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			encLogIf(GlobalContext, err)
 			return
 		}
 		data = decrypted
@@ -1143,15 +1168,25 @@ func (o *ObjectInfo) metadataEncryptFn(headers http.Header) (objectMetaEncryptFn
 
 // decryptChecksums will attempt to decode checksums and return it/them if set.
 // if part > 0, and we have the checksum for the part that will be returned.
-func (o *ObjectInfo) decryptChecksums(part int) map[string]string {
+func (o *ObjectInfo) decryptChecksums(part int, h http.Header) map[string]string {
 	data := o.Checksum
 	if len(data) == 0 {
 		return nil
 	}
+	if part > 0 && !crypto.SSEC.IsEncrypted(o.UserDefined) {
+		// already decrypted in ToObjectInfo for multipart objects
+		for _, pi := range o.Parts {
+			if pi.Number == part {
+				return pi.Checksums
+			}
+		}
+	}
 	if _, encrypted := crypto.IsEncrypted(o.UserDefined); encrypted {
-		decrypted, err := o.metadataDecrypter()("object-checksum", data)
+		decrypted, err := o.metadataDecrypter(h)("object-checksum", data)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			if err != crypto.ErrSecretKeyMismatch {
+				encLogIf(GlobalContext, err)
+			}
 			return nil
 		}
 		data = decrypted

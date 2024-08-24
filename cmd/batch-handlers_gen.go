@@ -7,6 +7,89 @@ import (
 )
 
 // DecodeMsg implements msgp.Decodable
+func (z *BatchJobPrefix) DecodeMsg(dc *msgp.Reader) (err error) {
+	var zb0002 uint32
+	zb0002, err = dc.ReadArrayHeader()
+	if err != nil {
+		err = msgp.WrapError(err)
+		return
+	}
+	if cap((*z)) >= int(zb0002) {
+		(*z) = (*z)[:zb0002]
+	} else {
+		(*z) = make(BatchJobPrefix, zb0002)
+	}
+	for zb0001 := range *z {
+		(*z)[zb0001], err = dc.ReadString()
+		if err != nil {
+			err = msgp.WrapError(err, zb0001)
+			return
+		}
+	}
+	return
+}
+
+// EncodeMsg implements msgp.Encodable
+func (z BatchJobPrefix) EncodeMsg(en *msgp.Writer) (err error) {
+	err = en.WriteArrayHeader(uint32(len(z)))
+	if err != nil {
+		err = msgp.WrapError(err)
+		return
+	}
+	for zb0003 := range z {
+		err = en.WriteString(z[zb0003])
+		if err != nil {
+			err = msgp.WrapError(err, zb0003)
+			return
+		}
+	}
+	return
+}
+
+// MarshalMsg implements msgp.Marshaler
+func (z BatchJobPrefix) MarshalMsg(b []byte) (o []byte, err error) {
+	o = msgp.Require(b, z.Msgsize())
+	o = msgp.AppendArrayHeader(o, uint32(len(z)))
+	for zb0003 := range z {
+		o = msgp.AppendString(o, z[zb0003])
+	}
+	return
+}
+
+// UnmarshalMsg implements msgp.Unmarshaler
+func (z *BatchJobPrefix) UnmarshalMsg(bts []byte) (o []byte, err error) {
+	var zb0002 uint32
+	zb0002, bts, err = msgp.ReadArrayHeaderBytes(bts)
+	if err != nil {
+		err = msgp.WrapError(err)
+		return
+	}
+	if cap((*z)) >= int(zb0002) {
+		(*z) = (*z)[:zb0002]
+	} else {
+		(*z) = make(BatchJobPrefix, zb0002)
+	}
+	for zb0001 := range *z {
+		(*z)[zb0001], bts, err = msgp.ReadStringBytes(bts)
+		if err != nil {
+			err = msgp.WrapError(err, zb0001)
+			return
+		}
+	}
+	o = bts
+	return
+}
+
+// Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+func (z BatchJobPrefix) Msgsize() (s int) {
+	s = msgp.ArrayHeaderSize
+	for zb0003 := range z {
+		s += msgp.StringPrefixSize + len(z[zb0003])
+	}
+	return
+}
+
+// DecodeMsg implements msgp.Decodable
 func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 	var field []byte
 	_ = field
@@ -40,12 +123,6 @@ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 			z.Started, err = dc.ReadTime()
 			if err != nil {
 				err = msgp.WrapError(err, "Started")
-				return
-			}
-		case "Location":
-			z.Location, err = dc.ReadString()
-			if err != nil {
-				err = msgp.WrapError(err, "Location")
 				return
 			}
 		case "Replicate":
@@ -115,9 +192,9 @@ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 7
+	// map header, size 6
 	// write "ID"
-	err = en.Append(0x87, 0xa2, 0x49, 0x44)
+	err = en.Append(0x86, 0xa2, 0x49, 0x44)
 	if err != nil {
 		return
 	}
@@ -144,16 +221,6 @@ func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
 	err = en.WriteTime(z.Started)
 	if err != nil {
 		err = msgp.WrapError(err, "Started")
-		return
-	}
-	// write "Location"
-	err = en.Append(0xa8, 0x4c, 0x6f, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e)
-	if err != nil {
-		return
-	}
-	err = en.WriteString(z.Location)
-	if err != nil {
-		err = msgp.WrapError(err, "Location")
 		return
 	}
 	// write "Replicate"
@@ -213,9 +280,9 @@ func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
 // MarshalMsg implements msgp.Marshaler
 func (z *BatchJobRequest) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 7
+	// map header, size 6
 	// string "ID"
-	o = append(o, 0x87, 0xa2, 0x49, 0x44)
+	o = append(o, 0x86, 0xa2, 0x49, 0x44)
 	o = msgp.AppendString(o, z.ID)
 	// string "User"
 	o = append(o, 0xa4, 0x55, 0x73, 0x65, 0x72)
@@ -223,9 +290,6 @@ func (z *BatchJobRequest) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "Started"
 	o = append(o, 0xa7, 0x53, 0x74, 0x61, 0x72, 0x74, 0x65, 0x64)
 	o = msgp.AppendTime(o, z.Started)
-	// string "Location"
-	o = append(o, 0xa8, 0x4c, 0x6f, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e)
-	o = msgp.AppendString(o, z.Location)
 	// string "Replicate"
 	o = append(o, 0xa9, 0x52, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x65)
 	if z.Replicate == nil {
@@ -298,12 +362,6 @@ func (z *BatchJobRequest) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "Started")
 				return
 			}
-		case "Location":
-			z.Location, bts, err = msgp.ReadStringBytes(bts)
-			if err != nil {
-				err = msgp.WrapError(err, "Location")
-				return
-			}
 		case "Replicate":
 			if msgp.IsNil(bts) {
 				bts, err = msgp.ReadNilBytes(bts)
@@ -369,7 +427,7 @@ func (z *BatchJobRequest) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z *BatchJobRequest) Msgsize() (s int) {
-	s = 1 + 3 + msgp.StringPrefixSize + len(z.ID) + 5 + msgp.StringPrefixSize + len(z.User) + 8 + msgp.TimeSize + 9 + msgp.StringPrefixSize + len(z.Location) + 10
+	s = 1 + 3 + msgp.StringPrefixSize + len(z.ID) + 5 + msgp.StringPrefixSize + len(z.User) + 8 + msgp.TimeSize + 10
 	if z.Replicate == nil {
 		s += msgp.NilSize
 	} else {
@@ -442,6 +500,12 @@ func (z *batchJobInfo) DecodeMsg(dc *msgp.Reader) (err error) {
 			z.RetryAttempts, err = dc.ReadInt()
 			if err != nil {
 				err = msgp.WrapError(err, "RetryAttempts")
+				return
+			}
+		case "at":
+			z.Attempts, err = dc.ReadInt()
+			if err != nil {
+				err = msgp.WrapError(err, "Attempts")
 				return
 			}
 		case "cmp":
@@ -517,9 +581,9 @@ func (z *batchJobInfo) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *batchJobInfo) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 16
+	// map header, size 17
 	// write "v"
-	err = en.Append(0xde, 0x0, 0x10, 0xa1, 0x76)
+	err = en.Append(0xde, 0x0, 0x11, 0xa1, 0x76)
 	if err != nil {
 		return
 	}
@@ -576,6 +640,16 @@ func (z *batchJobInfo) EncodeMsg(en *msgp.Writer) (err error) {
 	err = en.WriteInt(z.RetryAttempts)
 	if err != nil {
 		err = msgp.WrapError(err, "RetryAttempts")
+		return
+	}
+	// write "at"
+	err = en.Append(0xa2, 0x61, 0x74)
+	if err != nil {
+		return
+	}
+	err = en.WriteInt(z.Attempts)
+	if err != nil {
+		err = msgp.WrapError(err, "Attempts")
 		return
 	}
 	// write "cmp"
@@ -684,9 +758,9 @@ func (z *batchJobInfo) EncodeMsg(en *msgp.Writer) (err error) {
 // MarshalMsg implements msgp.Marshaler
 func (z *batchJobInfo) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 16
+	// map header, size 17
 	// string "v"
-	o = append(o, 0xde, 0x0, 0x10, 0xa1, 0x76)
+	o = append(o, 0xde, 0x0, 0x11, 0xa1, 0x76)
 	o = msgp.AppendInt(o, z.Version)
 	// string "jid"
 	o = append(o, 0xa3, 0x6a, 0x69, 0x64)
@@ -703,6 +777,9 @@ func (z *batchJobInfo) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "ra"
 	o = append(o, 0xa2, 0x72, 0x61)
 	o = msgp.AppendInt(o, z.RetryAttempts)
+	// string "at"
+	o = append(o, 0xa2, 0x61, 0x74)
+	o = msgp.AppendInt(o, z.Attempts)
 	// string "cmp"
 	o = append(o, 0xa3, 0x63, 0x6d, 0x70)
 	o = msgp.AppendBool(o, z.Complete)
@@ -790,6 +867,12 @@ func (z *batchJobInfo) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "RetryAttempts")
 				return
 			}
+		case "at":
+			z.Attempts, bts, err = msgp.ReadIntBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "Attempts")
+				return
+			}
 		case "cmp":
 			z.Complete, bts, err = msgp.ReadBoolBytes(bts)
 			if err != nil {
@@ -864,6 +947,6 @@ func (z *batchJobInfo) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z *batchJobInfo) Msgsize() (s int) {
-	s = 3 + 2 + msgp.IntSize + 4 + msgp.StringPrefixSize + len(z.JobID) + 3 + msgp.StringPrefixSize + len(z.JobType) + 3 + msgp.TimeSize + 3 + msgp.TimeSize + 3 + msgp.IntSize + 4 + msgp.BoolSize + 4 + msgp.BoolSize + 5 + msgp.StringPrefixSize + len(z.Bucket) + 5 + msgp.StringPrefixSize + len(z.Object) + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.Int64Size
+	s = 3 + 2 + msgp.IntSize + 4 + msgp.StringPrefixSize + len(z.JobID) + 3 + msgp.StringPrefixSize + len(z.JobType) + 3 + msgp.TimeSize + 3 + msgp.TimeSize + 3 + msgp.IntSize + 3 + msgp.IntSize + 4 + msgp.BoolSize + 4 + msgp.BoolSize + 5 + msgp.StringPrefixSize + len(z.Bucket) + 5 + msgp.StringPrefixSize + len(z.Object) + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.Int64Size
 	return
 }

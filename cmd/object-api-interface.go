@@ -32,6 +32,10 @@ import (
 	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
+//go:generate msgp -file $GOFILE -io=false -tests=false -unexported=false
+
+//msgp:ignore ObjectOptions TransitionOptions DeleteBucketOptions
+
 // CheckPreconditionFn returns true if precondition check failed.
 type CheckPreconditionFn func(o ObjectInfo) bool
 
@@ -109,6 +113,8 @@ type ObjectOptions struct {
 	// participating in a rebalance operation. Typically set for 'write' operations.
 	SkipRebalancing bool
 
+	SrcPoolIdx int // set by PutObject/CompleteMultipart operations due to rebalance; used to prevent rebalance src, dst pools to be the same
+
 	DataMovement bool // indicates an going decommisionning or rebalacing
 
 	PrefixEnabledFn func(prefix string) bool // function which returns true if versioning is enabled on prefix
@@ -129,6 +135,7 @@ type ObjectOptions struct {
 	EvalRetentionBypassFn EvalRetentionBypassFn // only set for enforcing retention bypass on DeleteObject.
 
 	FastGetObjInfo bool // Only for S3 Head/Get Object calls for now
+	NoAuditLog     bool // Only set for decom, rebalance, to avoid double audits.
 }
 
 // WalkOptions provides filtering, marker and other Walk() specific options.
@@ -138,6 +145,7 @@ type WalkOptions struct {
 	LatestOnly   bool                     // returns only latest versions for all matching objects
 	AskDisks     string                   // dictates how many disks are being listed
 	VersionsSort WalkVersionsSortOrder    // sort order for versions of the same object; default: Ascending order in ModTime
+	Limit        int                      // maximum number of items, 0 means no limit
 }
 
 // ExpirationOptions represents object options for object expiration at objectLayer.
@@ -174,8 +182,9 @@ type DeleteBucketOptions struct {
 
 // BucketOptions provides options for ListBuckets and GetBucketInfo call.
 type BucketOptions struct {
-	Deleted bool // true only when site replication is enabled
-	Cached  bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	Deleted    bool // true only when site replication is enabled
+	Cached     bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	NoMetadata bool
 }
 
 // SetReplicaStatus sets replica status and timestamp for delete operations in ObjectOptions
@@ -239,6 +248,7 @@ type ObjectLayer interface {
 	Shutdown(context.Context) error
 	NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, scanMode madmin.HealScanMode) error
 	BackendInfo() madmin.BackendInfo
+	Legacy() bool // Only returns true for deployments which use CRCMOD as its object distribution algorithm.
 	StorageInfo(ctx context.Context, metrics bool) StorageInfo
 	LocalStorageInfo(ctx context.Context, metrics bool) StorageInfo
 
@@ -251,7 +261,7 @@ type ObjectLayer interface {
 	ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (result ListObjectsV2Info, err error)
 	ListObjectVersions(ctx context.Context, bucket, prefix, marker, versionMarker, delimiter string, maxKeys int) (result ListObjectVersionsInfo, err error)
 	// Walk lists all objects including versions, delete markers.
-	Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo, opts WalkOptions) error
+	Walk(ctx context.Context, bucket, prefix string, results chan<- itemOrErr[ObjectInfo], opts WalkOptions) error
 
 	// Object operations.
 

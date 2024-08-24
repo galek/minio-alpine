@@ -33,7 +33,7 @@ const contextLogKey = contextKeyType("miniolog")
 // KeyVal - appended to ReqInfo.Tags
 type KeyVal struct {
 	Key string
-	Val interface{}
+	Val string
 }
 
 // ObjectVersion object version key/versionId
@@ -77,7 +77,7 @@ func NewReqInfo(remoteHost, userAgent, deploymentID, requestID, api, bucket, obj
 }
 
 // AppendTags - appends key/val to ReqInfo.tags
-func (r *ReqInfo) AppendTags(key string, val interface{}) *ReqInfo {
+func (r *ReqInfo) AppendTags(key, val string) *ReqInfo {
 	if r == nil {
 		return nil
 	}
@@ -88,7 +88,7 @@ func (r *ReqInfo) AppendTags(key string, val interface{}) *ReqInfo {
 }
 
 // SetTags - sets key/val to ReqInfo.tags
-func (r *ReqInfo) SetTags(key string, val interface{}) *ReqInfo {
+func (r *ReqInfo) SetTags(key, val string) *ReqInfo {
 	if r == nil {
 		return nil
 	}
@@ -121,23 +121,39 @@ func (r *ReqInfo) GetTags() []KeyVal {
 }
 
 // GetTagsMap - returns the user defined tags in a map structure
-func (r *ReqInfo) GetTagsMap() map[string]interface{} {
+func (r *ReqInfo) GetTagsMap() map[string]string {
 	if r == nil {
 		return nil
 	}
 	r.RLock()
 	defer r.RUnlock()
-	m := make(map[string]interface{}, len(r.tags))
+	m := make(map[string]string, len(r.tags))
 	for _, t := range r.tags {
 		m[t.Key] = t.Val
 	}
 	return m
 }
 
+// PopulateTagsMap - returns the user defined tags in a map structure
+func (r *ReqInfo) PopulateTagsMap(tagsMap map[string]string) {
+	if r == nil {
+		return
+	}
+	if tagsMap == nil {
+		return
+	}
+	r.RLock()
+	defer r.RUnlock()
+	for _, t := range r.tags {
+		tagsMap[t.Key] = t.Val
+	}
+	return
+}
+
 // SetReqInfo sets ReqInfo in the context.
 func SetReqInfo(ctx context.Context, req *ReqInfo) context.Context {
 	if ctx == nil {
-		LogIf(context.Background(), fmt.Errorf("context is nil"))
+		LogIf(context.Background(), "", fmt.Errorf("context is nil"))
 		return nil
 	}
 	return context.WithValue(ctx, contextLogKey, req)

@@ -27,9 +27,10 @@ import (
 var globalStats = struct {
 	errs uint64
 
-	tcpDialErrs     uint64
-	tcpDialCount    uint64
-	tcpDialTotalDur uint64
+	tcpDialErrs                 uint64
+	tcpDialCount                uint64
+	tcpDialTotalDur             uint64
+	tcpTimeForFirstByteTotalDur uint64
 }{}
 
 // RPCStats holds information about the DHCP/TCP metrics and errors
@@ -37,6 +38,7 @@ type RPCStats struct {
 	Errs uint64
 
 	DialAvgDuration uint64
+	TTFBAvgDuration uint64
 	DialErrs        uint64
 }
 
@@ -48,6 +50,7 @@ func GetRPCStats() RPCStats {
 	}
 	if v := atomic.LoadUint64(&globalStats.tcpDialCount); v > 0 {
 		s.DialAvgDuration = atomic.LoadUint64(&globalStats.tcpDialTotalDur) / v
+		s.TTFBAvgDuration = atomic.LoadUint64(&globalStats.tcpTimeForFirstByteTotalDur) / v
 	}
 	return s
 }
@@ -55,8 +58,11 @@ func GetRPCStats() RPCStats {
 // Return a function which update the global stats related to tcp connections
 func setupReqStatsUpdate(req *http.Request) (*http.Request, func()) {
 	var dialStart, dialEnd int64
-
+	start := time.Now()
 	trace := &httptrace.ClientTrace{
+		GotFirstResponseByte: func() {
+			atomic.AddUint64(&globalStats.tcpTimeForFirstByteTotalDur, uint64(time.Since(start)))
+		},
 		ConnectStart: func(network, addr string) {
 			atomic.StoreInt64(&dialStart, time.Now().UnixNano())
 		},

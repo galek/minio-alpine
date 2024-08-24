@@ -154,7 +154,7 @@ func getSignature(signingKey []byte, stringToSign string) string {
 // Check to see if Policy is signed correctly.
 func doesPolicySignatureMatch(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// For SignV2 - Signature field will be valid
-	if _, ok := formValues["Signature"]; ok {
+	if _, ok := formValues[xhttp.AmzSignatureV2]; ok {
 		return doesPolicySignatureV2Match(formValues)
 	}
 	return doesPolicySignatureV4Match(formValues)
@@ -175,7 +175,7 @@ func compareSignatureV4(sig1, sig2 string) bool {
 // returns ErrNone if the signature matches.
 func doesPolicySignatureV4Match(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// Server region.
-	region := globalSite.Region
+	region := globalSite.Region()
 
 	// Parse credential tag.
 	credHeader, s3Err := parseCredentialHeader("Credential="+formValues.Get(xhttp.AmzCredential), region, serviceS3)

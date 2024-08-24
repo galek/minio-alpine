@@ -20,7 +20,6 @@ package cmd
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/url"
 	"sync"
 	"time"
@@ -32,7 +31,6 @@ import (
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/kms"
-	"github.com/minio/minio/internal/logger"
 )
 
 const (
@@ -131,7 +129,7 @@ func (sys *BucketTargetSys) initHC(ep *url.URL) {
 func newHCClient() *madmin.AnonymousClient {
 	clnt, e := madmin.NewAnonymousClientNoEndpoint()
 	if e != nil {
-		logger.LogOnceIf(GlobalContext, fmt.Errorf("WARNING: Unable to initialize health check client"), string(replicationSubsystem))
+		bugLogIf(GlobalContext, errors.New("Unable to initialize health check client"))
 		return nil
 	}
 	clnt.SetCustomTransport(globalRemoteTargetTransport)
@@ -430,7 +428,7 @@ func (sys *BucketTargetSys) RemoveTarget(ctx context.Context, bucket, arnStr str
 	if arn.Type == madmin.ReplicationService {
 		// reject removal of remote target if replication configuration is present
 		rcfg, err := getReplicationConfig(ctx, bucket)
-		if err == nil {
+		if err == nil && rcfg != nil {
 			for _, tgtArn := range rcfg.FilterTargetArns(replication.ObjectOpts{OpType: replication.AllReplicationType}) {
 				if err == nil && (tgtArn == arnStr || rcfg.RoleArn == arnStr) {
 					sys.RLock()
@@ -614,7 +612,7 @@ func (sys *BucketTargetSys) UpdateAllTargets(bucket string, tgts *madmin.BucketT
 }
 
 // create minio-go clients for buckets having remote targets
-func (sys *BucketTargetSys) set(bucket BucketInfo, meta BucketMetadata) {
+func (sys *BucketTargetSys) set(bucket string, meta BucketMetadata) {
 	cfg := meta.bucketTargetConfig
 	if cfg == nil || cfg.Empty() {
 		return
@@ -624,13 +622,13 @@ func (sys *BucketTargetSys) set(bucket BucketInfo, meta BucketMetadata) {
 	for _, tgt := range cfg.Targets {
 		tgtClient, err := sys.getRemoteTargetClient(&tgt)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			replLogIf(GlobalContext, err)
 			continue
 		}
 		sys.arnRemotesMap[tgt.Arn] = arnTarget{Client: tgtClient}
-		sys.updateBandwidthLimit(bucket.Name, tgt.Arn, tgt.BandwidthLimit)
+		sys.updateBandwidthLimit(bucket, tgt.Arn, tgt.BandwidthLimit)
 	}
-	sys.targetsMap[bucket.Name] = cfg.Targets
+	sys.targetsMap[bucket] = cfg.Targets
 }
 
 // Returns a minio-go Client configured to access remote host described in replication target config.

@@ -27,8 +27,9 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/hash"
-	"github.com/minio/minio/internal/logger"
 )
+
+//go:generate msgp -file $GOFILE -io=false -tests=false -unexported=false
 
 // BackendType - represents different backend types.
 type BackendType int
@@ -187,9 +188,9 @@ type ObjectInfo struct {
 	Parts []ObjectPartInfo `json:"-"`
 
 	// Implements writer and reader used by CopyObject API
-	Writer       io.WriteCloser `json:"-"`
-	Reader       *hash.Reader   `json:"-"`
-	PutObjReader *PutObjReader  `json:"-"`
+	Writer       io.WriteCloser `json:"-" msg:"-"`
+	Reader       *hash.Reader   `json:"-" msg:"-"`
+	PutObjReader *PutObjReader  `json:"-" msg:"-"`
 
 	metadataOnly bool
 	versionOnly  bool // adds a new version, only used by CopyObject
@@ -232,7 +233,7 @@ func (o ObjectInfo) ExpiresStr() string {
 
 // ArchiveInfo returns any saved zip archive meta information.
 // It will be decrypted if needed.
-func (o *ObjectInfo) ArchiveInfo() []byte {
+func (o *ObjectInfo) ArchiveInfo(h http.Header) []byte {
 	if len(o.UserDefined) == 0 {
 		return nil
 	}
@@ -242,9 +243,9 @@ func (o *ObjectInfo) ArchiveInfo() []byte {
 	}
 	data := []byte(z)
 	if v, ok := o.UserDefined[archiveTypeMetadataKey]; ok && v == archiveTypeEnc {
-		decrypted, err := o.metadataDecrypter()(archiveTypeEnc, data)
+		decrypted, err := o.metadataDecrypter(h)(archiveTypeEnc, data)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			encLogIf(GlobalContext, err)
 			return nil
 		}
 		data = decrypted
@@ -325,6 +326,7 @@ func (ri ReplicateObjectInfo) ToObjectInfo() ObjectInfo {
 		VersionPurgeStatusInternal: ri.VersionPurgeStatusInternal,
 		DeleteMarker:               true,
 		UserDefined:                map[string]string{},
+		Checksum:                   ri.Checksum,
 	}
 }
 
@@ -356,6 +358,7 @@ type ReplicateObjectInfo struct {
 	TargetStatuses       map[string]replication.StatusType
 	TargetPurgeStatuses  map[string]VersionPurgeStatusType
 	ReplicationTimestamp time.Time
+	Checksum             []byte
 }
 
 // MultipartInfo captures metadata information about the uploadId

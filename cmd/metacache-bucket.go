@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // a bucketMetacache keeps track of all caches generated
@@ -221,7 +221,7 @@ func (b *bucketMetacache) deleteAll() {
 
 	ez, ok := objAPI.(deleteAllStorager)
 	if !ok {
-		logger.LogIf(ctx, errors.New("bucketMetacache: expected objAPI to be 'deleteAllStorager'"))
+		bugLogIf(ctx, errors.New("bucketMetacache: expected objAPI to be 'deleteAllStorager'"))
 		return
 	}
 

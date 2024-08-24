@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2023 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -20,11 +20,8 @@ package http
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,12 +30,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	jsoniter "github.com/json-iterator/go"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
+	"github.com/valyala/bytebufferpool"
 )
 
 const (
@@ -47,6 +46,9 @@ const (
 
 	// maxWorkers is the maximum number of concurrent http loggers
 	maxWorkers = 16
+
+	// maxWorkers is the maximum number of concurrent batch http loggers
+	maxWorkersWithBatchEvents = 4
 
 	// the suffix for the configured queue dir where the logs will be persisted.
 	httpLoggerExtension = ".http.log"
@@ -58,6 +60,11 @@ const (
 	statusClosed
 )
 
+var (
+	logChBuffers = make(map[string]chan interface{})
+	logChLock    = sync.Mutex{}
+)
+
 // Config http logger target
 type Config struct {
 	Enabled    bool              `json:"enabled"`
@@ -67,13 +74,14 @@ type Config struct {
 	AuthToken  string            `json:"authToken"`
 	ClientCert string            `json:"clientCert"`
 	ClientKey  string            `json:"clientKey"`
+	BatchSize  int               `json:"batchSize"`
 	QueueSize  int               `json:"queueSize"`
 	QueueDir   string            `json:"queueDir"`
 	Proxy      string            `json:"string"`
 	Transport  http.RoundTripper `json:"-"`
 
 	// Custom logger
-	LogOnce func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
+	LogOnceIf func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
 }
 
 // Target implements logger.Target and sends the json
@@ -82,14 +90,16 @@ type Config struct {
 // buffer is full, new logs are just ignored and an error
 // is returned to the caller.
 type Target struct {
-	totalMessages  int64
-	failedMessages int64
-	status         int32
+	totalMessages  atomic.Int64
+	failedMessages atomic.Int64
+	status         atomic.Int32
 
 	// Worker control
-	workers       int64
-	workerStartMu sync.Mutex
-	lastStarted   time.Time
+	workers    atomic.Int64
+	maxWorkers int64
+
+	// workerStartMu sync.Mutex
+	lastStarted time.Time
 
 	wg sync.WaitGroup
 
@@ -99,16 +109,29 @@ type Target struct {
 	logCh   chan interface{}
 	logChMu sync.RWMutex
 
-	// If the first init fails, this starts a goroutine that
-	// will attempt to establish the connection.
-	revive sync.Once
+	// If this webhook is being re-configured we will
+	// assign the new webhook target to this field.
+	// The Send() method will then re-direct entries
+	// to the new target when the current one
+	// has been set to status "statusClosed".
+	// Once the glogal target slice has been migrated
+	// the current target will stop receiving entries.
+	migrateTarget *Target
+
+	// Number of events per HTTP send to webhook target
+	// this is ideally useful only if your endpoint can
+	// support reading multiple events on a stream for example
+	// like : Splunk HTTP Event collector, if you are unsure
+	// set this to '1'.
+	batchSize   int
+	payloadType string
 
 	// store to persist and replay the logs to the target
 	// to avoid missing events when the target is down.
 	store          store.Store[interface{}]
 	storeCtxCancel context.CancelFunc
 
-	initQueueStoreOnce once.Init
+	initQueueOnce once.Init
 
 	config Config
 	client *http.Client
@@ -117,6 +140,11 @@ type Target struct {
 // Name returns the name of the target
 func (h *Target) Name() string {
 	return "minio-http-" + h.config.Name
+}
+
+// Type - returns type of the target
+func (h *Target) Type() types.TargetType {
+	return types.TargetHTTP
 }
 
 // Endpoint returns the backend endpoint
@@ -130,16 +158,7 @@ func (h *Target) String() string {
 
 // IsOnline returns true if the target is reachable using a cached value
 func (h *Target) IsOnline(ctx context.Context) bool {
-	return atomic.LoadInt32(&h.status) == statusOnline
-}
-
-// ping returns true if the target is reachable.
-func (h *Target) ping(ctx context.Context) bool {
-	if err := h.send(ctx, []byte(`{}`), webhookCallTimeout); err != nil {
-		return !xnet.IsNetworkOrHostDown(err, false) && !xnet.IsConnRefusedErr(err)
-	}
-	go h.startHTTPLogger(ctx)
-	return true
+	return h.status.Load() == statusOnline
 }
 
 // Stats returns the target statistics.
@@ -148,89 +167,64 @@ func (h *Target) Stats() types.TargetStats {
 	queueLength := len(h.logCh)
 	h.logChMu.RUnlock()
 	stats := types.TargetStats{
-		TotalMessages:  atomic.LoadInt64(&h.totalMessages),
-		FailedMessages: atomic.LoadInt64(&h.failedMessages),
+		TotalMessages:  h.totalMessages.Load(),
+		FailedMessages: h.failedMessages.Load(),
 		QueueLength:    queueLength,
 	}
 
 	return stats
 }
 
+// AssignMigrateTarget assigns a target
+// which will eventually replace the current target.
+func (h *Target) AssignMigrateTarget(migrateTgt *Target) {
+	h.migrateTarget = migrateTgt
+}
+
 // Init validate and initialize the http target
 func (h *Target) Init(ctx context.Context) (err error) {
 	if h.config.QueueDir != "" {
-		return h.initQueueStoreOnce.DoWithContext(ctx, h.initQueueStore)
+		return h.initQueueOnce.DoWithContext(ctx, h.initDiskStore)
 	}
-	return h.init(ctx)
+	return h.initQueueOnce.DoWithContext(ctx, h.initMemoryStore)
 }
 
-func (h *Target) initQueueStore(ctx context.Context) (err error) {
-	var queueStore store.Store[interface{}]
-	queueDir := filepath.Join(h.config.QueueDir, h.Name())
-	queueStore = store.NewQueueStore[interface{}](queueDir, uint64(h.config.QueueSize), httpLoggerExtension)
-	if err = queueStore.Open(); err != nil {
+func (h *Target) initDiskStore(ctx context.Context) (err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	h.storeCtxCancel = cancel
+	h.lastStarted = time.Now()
+	go h.startQueueProcessor(ctx, true)
+
+	queueStore := store.NewQueueStore[interface{}](
+		filepath.Join(h.config.QueueDir, h.Name()),
+		uint64(h.config.QueueSize),
+		httpLoggerExtension,
+	)
+
+	if err := queueStore.Open(); err != nil {
 		return fmt.Errorf("unable to initialize the queue store of %s webhook: %w", h.Name(), err)
 	}
-	ctx, cancel := context.WithCancel(ctx)
+
 	h.store = queueStore
-	h.storeCtxCancel = cancel
-	store.StreamItems(h.store, h, ctx.Done(), h.config.LogOnce)
-	return
-}
+	store.StreamItems(h.store, h, ctx.Done(), h.config.LogOnceIf)
 
-func (h *Target) init(ctx context.Context) (err error) {
-	switch atomic.LoadInt32(&h.status) {
-	case statusOnline:
-		return nil
-	case statusClosed:
-		return errors.New("target is closed")
-	}
-
-	if !h.ping(ctx) {
-		// Start a goroutine that will continue to check if we can reach
-		h.revive.Do(func() {
-			go func() {
-				// Avoid stamping herd, add jitter.
-				t := time.NewTicker(time.Second + time.Duration(rand.Int63n(int64(5*time.Second))))
-				defer t.Stop()
-
-				for range t.C {
-					if atomic.LoadInt32(&h.status) != statusOffline {
-						return
-					}
-					if h.ping(ctx) {
-						// We are online.
-						if atomic.CompareAndSwapInt32(&h.status, statusOffline, statusOnline) {
-							h.workerStartMu.Lock()
-							h.lastStarted = time.Now()
-							h.workerStartMu.Unlock()
-							atomic.AddInt64(&h.workers, 1)
-							go h.startHTTPLogger(ctx)
-						}
-						return
-					}
-				}
-			}()
-		})
-		return err
-	}
-
-	if atomic.CompareAndSwapInt32(&h.status, statusOffline, statusOnline) {
-		h.workerStartMu.Lock()
-		h.lastStarted = time.Now()
-		h.workerStartMu.Unlock()
-		atomic.AddInt64(&h.workers, 1)
-		go h.startHTTPLogger(ctx)
-	}
 	return nil
 }
 
-func (h *Target) send(ctx context.Context, payload []byte, timeout time.Duration) (err error) {
+func (h *Target) initMemoryStore(ctx context.Context) (err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	h.storeCtxCancel = cancel
+	h.lastStarted = time.Now()
+	go h.startQueueProcessor(ctx, true)
+	return nil
+}
+
+func (h *Target) send(ctx context.Context, payload []byte, payloadType string, timeout time.Duration) (err error) {
 	defer func() {
 		if err != nil {
-			atomic.StoreInt32(&h.status, statusOffline)
+			h.status.Store(statusOffline)
 		} else {
-			atomic.StoreInt32(&h.status, statusOnline)
+			h.status.Store(statusOnline)
 		}
 	}()
 
@@ -241,7 +235,9 @@ func (h *Target) send(ctx context.Context, payload []byte, timeout time.Duration
 	if err != nil {
 		return fmt.Errorf("invalid configuration for '%s'; %v", h.Endpoint(), err)
 	}
-	req.Header.Set(xhttp.ContentType, "application/json")
+	if payloadType != "" {
+		req.Header.Set(xhttp.ContentType, payloadType)
+	}
 	req.Header.Set(xhttp.MinIOVersion, xhttp.GlobalMinIOVersion)
 	req.Header.Set(xhttp.MinioDeploymentID, xhttp.GlobalDeploymentID)
 
@@ -272,68 +268,241 @@ func (h *Target) send(ctx context.Context, payload []byte, timeout time.Duration
 	}
 }
 
-func (h *Target) logEntry(ctx context.Context, entry interface{}) {
-	logJSON, err := json.Marshal(&entry)
-	if err != nil {
-		atomic.AddInt64(&h.failedMessages, 1)
-		return
-	}
-
-	const maxTries = 3
-	tries := 0
-	for tries < maxTries {
-		if atomic.LoadInt32(&h.status) == statusClosed {
-			// Don't retry when closing...
-			return
-		}
-		// sleep = (tries+2) ^ 2 milliseconds.
-		sleep := time.Duration(math.Pow(float64(tries+2), 2)) * time.Millisecond
-		if sleep > time.Second {
-			sleep = time.Second
-		}
-		time.Sleep(sleep)
-		tries++
-		err := h.send(ctx, logJSON, webhookCallTimeout)
-		if err == nil {
-			return
-		}
-		h.config.LogOnce(ctx, err, h.Endpoint())
-	}
-	if tries == maxTries {
-		// Even with multiple retries, count failed messages as only one.
-		atomic.AddInt64(&h.failedMessages, 1)
-	}
-}
-
-func (h *Target) startHTTPLogger(ctx context.Context) {
+func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 	h.logChMu.RLock()
-	logCh := h.logCh
-	if logCh != nil {
-		// We are not allowed to add when logCh is nil
-		h.wg.Add(1)
-		defer h.wg.Done()
+	if h.logCh == nil {
+		h.logChMu.RUnlock()
+		return
 	}
 	h.logChMu.RUnlock()
 
-	defer atomic.AddInt64(&h.workers, -1)
+	h.workers.Add(1)
+	defer h.workers.Add(-1)
 
-	if logCh == nil {
-		return
+	h.wg.Add(1)
+	defer h.wg.Done()
+
+	entries := make([]interface{}, 0)
+	name := h.Name()
+
+	defer func() {
+		// re-load the global buffer pointer
+		// in case it was modified by a new target.
+		logChLock.Lock()
+		currentGlobalBuffer, ok := logChBuffers[name]
+		logChLock.Unlock()
+		if !ok {
+			return
+		}
+
+		for _, v := range entries {
+			select {
+			case currentGlobalBuffer <- v:
+			default:
+			}
+		}
+
+		if mainWorker {
+		drain:
+			for {
+				select {
+				case v, ok := <-h.logCh:
+					if !ok {
+						break drain
+					}
+
+					currentGlobalBuffer <- v
+				default:
+					break drain
+				}
+			}
+		}
+	}()
+
+	var entry interface{}
+	var ok bool
+	var err error
+	lastBatchProcess := time.Now()
+
+	buf := bytebufferpool.Get()
+	enc := jsoniter.ConfigCompatibleWithStandardLibrary.NewEncoder(buf)
+	defer bytebufferpool.Put(buf)
+
+	isDirQueue := h.config.QueueDir != ""
+
+	// globalBuffer is always created or adjusted
+	// before this method is launched.
+	logChLock.Lock()
+	globalBuffer := logChBuffers[name]
+	logChLock.Unlock()
+
+	newTicker := time.NewTicker(time.Second)
+	isTick := false
+
+	for {
+		isTick = false
+		select {
+		case _ = <-newTicker.C:
+			isTick = true
+		case entry, _ = <-globalBuffer:
+		case entry, ok = <-h.logCh:
+			if !ok {
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+
+		if !isTick {
+			h.totalMessages.Add(1)
+
+			if !isDirQueue {
+				if err := enc.Encode(&entry); err != nil {
+					h.config.LogOnceIf(
+						ctx,
+						fmt.Errorf("unable to encode webhook log entry, err  '%w' entry: %v\n", err, entry),
+						h.Name(),
+					)
+					h.failedMessages.Add(1)
+					continue
+				}
+			}
+
+			entries = append(entries, entry)
+		}
+
+		if len(entries) != h.batchSize {
+			if len(h.logCh) > 0 || len(globalBuffer) > 0 || len(entries) == 0 {
+				continue
+			}
+
+			if h.batchSize > 1 {
+				// If we are doing batching, we should wait
+				// at least one second before sending.
+				// Even if there is nothing in the queue.
+				if time.Since(lastBatchProcess).Seconds() < 1 {
+					continue
+				}
+			}
+		}
+
+		lastBatchProcess = time.Now()
+
+	retry:
+		// If the channel reaches above half capacity
+		// we spawn more workers. The workers spawned
+		// from this main worker routine will exit
+		// once the channel drops below half capacity
+		// and when it's been at least 30 seconds since
+		// we launched a new worker.
+		if mainWorker && len(h.logCh) > cap(h.logCh)/2 {
+			nWorkers := h.workers.Load()
+			if nWorkers < h.maxWorkers {
+				if time.Since(h.lastStarted).Milliseconds() > 10 {
+					h.lastStarted = time.Now()
+					go h.startQueueProcessor(ctx, false)
+				}
+			}
+		}
+
+		if !isDirQueue {
+			err = h.send(ctx, buf.Bytes(), h.payloadType, webhookCallTimeout)
+		} else {
+			err = h.store.PutMultiple(entries)
+		}
+
+		if err != nil {
+
+			h.config.LogOnceIf(
+				context.Background(),
+				fmt.Errorf("unable to send webhook log entry to '%s' err '%w'", name, err),
+				name,
+			)
+
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+
+			time.Sleep(3 * time.Second)
+			goto retry
+		}
+
+		entries = make([]interface{}, 0)
+
+		if !isDirQueue {
+			buf.Reset()
+		}
+
+		if !mainWorker && len(h.logCh) < cap(h.logCh)/2 {
+			if time.Since(h.lastStarted).Seconds() > 30 {
+				return
+			}
+		}
+
 	}
-	// Send messages until channel is closed.
-	for entry := range logCh {
-		atomic.AddInt64(&h.totalMessages, 1)
-		h.logEntry(ctx, entry)
+}
+
+// CreateOrAdjustGlobalBuffer will create or adjust the global log entry buffers
+// which are used to migrate log entries between old and new targets.
+func CreateOrAdjustGlobalBuffer(currentTgt *Target, newTgt *Target) {
+	logChLock.Lock()
+	defer logChLock.Unlock()
+
+	requiredCap := currentTgt.config.QueueSize + (currentTgt.config.BatchSize * int(currentTgt.maxWorkers))
+	currentCap := 0
+	name := newTgt.Name()
+
+	currentBuff, ok := logChBuffers[name]
+	if !ok {
+		logChBuffers[name] = make(chan interface{}, requiredCap)
+		currentCap = requiredCap
+	} else {
+		currentCap = cap(currentBuff)
+		requiredCap += len(currentBuff)
+	}
+
+	if requiredCap > currentCap {
+		logChBuffers[name] = make(chan interface{}, requiredCap)
+
+		if len(currentBuff) > 0 {
+		drain:
+			for {
+				select {
+				case v, ok := <-currentBuff:
+					if !ok {
+						break drain
+					}
+					logChBuffers[newTgt.Name()] <- v
+				default:
+					break drain
+				}
+			}
+		}
 	}
 }
 
 // New initializes a new logger target which
 // sends log over http to the specified endpoint
-func New(config Config) *Target {
+func New(config Config) (*Target, error) {
+	maxWorkers := maxWorkers
+	if config.BatchSize > 100 {
+		maxWorkers = maxWorkersWithBatchEvents
+	} else if config.BatchSize <= 0 {
+		config.BatchSize = 1
+	}
+
 	h := &Target{
-		logCh:  make(chan interface{}, config.QueueSize),
-		config: config,
-		status: statusOffline,
+		logCh:      make(chan interface{}, config.QueueSize),
+		config:     config,
+		batchSize:  config.BatchSize,
+		maxWorkers: int64(maxWorkers),
+	}
+	h.status.Store(statusOffline)
+
+	if config.BatchSize > 1 {
+		h.payloadType = ""
+	} else {
+		h.payloadType = "application/json"
 	}
 
 	// If proxy available, set the same
@@ -344,34 +513,33 @@ func New(config Config) *Target {
 		ctransport.Proxy = http.ProxyURL(proxyURL)
 		h.config.Transport = ctransport
 	}
-	h.client = &http.Client{Transport: h.config.Transport}
 
-	return h
+	h.client = &http.Client{Transport: h.config.Transport}
+	return h, nil
 }
 
 // SendFromStore - reads the log from store and sends it to webhook.
 func (h *Target) SendFromStore(key store.Key) (err error) {
-	var eventData interface{}
-	eventData, err = h.store.Get(key.Name)
+	var eventData []byte
+	eventData, err = h.store.GetRaw(key.Name)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	atomic.AddInt64(&h.totalMessages, 1)
-	logJSON, err := json.Marshal(&eventData)
-	if err != nil {
-		atomic.AddInt64(&h.failedMessages, 1)
-		return
-	}
-	if err := h.send(context.Background(), logJSON, webhookCallTimeout); err != nil {
-		atomic.AddInt64(&h.failedMessages, 1)
-		if xnet.IsNetworkOrHostDown(err, true) {
-			return store.ErrNotConnected
+
+	h.failedMessages.Add(1)
+	defer func() {
+		if err == nil {
+			h.failedMessages.Add(-1)
 		}
+	}()
+
+	if err := h.send(context.Background(), eventData, h.payloadType, webhookCallTimeout); err != nil {
 		return err
 	}
+
 	// Delete the event from store.
 	return h.store.Del(key.Name)
 }
@@ -380,13 +548,13 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 // Messages are queued in the disk if the store is enabled
 // If Cancel has been called the message is ignored.
 func (h *Target) Send(ctx context.Context, entry interface{}) error {
-	if atomic.LoadInt32(&h.status) == statusClosed {
+	if h.status.Load() == statusClosed {
+		if h.migrateTarget != nil {
+			return h.migrateTarget.Send(ctx, entry)
+		}
 		return nil
 	}
-	if h.store != nil {
-		// save the entry to the queue store which will be replayed to the target.
-		return h.store.Put(entry)
-	}
+
 	h.logChMu.RLock()
 	defer h.logChMu.RUnlock()
 	if h.logCh == nil {
@@ -396,6 +564,7 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 
 	select {
 	case h.logCh <- entry:
+		h.totalMessages.Add(1)
 	case <-ctx.Done():
 		// return error only for context timedout.
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -403,24 +572,8 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 		}
 		return nil
 	default:
-		nWorkers := atomic.LoadInt64(&h.workers)
-		if nWorkers < maxWorkers {
-			// Only have one try to start at the same time.
-			h.workerStartMu.Lock()
-			defer h.workerStartMu.Unlock()
-			// Start one max every second.
-			if time.Since(h.lastStarted) > time.Second {
-				if atomic.CompareAndSwapInt64(&h.workers, nWorkers, nWorkers+1) {
-					// Start another logger.
-					h.lastStarted = time.Now()
-					go h.startHTTPLogger(ctx)
-				}
-			}
-			h.logCh <- entry
-			return nil
-		}
-		atomic.AddInt64(&h.totalMessages, 1)
-		atomic.AddInt64(&h.failedMessages, 1)
+		h.totalMessages.Add(1)
+		h.failedMessages.Add(1)
 		return errors.New("log buffer full")
 	}
 
@@ -431,13 +584,11 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 // All queued messages are flushed and the function returns afterwards.
 // All messages sent to the target after this function has been called will be dropped.
 func (h *Target) Cancel() {
-	atomic.StoreInt32(&h.status, statusClosed)
+	h.status.Store(statusClosed)
+	h.storeCtxCancel()
 
-	// If queuestore is configured, cancel it's context to
-	// stop the replay go-routine.
-	if h.store != nil {
-		h.storeCtxCancel()
-	}
+	// Wait for messages to be sent...
+	h.wg.Wait()
 
 	// Set logch to nil and close it.
 	// This will block all Send operations,
@@ -447,12 +598,4 @@ func (h *Target) Cancel() {
 	xioutil.SafeClose(h.logCh)
 	h.logCh = nil
 	h.logChMu.Unlock()
-
-	// Wait for messages to be sent...
-	h.wg.Wait()
-}
-
-// Type - returns type of the target
-func (h *Target) Type() types.TargetType {
-	return types.TargetHTTP
 }

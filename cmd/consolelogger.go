@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -20,6 +20,7 @@ package cmd
 import (
 	"container/ring"
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 
@@ -28,8 +29,8 @@ import (
 	"github.com/minio/minio/internal/logger/target/console"
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/pubsub"
-	"github.com/minio/pkg/v2/logger/message/log"
-	xnet "github.com/minio/pkg/v2/net"
+	"github.com/minio/pkg/v3/logger/message/log"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // number of log messages to buffer
@@ -49,10 +50,10 @@ type HTTPConsoleLoggerSys struct {
 
 // NewConsoleLogger - creates new HTTPConsoleLoggerSys with all nodes subscribed to
 // the console logging pub sub system
-func NewConsoleLogger(ctx context.Context) *HTTPConsoleLoggerSys {
+func NewConsoleLogger(ctx context.Context, w io.Writer) *HTTPConsoleLoggerSys {
 	return &HTTPConsoleLoggerSys{
 		pubsub:  pubsub.New[log.Info, madmin.LogMask](8),
-		console: console.New(),
+		console: console.New(w),
 		logBuf:  ring.New(defaultLogBufferCount),
 	}
 }

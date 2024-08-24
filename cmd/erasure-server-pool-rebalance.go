@@ -26,17 +26,21 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/lithammer/shortuuid/v4"
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/bucket/lifecycle"
+	objectlock "github.com/minio/minio/internal/bucket/object/lock"
+	"github.com/minio/minio/internal/bucket/replication"
+	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/hash"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/env"
+	"github.com/minio/pkg/v3/workers"
 )
 
 //go:generate msgp -file $GOFILE -unexported
@@ -115,11 +119,8 @@ func (z *erasureServerPools) loadRebalanceMeta(ctx context.Context) error {
 	}
 
 	z.rebalMu.Lock()
-	if len(r.PoolStats) == len(z.serverPools) {
-		z.rebalMeta = r
-	} else {
-		z.updateRebalanceStats(ctx)
-	}
+	z.rebalMeta = r
+	z.updateRebalanceStats(ctx)
 	z.rebalMu.Unlock()
 
 	return nil
@@ -143,24 +144,16 @@ func (z *erasureServerPools) updateRebalanceStats(ctx context.Context) error {
 		}
 	}
 	if ok {
-		lock := z.serverPools[0].NewNSLock(minioMetaBucket, rebalMetaName)
-		lkCtx, err := lock.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("failed to acquire write lock on %s/%s: %w", minioMetaBucket, rebalMetaName, err))
-			return err
-		}
-		defer lock.Unlock(lkCtx)
-
-		ctx = lkCtx.Context()
-
-		noLockOpts := ObjectOptions{NoLock: true}
-		return z.rebalMeta.saveWithOpts(ctx, z.serverPools[0], noLockOpts)
+		return z.rebalMeta.save(ctx, z.serverPools[0])
 	}
 
 	return nil
 }
 
 func (z *erasureServerPools) findIndex(index int) int {
+	if z.rebalMeta == nil {
+		return 0
+	}
 	for i := 0; i < len(z.rebalMeta.PoolStats); i++ {
 		if i == index {
 			return index
@@ -273,6 +266,10 @@ func (z *erasureServerPools) bucketRebalanceDone(bucket string, poolIdx int) {
 	z.rebalMu.Lock()
 	defer z.rebalMu.Unlock()
 
+	if z.rebalMeta == nil {
+		return
+	}
+
 	ps := z.rebalMeta.PoolStats[poolIdx]
 	if ps == nil {
 		return
@@ -327,6 +324,10 @@ func (r *rebalanceMeta) loadWithOpts(ctx context.Context, store objectIO, opts O
 }
 
 func (r *rebalanceMeta) saveWithOpts(ctx context.Context, store objectIO, opts ObjectOptions) error {
+	if r == nil {
+		return nil
+	}
+
 	data := make([]byte, 4, r.Msgsize()+4)
 
 	// Initialize the header.
@@ -349,8 +350,15 @@ func (z *erasureServerPools) IsRebalanceStarted() bool {
 	z.rebalMu.RLock()
 	defer z.rebalMu.RUnlock()
 
-	if r := z.rebalMeta; r != nil {
-		if r.StoppedAt.IsZero() {
+	r := z.rebalMeta
+	if r == nil {
+		return false
+	}
+	if !r.StoppedAt.IsZero() {
+		return false
+	}
+	for _, ps := range r.PoolStats {
+		if ps.Participating && ps.Info.Status != rebalCompleted {
 			return true
 		}
 	}
@@ -365,14 +373,14 @@ func (z *erasureServerPools) IsPoolRebalancing(poolIndex int) bool {
 		if !r.StoppedAt.IsZero() {
 			return false
 		}
-		ps := z.rebalMeta.PoolStats[poolIndex]
+		ps := r.PoolStats[poolIndex]
 		return ps.Participating && ps.Info.Status == rebalStarted
 	}
 	return false
 }
 
 func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) (err error) {
-	doneCh := make(chan struct{})
+	doneCh := make(chan error, 1)
 	defer xioutil.SafeClose(doneCh)
 
 	// Save rebalance.bin periodically.
@@ -387,56 +395,59 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 
 		timer := time.NewTimer(randSleepFor())
 		defer timer.Stop()
-		var rebalDone bool
-		var traceMsg string
+
+		var (
+			quit     bool
+			traceMsg string
+		)
 
 		for {
 			select {
-			case <-doneCh:
-				// rebalance completed for poolIdx
+			case rebalErr := <-doneCh:
+				quit = true
 				now := time.Now()
+				var status rebalStatus
+
+				switch {
+				case errors.Is(rebalErr, context.Canceled):
+					status = rebalStopped
+					traceMsg = fmt.Sprintf("stopped at %s", now)
+				case rebalErr == nil:
+					status = rebalCompleted
+					traceMsg = fmt.Sprintf("completed at %s", now)
+				default:
+					status = rebalFailed
+					traceMsg = fmt.Sprintf("stopped at %s with err: %v", now, rebalErr)
+				}
+
 				z.rebalMu.Lock()
-				z.rebalMeta.PoolStats[poolIdx].Info.Status = rebalCompleted
+				z.rebalMeta.PoolStats[poolIdx].Info.Status = status
 				z.rebalMeta.PoolStats[poolIdx].Info.EndTime = now
 				z.rebalMu.Unlock()
-
-				rebalDone = true
-				traceMsg = fmt.Sprintf("completed at %s", now)
-
-			case <-ctx.Done():
-
-				// rebalance stopped for poolIdx
-				now := time.Now()
-				z.rebalMu.Lock()
-				z.rebalMeta.PoolStats[poolIdx].Info.Status = rebalStopped
-				z.rebalMeta.PoolStats[poolIdx].Info.EndTime = now
-				z.rebalMeta.cancel = nil // remove the already used context.CancelFunc
-				z.rebalMu.Unlock()
-
-				rebalDone = true
-				traceMsg = fmt.Sprintf("stopped at %s", now)
 
 			case <-timer.C:
 				traceMsg = fmt.Sprintf("saved at %s", time.Now())
 			}
 
 			stopFn := globalRebalanceMetrics.log(rebalanceMetricSaveMetadata, poolIdx, traceMsg)
-			err := z.saveRebalanceStats(ctx, poolIdx, rebalSaveStats)
-			stopFn(err)
-			logger.LogIf(ctx, err)
-			timer.Reset(randSleepFor())
+			err := z.saveRebalanceStats(GlobalContext, poolIdx, rebalSaveStats)
+			stopFn(0, err)
+			rebalanceLogIf(GlobalContext, err)
 
-			if rebalDone {
+			if quit {
 				return
 			}
+
+			timer.Reset(randSleepFor())
 		}
 	}()
 
-	logger.Event(ctx, "Pool %d rebalancing is started", poolIdx+1)
+	rebalanceLogEvent(ctx, "Pool %d rebalancing is started", poolIdx+1)
 
 	for {
 		select {
 		case <-ctx.Done():
+			doneCh <- ctx.Err()
 			return
 		default:
 		}
@@ -448,17 +459,20 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 		}
 
 		stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceBucket, poolIdx, bucket)
-		err = z.rebalanceBucket(ctx, bucket, poolIdx)
-		if err != nil {
-			stopFn(err)
-			logger.LogIf(ctx, err)
+		if err = z.rebalanceBucket(ctx, bucket, poolIdx); err != nil {
+			stopFn(0, err)
+			if errors.Is(err, errServerNotInitialized) || errors.Is(err, errBucketMetadataNotInitialized) {
+				continue
+			}
+			rebalanceLogIf(GlobalContext, err)
+			doneCh <- err
 			return
 		}
-		stopFn(nil)
+		stopFn(0, nil)
 		z.bucketRebalanceDone(bucket, poolIdx)
 	}
 
-	logger.Event(ctx, "Pool %d rebalancing is done", poolIdx+1)
+	rebalanceLogEvent(GlobalContext, "Pool %d rebalancing is done", poolIdx+1)
 
 	return err
 }
@@ -485,34 +499,93 @@ func (z *erasureServerPools) checkIfRebalanceDone(poolIdx int) bool {
 	return false
 }
 
+func (set *erasureObjects) listObjectsToRebalance(ctx context.Context, bucketName string, fn func(entry metaCacheEntry)) error {
+	disks, _ := set.getOnlineDisksWithHealing(false)
+	if len(disks) == 0 {
+		return fmt.Errorf("no online drives found for set with endpoints %s", set.getEndpoints())
+	}
+
+	// However many we ask, versions must exist on ~50%
+	listingQuorum := (set.setDriveCount + 1) / 2
+
+	// How to resolve partial results.
+	resolver := metadataResolutionParams{
+		dirQuorum: listingQuorum, // make sure to capture all quorum ratios
+		objQuorum: listingQuorum, // make sure to capture all quorum ratios
+		bucket:    bucketName,
+	}
+
+	err := listPathRaw(ctx, listPathRawOptions{
+		disks:          disks,
+		bucket:         bucketName,
+		recursive:      true,
+		forwardTo:      "",
+		minDisks:       listingQuorum,
+		reportNotFound: false,
+		agreed:         fn,
+		partial: func(entries metaCacheEntries, _ []error) {
+			entry, ok := entries.resolve(&resolver)
+			if ok {
+				fn(*entry)
+			}
+		},
+		finished: nil,
+	})
+	return err
+}
+
 // rebalanceBucket rebalances objects under bucket in poolIdx pool
-func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string, poolIdx int) error {
+func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string, poolIdx int) (err error) {
 	ctx = logger.SetReqInfo(ctx, &logger.ReqInfo{})
-	vc, _ := globalBucketVersioningSys.Get(bucket)
-	// Check if the current bucket has a configured lifecycle policy
-	lc, _ := globalLifecycleSys.Get(bucket)
-	// Check if bucket is object locked.
-	lr, _ := globalBucketObjectLockSys.Get(bucket)
-	rcfg, _ := getReplicationConfig(ctx, bucket)
+
+	var vc *versioning.Versioning
+	var lc *lifecycle.Lifecycle
+	var lr objectlock.Retention
+	var rcfg *replication.Config
+	if bucket != minioMetaBucket {
+		vc, err = globalBucketVersioningSys.Get(bucket)
+		if err != nil {
+			return err
+		}
+
+		// Check if the current bucket has a configured lifecycle policy
+		lc, err = globalLifecycleSys.Get(bucket)
+		if err != nil && !errors.Is(err, BucketLifecycleNotFound{Bucket: bucket}) {
+			return err
+		}
+
+		// Check if bucket is object locked.
+		lr, err = globalBucketObjectLockSys.Get(bucket)
+		if err != nil {
+			return err
+		}
+
+		rcfg, err = getReplicationConfig(ctx, bucket)
+		if err != nil {
+			return err
+		}
+	}
 
 	pool := z.serverPools[poolIdx]
+
 	const envRebalanceWorkers = "_MINIO_REBALANCE_WORKERS"
-	wStr := env.Get(envRebalanceWorkers, strconv.Itoa(len(pool.sets)))
-	workerSize, err := strconv.Atoi(wStr)
+	workerSize, err := env.GetInt(envRebalanceWorkers, len(pool.sets))
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("invalid %s value: %s err: %v, defaulting to %d", envRebalanceWorkers, wStr, err, len(pool.sets)))
+		rebalanceLogIf(ctx, fmt.Errorf("invalid workers value err: %v, defaulting to %d", err, len(pool.sets)))
 		workerSize = len(pool.sets)
 	}
-	workers := make(chan struct{}, workerSize)
-	var wg sync.WaitGroup
-	for _, set := range pool.sets {
+
+	// Each decom worker needs one List() goroutine/worker
+	// add that many extra workers.
+	workerSize += len(pool.sets)
+
+	wk, err := workers.New(workerSize)
+	if err != nil {
+		return err
+	}
+
+	for setIdx, set := range pool.sets {
 		set := set
-		disks := set.getOnlineDisks()
-		if len(disks) == 0 {
-			logger.LogIf(ctx, fmt.Errorf("no online disks found for set with endpoints %s",
-				set.getEndpoints()))
-			continue
-		}
 
 		filterLifecycle := func(bucket, object string, fi FileInfo) bool {
 			if lc == nil {
@@ -531,10 +604,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 		}
 
 		rebalanceEntry := func(entry metaCacheEntry) {
-			defer func() {
-				<-workers
-				wg.Done()
-			}()
+			defer wk.Give()
 
 			if entry.isDir() {
 				return
@@ -556,14 +626,18 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 
 			var rebalanced, expired int
 			for _, version := range fivs.Versions {
+				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
+
 				// Skip transitioned objects for now. TBD
 				if version.IsRemote() {
+					stopFn(version.Size, errors.New("ILM Tiered version will be skipped for now"))
 					continue
 				}
 
 				// Apply lifecycle rules on the objects that are expired.
 				if filterLifecycle(bucket, version.Name, version) {
 					expired++
+					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
 
@@ -573,6 +647,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 				remainingVersions := len(fivs.Versions) - expired
 				if version.Deleted && remainingVersions == 1 {
 					rebalanced++
+					stopFn(version.Size, errors.New("DELETE marked object with no other non-current versions will be skipped"))
 					continue
 				}
 
@@ -581,6 +656,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					versionID = nullVersionID
 				}
 
+				var failure, ignore bool
 				if version.Deleted {
 					_, err := z.DeleteObject(ctx,
 						bucket,
@@ -590,26 +666,36 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 							VersionID:         versionID,
 							MTime:             version.ModTime,
 							DeleteReplication: version.ReplicationState,
+							SrcPoolIdx:        poolIdx,
+							DataMovement:      true,
 							DeleteMarker:      true, // make sure we create a delete marker
 							SkipRebalancing:   true, // make sure we skip the decommissioned pool
+							NoAuditLog:        true,
 						})
-					var failure bool
-					if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-						logger.LogIf(ctx, err)
-						failure = true
+					// This can happen when rebalance stop races with ongoing rebalance workers.
+					// These rebalance failures can be ignored.
+					if err != nil {
+						// This can happen when rebalance stop races with ongoing rebalance workers.
+						// These rebalance failures can be ignored.
+						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+							ignore = true
+							stopFn(0, nil)
+							continue
+						}
 					}
-
+					stopFn(version.Size, err)
+					rebalanceLogIf(ctx, err)
+					failure = err != nil
 					if !failure {
 						z.updatePoolStats(poolIdx, bucket, version)
 						rebalanced++
 					}
+					auditLogRebalance(ctx, "Rebalance:DeleteMarker", bucket, version.Name, versionID, err)
 					continue
 				}
 
-				var failure, ignore bool
 				for try := 0; try < 3; try++ {
 					// GetObjectReader.Close is called by rebalanceObject
-					stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
 					gr, err := set.GetObjectNInfo(ctx,
 						bucket,
 						encodeDirObject(version.Name),
@@ -619,28 +705,36 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 							VersionID:    versionID,
 							NoDecryption: true,
 							NoLock:       true,
+							NoAuditLog:   true,
 						})
 					if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 						// object deleted by the application, nothing to do here we move on.
 						ignore = true
-						stopFn(nil)
+						stopFn(0, nil)
 						break
 					}
 					if err != nil {
 						failure = true
-						logger.LogIf(ctx, err)
-						stopFn(err)
+						rebalanceLogIf(ctx, err)
+						stopFn(0, err)
 						continue
 					}
 
-					if err = z.rebalanceObject(ctx, bucket, gr); err != nil {
+					if err = z.rebalanceObject(ctx, poolIdx, bucket, gr); err != nil {
+						// This can happen when rebalance stop races with ongoing rebalance workers.
+						// These rebalance failures can be ignored.
+						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+							ignore = true
+							stopFn(0, nil)
+							break
+						}
 						failure = true
-						logger.LogIf(ctx, err)
-						stopFn(err)
+						rebalanceLogIf(ctx, err)
+						stopFn(version.Size, err)
 						continue
 					}
 
-					stopFn(nil)
+					stopFn(version.Size, nil)
 					failure = false
 					break
 				}
@@ -663,54 +757,35 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					ObjectOptions{
 						DeletePrefix:       true, // use prefix delete to delete all versions at once.
 						DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
+						NoAuditLog:         true,
 					},
 				)
-				stopFn(err)
+				stopFn(0, err)
 				auditLogRebalance(ctx, "Rebalance:DeleteObject", bucket, entry.name, "", err)
 				if err != nil {
-					logger.LogIf(ctx, err)
+					rebalanceLogIf(ctx, err)
 				}
 			}
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			listQuorum := (len(disks) + 1) / 2
-
-			// How to resolve partial results.
-			resolver := metadataResolutionParams{
-				dirQuorum: listQuorum, // make sure to capture all quorum ratios
-				objQuorum: listQuorum, // make sure to capture all quorum ratios
-				bucket:    bucket,
-			}
-			err := listPathRaw(ctx, listPathRawOptions{
-				disks:          disks,
-				bucket:         bucket,
-				recursive:      true,
-				forwardTo:      "",
-				minDisks:       listQuorum,
-				reportNotFound: false,
-				agreed: func(entry metaCacheEntry) {
-					workers <- struct{}{}
-					wg.Add(1)
+		wk.Take()
+		go func(setIdx int) {
+			defer wk.Give()
+			err := set.listObjectsToRebalance(ctx, bucket,
+				func(entry metaCacheEntry) {
+					wk.Take()
 					go rebalanceEntry(entry)
 				},
-				partial: func(entries metaCacheEntries, _ []error) {
-					entry, ok := entries.resolve(&resolver)
-					if ok {
-						workers <- struct{}{}
-						wg.Add(1)
-						go rebalanceEntry(*entry)
-					}
-				},
-				finished: nil,
-			})
-			logger.LogIf(ctx, err)
-		}()
+			)
+			if err == nil || errors.Is(err, context.Canceled) {
+				return
+			}
+			setN := humanize.Ordinal(setIdx + 1)
+			rebalanceLogIf(ctx, fmt.Errorf("listing objects from %s set failed with %v", setN, err), "rebalance-listing-failed"+setN)
+		}(setIdx)
 	}
-	wg.Wait()
+
+	wk.Wait()
 	return nil
 }
 
@@ -725,7 +800,7 @@ func (z *erasureServerPools) saveRebalanceStats(ctx context.Context, poolIdx int
 	lock := z.serverPools[0].NewNSLock(minioMetaBucket, rebalMetaName)
 	lkCtx, err := lock.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("failed to acquire write lock on %s/%s: %w", minioMetaBucket, rebalMetaName, err))
+		rebalanceLogIf(ctx, fmt.Errorf("failed to acquire write lock on %s/%s: %w", minioMetaBucket, rebalMetaName, err))
 		return err
 	}
 	defer lock.Unlock(lkCtx)
@@ -744,7 +819,9 @@ func (z *erasureServerPools) saveRebalanceStats(ctx context.Context, poolIdx int
 	case rebalSaveStoppedAt:
 		r.StoppedAt = time.Now()
 	case rebalSaveStats:
-		r.PoolStats[poolIdx] = z.rebalMeta.PoolStats[poolIdx]
+		if z.rebalMeta != nil {
+			r.PoolStats[poolIdx] = z.rebalMeta.PoolStats[poolIdx]
+		}
 	}
 	z.rebalMeta = r
 
@@ -766,7 +843,7 @@ func auditLogRebalance(ctx context.Context, apiName, bucket, object, versionID s
 	})
 }
 
-func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string, gr *GetObjectReader) (err error) {
+func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, bucket string, gr *GetObjectReader) (err error) {
 	oi := gr.ObjInfo
 
 	defer func() {
@@ -781,13 +858,16 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 
 	if oi.isMultipart() {
 		res, err := z.NewMultipartUpload(ctx, bucket, oi.Name, ObjectOptions{
-			VersionID:   oi.VersionID,
-			UserDefined: oi.UserDefined,
+			VersionID:    oi.VersionID,
+			UserDefined:  oi.UserDefined,
+			NoAuditLog:   true,
+			DataMovement: true,
+			SrcPoolIdx:   poolIdx,
 		})
 		if err != nil {
 			return fmt.Errorf("rebalanceObject: NewMultipartUpload() %w", err)
 		}
-		defer z.AbortMultipartUpload(ctx, bucket, oi.Name, res.UploadID, ObjectOptions{})
+		defer z.AbortMultipartUpload(ctx, bucket, oi.Name, res.UploadID, ObjectOptions{NoAuditLog: true})
 
 		parts := make([]CompletePart, len(oi.Parts))
 		for i, part := range oi.Parts {
@@ -803,6 +883,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 					IndexCB: func() []byte {
 						return part.Index // Preserve part Index to ensure decompression works.
 					},
+					NoAuditLog: true,
 				})
 			if err != nil {
 				return fmt.Errorf("rebalanceObject: PutObjectPart() %w", err)
@@ -815,6 +896,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 		_, err = z.CompleteMultipartUpload(ctx, bucket, oi.Name, res.UploadID, parts, ObjectOptions{
 			DataMovement: true,
 			MTime:        oi.ModTime,
+			NoAuditLog:   true,
 		})
 		if err != nil {
 			err = fmt.Errorf("rebalanceObject: CompleteMultipartUpload() %w", err)
@@ -832,6 +914,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 		oi.Name,
 		NewPutObjReader(hr),
 		ObjectOptions{
+			SrcPoolIdx:   poolIdx,
 			DataMovement: true,
 			VersionID:    oi.VersionID,
 			MTime:        oi.ModTime,
@@ -840,6 +923,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 			IndexCB: func() []byte {
 				return oi.Parts[0].Index // Preserve part Index to ensure decompression works.
 			},
+			NoAuditLog: true,
 		})
 	if err != nil {
 		err = fmt.Errorf("rebalanceObject: PutObject() %w", err)
@@ -881,7 +965,7 @@ func (z *erasureServerPools) StartRebalance() {
 		go func(idx int) {
 			stopfn := globalRebalanceMetrics.log(rebalanceMetricRebalanceBuckets, idx)
 			err := z.rebalanceBuckets(ctx, idx)
-			stopfn(err)
+			stopfn(0, err)
 		}(poolIdx)
 	}
 }
@@ -921,7 +1005,9 @@ const (
 	rebalanceMetricSaveMetadata
 )
 
-func rebalanceTrace(r rebalanceMetric, poolIdx int, startTime time.Time, duration time.Duration, err error, path string) madmin.TraceInfo {
+var errDataMovementSrcDstPoolSame = errors.New("source and destination pool are the same")
+
+func rebalanceTrace(r rebalanceMetric, poolIdx int, startTime time.Time, duration time.Duration, err error, path string, sz int64) madmin.TraceInfo {
 	var errStr string
 	if err != nil {
 		errStr = err.Error()
@@ -934,15 +1020,16 @@ func rebalanceTrace(r rebalanceMetric, poolIdx int, startTime time.Time, duratio
 		Duration:  duration,
 		Path:      path,
 		Error:     errStr,
+		Bytes:     sz,
 	}
 }
 
-func (p *rebalanceMetrics) log(r rebalanceMetric, poolIdx int, paths ...string) func(err error) {
+func (p *rebalanceMetrics) log(r rebalanceMetric, poolIdx int, paths ...string) func(sz int64, err error) {
 	startTime := time.Now()
-	return func(err error) {
+	return func(sz int64, err error) {
 		duration := time.Since(startTime)
 		if globalTrace.NumSubscribers(madmin.TraceRebalance) > 0 {
-			globalTrace.Publish(rebalanceTrace(r, poolIdx, startTime, duration, err, strings.Join(paths, " ")))
+			globalTrace.Publish(rebalanceTrace(r, poolIdx, startTime, duration, err, strings.Join(paths, " "), sz))
 		}
 	}
 }

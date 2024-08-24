@@ -21,7 +21,7 @@ import (
 	"strconv"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/env"
 )
 
 // DefaultKVS default configuration values for ILM subsystem
@@ -44,6 +44,15 @@ type Config struct {
 
 // LookupConfig - lookup ilm config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
+	cfg = Config{
+		TransitionWorkers: 100,
+		ExpirationWorkers: 100,
+	}
+
+	if err = config.CheckValidKeys(config.ILMSubSys, kvs, DefaultKVS); err != nil {
+		return cfg, err
+	}
+
 	tw, err := strconv.Atoi(env.Get(EnvILMTransitionWorkers, kvs.GetWithDefault(transitionWorkers, DefaultKVS)))
 	if err != nil {
 		return cfg, err

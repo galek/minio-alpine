@@ -347,13 +347,24 @@ func checkPostPolicy(formValues http.Header, postPolicyForm PostPolicyForm) erro
 		}
 		delete(checkHeader, formCanonicalName)
 	}
+	// For SignV2 - Signature/AWSAccessKeyId field will be ignored.
+	if _, ok := formValues[xhttp.AmzSignatureV2]; ok {
+		delete(checkHeader, xhttp.AmzSignatureV2)
+		for k := range checkHeader {
+			// case-insensitivity for AWSAccessKeyId
+			if strings.EqualFold(k, xhttp.AmzAccessKeyID) {
+				delete(checkHeader, k)
+				break
+			}
+		}
+	}
 
 	if len(checkHeader) != 0 {
 		logKeys := make([]string, 0, len(checkHeader))
 		for key := range checkHeader {
 			logKeys = append(logKeys, key)
 		}
-		return fmt.Errorf("Each form field that you specify in a form (except %s) must appear in the list of conditions.", strings.Join(logKeys, ", "))
+		return fmt.Errorf("Each form field that you specify in a form must appear in the list of policy conditions. %q not specified in the policy.", strings.Join(logKeys, ", "))
 	}
 
 	return nil

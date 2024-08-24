@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,18 +18,19 @@
 package cmd
 
 import (
-	"context"
+	"math"
 	"net/http"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/kms"
-	"github.com/minio/minio/internal/logger"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // getLocalServerProperty - returns madmin.ServerProperties for only the
@@ -42,9 +43,13 @@ func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Req
 	if globalIsDistErasure {
 		addr = globalLocalNodeName
 	}
+	poolNumbers := make(map[int]struct{})
 	network := make(map[string]string)
 	for _, ep := range endpointServerPools {
 		for _, endpoint := range ep.Endpoints {
+			if endpoint.IsLocal {
+				poolNumbers[endpoint.PoolIdx+1] = struct{}{}
+			}
 			nodeName := endpoint.Host
 			if nodeName == "" {
 				nodeName = addr
@@ -59,9 +64,11 @@ func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Req
 				if err := isServerResolvable(endpoint, 5*time.Second); err == nil {
 					network[nodeName] = string(madmin.ItemOnline)
 				} else {
-					network[nodeName] = string(madmin.ItemOffline)
-					// log once the error
-					logger.LogOnceIf(context.Background(), err, nodeName)
+					if xnet.IsNetworkOrHostDown(err, false) {
+						network[nodeName] = string(madmin.ItemOffline)
+					} else if xnet.IsNetworkOrHostDown(err, true) {
+						network[nodeName] = "connection attempt timedout"
+					}
 				}
 			}
 		}
@@ -111,6 +118,17 @@ func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Req
 		},
 		MinioEnvVars: make(map[string]string, 10),
 	}
+
+	for poolNumber := range poolNumbers {
+		props.PoolNumbers = append(props.PoolNumbers, poolNumber)
+	}
+	sort.Ints(props.PoolNumbers)
+	props.PoolNumber = func() int {
+		if len(props.PoolNumbers) == 1 {
+			return props.PoolNumbers[0]
+		}
+		return math.MaxInt // this indicates that its unset.
+	}()
 
 	sensitive := map[string]struct{}{
 		config.EnvAccessKey:         {},

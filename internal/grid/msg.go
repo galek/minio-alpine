@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/tinylib/msgp/msgp"
 	"github.com/zeebo/xxh3"
@@ -255,8 +256,15 @@ type sender interface {
 }
 
 type connectReq struct {
-	ID   [16]byte
-	Host string
+	ID    [16]byte
+	Host  string
+	Time  time.Time
+	Token string
+}
+
+// addToken will add the token to the connect request.
+func (c *connectReq) addToken(fn AuthFn) {
+	c.Token = fn()
 }
 
 func (connectReq) Op() Op {
@@ -282,10 +290,19 @@ func (muxConnectError) Op() Op {
 }
 
 type pongMsg struct {
-	NotFound bool    `msg:"nf"`
-	Err      *string `msg:"e,allownil"`
+	NotFound bool      `msg:"nf"`
+	Err      *string   `msg:"e,allownil"`
+	T        time.Time `msg:"t"`
 }
 
 func (pongMsg) Op() Op {
 	return OpPong
+}
+
+type pingMsg struct {
+	T time.Time `msg:"t"`
+}
+
+func (pingMsg) Op() Op {
+	return OpPing
 }

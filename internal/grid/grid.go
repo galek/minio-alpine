@@ -20,12 +20,18 @@ package grid
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 )
 
@@ -42,10 +48,16 @@ const (
 
 	// maxBufferSize is the maximum buffer size.
 	// Buffers larger than this is not reused.
-	maxBufferSize = 64 << 10
+	maxBufferSize = 96 << 10
+
+	// This is the assumed size of bigger buffers and allocation size.
+	biggerBufMin = 32 << 10
+
+	// This is the maximum size of bigger buffers.
+	biggerBufMax = maxBufferSize
 
 	// If there is a queue, merge up to this many messages.
-	maxMergeMessages = 30
+	maxMergeMessages = 50
 
 	// clientPingInterval will ping the remote handler every 15 seconds.
 	// Clients disconnect when we exceed 2 intervals.
@@ -63,6 +75,13 @@ var internalByteBuffer = sync.Pool{
 	},
 }
 
+var internal32KByteBuffer = sync.Pool{
+	New: func() any {
+		m := make([]byte, 0, biggerBufMin)
+		return &m
+	},
+}
+
 // GetByteBuffer can be replaced with a function that returns a small
 // byte buffer.
 // When replacing PutByteBuffer should also be replaced
@@ -72,10 +91,34 @@ var GetByteBuffer = func() []byte {
 	return b[:0]
 }
 
+// GetByteBufferCap returns a length 0 byte buffer with at least the given capacity.
+func GetByteBufferCap(wantSz int) []byte {
+	if wantSz < defaultBufferSize {
+		b := GetByteBuffer()[:0]
+		if cap(b) >= wantSz {
+			return b
+		}
+		PutByteBuffer(b)
+	}
+	if wantSz <= maxBufferSize {
+		b := *internal32KByteBuffer.Get().(*[]byte)
+		if cap(b) >= wantSz {
+			return b[:0]
+		}
+		internal32KByteBuffer.Put(&b)
+	}
+	return make([]byte, 0, wantSz)
+}
+
 // PutByteBuffer is for returning byte buffers.
 var PutByteBuffer = func(b []byte) {
-	if cap(b) >= minBufferSize && cap(b) < maxBufferSize {
+	if cap(b) >= biggerBufMin && cap(b) < biggerBufMax {
+		internal32KByteBuffer.Put(&b)
+		return
+	}
+	if cap(b) >= minBufferSize && cap(b) < biggerBufMin {
 		internalByteBuffer.Put(&b)
+		return
 	}
 }
 
@@ -83,7 +126,8 @@ var PutByteBuffer = func(b []byte) {
 // A successful call returns err == nil, not err == EOF. Because readAllInto is
 // defined to read from src until EOF, it does not treat an EOF from Read
 // as an error to be reported.
-func readAllInto(b []byte, r *wsutil.Reader) ([]byte, error) {
+func readAllInto(b []byte, r *wsutil.Reader, want int64) ([]byte, error) {
+	read := int64(0)
 	for {
 		if len(b) == cap(b) {
 			// Add more capacity (let append pick how much).
@@ -93,9 +137,17 @@ func readAllInto(b []byte, r *wsutil.Reader) ([]byte, error) {
 		b = b[:len(b)+n]
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if want >= 0 && read+int64(n) != want {
+					return nil, io.ErrUnexpectedEOF
+				}
 				err = nil
 			}
 			return b, err
+		}
+		read += int64(n)
+		if want >= 0 && read == want {
+			// No need to read more...
+			return b, nil
 		}
 	}
 }
@@ -117,11 +169,7 @@ type writerWrapper struct {
 }
 
 func (w *writerWrapper) Write(p []byte) (n int, err error) {
-	buf := GetByteBuffer()
-	if cap(buf) < len(p) {
-		PutByteBuffer(buf)
-		buf = make([]byte, len(p))
-	}
+	buf := GetByteBufferCap(len(p))
 	buf = buf[:len(p)]
 	copy(buf, p)
 	select {
@@ -147,141 +195,49 @@ func bytesOrLength(b []byte) string {
 	return fmt.Sprint(b)
 }
 
-type lockedClientMap struct {
-	m  map[uint64]*muxClient
-	mu sync.Mutex
-}
+// ConnDialer is a function that dials a connection to the given address.
+// There should be no retries in this function,
+// and should have a timeout of something like 2 seconds.
+// The returned net.Conn should also have quick disconnect on errors.
+// The net.Conn must support all features as described by the net.Conn interface.
+type ConnDialer func(ctx context.Context, address string) (net.Conn, error)
 
-func (m *lockedClientMap) Load(id uint64) (*muxClient, bool) {
-	m.mu.Lock()
-	v, ok := m.m[id]
-	m.mu.Unlock()
-	return v, ok
-}
+// ConnectWSWithRoutePath is like ConnectWS but with a custom grid route path.
+func ConnectWSWithRoutePath(dial ContextDialer, auth AuthFn, tls *tls.Config, routePath string) func(ctx context.Context, remote string) (net.Conn, error) {
+	return func(ctx context.Context, remote string) (net.Conn, error) {
+		toDial := strings.Replace(remote, "http://", "ws://", 1)
+		toDial = strings.Replace(toDial, "https://", "wss://", 1)
+		toDial += routePath
 
-func (m *lockedClientMap) LoadAndDelete(id uint64) (*muxClient, bool) {
-	m.mu.Lock()
-	v, ok := m.m[id]
-	if ok {
-		delete(m.m, id)
-	}
-	m.mu.Unlock()
-	return v, ok
-}
-
-func (m *lockedClientMap) Size() int {
-	m.mu.Lock()
-	v := len(m.m)
-	m.mu.Unlock()
-	return v
-}
-
-func (m *lockedClientMap) Delete(id uint64) {
-	m.mu.Lock()
-	delete(m.m, id)
-	m.mu.Unlock()
-}
-
-func (m *lockedClientMap) Range(fn func(key uint64, value *muxClient) bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for k, v := range m.m {
-		if !fn(k, v) {
-			break
+		dialer := ws.DefaultDialer
+		dialer.ReadBufferSize = readBufferSize
+		dialer.WriteBufferSize = writeBufferSize
+		dialer.Timeout = defaultDialTimeout
+		if dial != nil {
+			dialer.NetDial = dial
 		}
-	}
-}
+		header := make(http.Header, 2)
+		header.Set("Authorization", "Bearer "+auth())
+		header.Set("X-Minio-Time", strconv.FormatInt(time.Now().UnixNano(), 10))
 
-func (m *lockedClientMap) Clear() {
-	m.mu.Lock()
-	m.m = map[uint64]*muxClient{}
-	m.mu.Unlock()
-}
-
-func (m *lockedClientMap) LoadOrStore(id uint64, v *muxClient) (*muxClient, bool) {
-	m.mu.Lock()
-	v2, ok := m.m[id]
-	if ok {
-		m.mu.Unlock()
-		return v2, true
-	}
-	m.m[id] = v
-	m.mu.Unlock()
-	return v, false
-}
-
-type lockedServerMap struct {
-	m  map[uint64]*muxServer
-	mu sync.Mutex
-}
-
-func (m *lockedServerMap) Load(id uint64) (*muxServer, bool) {
-	m.mu.Lock()
-	v, ok := m.m[id]
-	m.mu.Unlock()
-	return v, ok
-}
-
-func (m *lockedServerMap) LoadAndDelete(id uint64) (*muxServer, bool) {
-	m.mu.Lock()
-	v, ok := m.m[id]
-	if ok {
-		delete(m.m, id)
-	}
-	m.mu.Unlock()
-	return v, ok
-}
-
-func (m *lockedServerMap) Size() int {
-	m.mu.Lock()
-	v := len(m.m)
-	m.mu.Unlock()
-	return v
-}
-
-func (m *lockedServerMap) Delete(id uint64) {
-	m.mu.Lock()
-	delete(m.m, id)
-	m.mu.Unlock()
-}
-
-func (m *lockedServerMap) Range(fn func(key uint64, value *muxServer) bool) {
-	m.mu.Lock()
-	for k, v := range m.m {
-		if !fn(k, v) {
-			break
+		if len(header) > 0 {
+			dialer.Header = ws.HandshakeHeaderHTTP(header)
 		}
+		dialer.TLSConfig = tls
+
+		conn, br, _, err := dialer.Dial(ctx, toDial)
+		if br != nil {
+			ws.PutReader(br)
+		}
+		return conn, err
 	}
-	m.mu.Unlock()
 }
 
-func (m *lockedServerMap) Clear() {
-	m.mu.Lock()
-	m.m = map[uint64]*muxServer{}
-	m.mu.Unlock()
+// ConnectWS returns a function that dials a websocket connection to the given address.
+// Route and auth are added to the connection.
+func ConnectWS(dial ContextDialer, auth AuthFn, tls *tls.Config) func(ctx context.Context, remote string) (net.Conn, error) {
+	return ConnectWSWithRoutePath(dial, auth, tls, RoutePath)
 }
 
-func (m *lockedServerMap) LoadOrStore(id uint64, v *muxServer) (*muxServer, bool) {
-	m.mu.Lock()
-	v2, ok := m.m[id]
-	if ok {
-		m.mu.Unlock()
-		return v2, true
-	}
-	m.m[id] = v
-	m.mu.Unlock()
-	return v, false
-}
-
-func (m *lockedServerMap) LoadOrCompute(id uint64, fn func() *muxServer) (*muxServer, bool) {
-	m.mu.Lock()
-	v2, ok := m.m[id]
-	if ok {
-		m.mu.Unlock()
-		return v2, true
-	}
-	v := fn()
-	m.m[id] = v
-	m.mu.Unlock()
-	return v, false
-}
+// ValidateTokenFn must validate the token and return an error if it is invalid.
+type ValidateTokenFn func(token string) error

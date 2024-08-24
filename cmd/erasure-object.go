@@ -20,6 +20,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/klauspost/readahead"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/tags"
@@ -40,13 +42,13 @@ import (
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/mimedb"
-	"github.com/minio/pkg/v2/sync/errgroup"
-	"github.com/minio/pkg/v2/wildcard"
+	"github.com/minio/pkg/v3/mimedb"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 // list all errors which can be ignored in object operations.
@@ -67,7 +69,9 @@ func countOnlineDisks(onlineDisks []StorageAPI) (online int) {
 // if source object and destination object are same we only
 // update metadata.
 func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (oi ObjectInfo, err error) {
-	auditObjectErasureSet(ctx, dstObject, &er)
+	if !dstOpts.NoAuditLog {
+		auditObjectErasureSet(ctx, "CopyObject", dstObject, &er)
+	}
 
 	// This call shouldn't be used for anything other than metadata updates or adding self referential versions.
 	if !srcInfo.metadataOnly {
@@ -93,15 +97,19 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	if srcOpts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, storageDisks, "", srcBucket, srcObject, srcOpts.VersionID, true, false)
 	} else {
-		metaArr, errs = readAllXL(ctx, storageDisks, srcBucket, srcObject, true, false, true)
+		metaArr, errs = readAllXL(ctx, storageDisks, srcBucket, srcObject, true, false)
 	}
 
 	readQuorum, writeQuorum, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
 	if err != nil {
 		if errors.Is(err, errErasureReadQuorum) && !strings.HasPrefix(srcBucket, minioMetaBucket) {
 			_, derr := er.deleteIfDangling(context.Background(), srcBucket, srcObject, metaArr, errs, nil, srcOpts)
-			if derr != nil {
-				err = derr
+			if derr == nil {
+				if srcOpts.VersionID != "" {
+					err = errFileVersionNotFound
+				} else {
+					err = errFileNotFound
+				}
 			}
 		}
 		return ObjectInfo{}, toObjectErr(err, srcBucket, srcObject)
@@ -143,11 +151,12 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		modTime = dstOpts.MTime
 		fi.ModTime = dstOpts.MTime
 	}
+	// check inline before overwriting metadata.
+	inlineData := fi.InlineData()
 
 	fi.Metadata = srcInfo.UserDefined
 	srcInfo.UserDefined["etag"] = srcInfo.ETag
 
-	inlineData := fi.InlineData()
 	freeVersionID := fi.TierFreeVersionID()
 	freeVersionMarker := fi.TierFreeVersion()
 
@@ -189,7 +198,9 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 // GetObjectNInfo - returns object info and an object
 // Read(Closer). When err != nil, the returned reader is always nil.
 func (er erasureObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, err error) {
-	auditObjectErasureSet(ctx, object, &er)
+	if !opts.NoAuditLog {
+		auditObjectErasureSet(ctx, "GetObject", object, &er)
+	}
 
 	var unlockOnDefer bool
 	nsUnlocker := func() {}
@@ -240,6 +251,23 @@ func (er erasureObjects) GetObjectNInfo(ctx context.Context, bucket, object stri
 		}, toObjectErr(errMethodNotAllowed, bucket, object)
 	}
 
+	// Set NoDecryption for SSE-C objects and if replication request
+	if crypto.SSEC.IsEncrypted(objInfo.UserDefined) && opts.ReplicationRequest {
+		opts.NoDecryption = true
+	}
+
+	if objInfo.Size == 0 {
+		if _, _, err := rs.GetOffsetLength(objInfo.Size); err != nil {
+			// Make sure to return object info to provide extra information.
+			return &GetObjectReader{
+				ObjInfo: objInfo,
+			}, err
+		}
+
+		// Zero byte objects don't even need to further initialize pipes etc.
+		return NewGetObjectReaderFromReader(bytes.NewReader(nil), objInfo, opts)
+	}
+
 	if objInfo.IsRemote() {
 		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, h, objInfo, opts)
 		if err != nil {
@@ -249,18 +277,13 @@ func (er erasureObjects) GetObjectNInfo(ctx context.Context, bucket, object stri
 		return gr.WithCleanupFuncs(nsUnlocker), nil
 	}
 
-	if objInfo.Size == 0 {
-		// Zero byte objects don't even need to further initialize pipes etc.
-		return NewGetObjectReaderFromReader(bytes.NewReader(nil), objInfo, opts)
-	}
-
-	fn, off, length, err := NewGetObjectReader(rs, objInfo, opts)
+	fn, off, length, err := NewGetObjectReader(rs, objInfo, opts, h)
 	if err != nil {
 		return nil, err
 	}
 
 	if unlockOnDefer {
-		unlockOnDefer = fi.InlineData()
+		unlockOnDefer = fi.InlineData() || len(fi.Data) > 0
 	}
 
 	pr, pw := xioutil.WaitPipe()
@@ -372,24 +395,16 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 			// that we have some parts or data blocks missing or corrupted
 			// - attempt a heal to successfully heal them for future calls.
 			if written == partLength {
-				var scan madmin.HealScanMode
-				switch {
-				case errors.Is(err, errFileNotFound):
-					scan = madmin.HealNormalScan
-				case errors.Is(err, errFileCorrupt):
-					scan = madmin.HealDeepScan
-				}
-				switch scan {
-				case madmin.HealNormalScan, madmin.HealDeepScan:
+				if errors.Is(err, errFileNotFound) || errors.Is(err, errFileCorrupt) {
 					healOnce.Do(func() {
-						globalMRFState.addPartialOp(partialOperation{
-							bucket:    bucket,
-							object:    object,
-							versionID: fi.VersionID,
-							queued:    time.Now(),
-							setIndex:  er.setIndex,
-							poolIndex: er.poolIndex,
-							scanMode:  scan,
+						globalMRFState.addPartialOp(PartialOperation{
+							Bucket:     bucket,
+							Object:     object,
+							VersionID:  fi.VersionID,
+							Queued:     time.Now(),
+							SetIndex:   er.setIndex,
+							PoolIndex:  er.poolIndex,
+							BitrotScan: errors.Is(err, errFileCorrupt),
 						})
 					})
 					// Healing is triggered and we have written
@@ -401,11 +416,6 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 			}
 			if err != nil {
 				return toObjectErr(err, bucket, object)
-			}
-		}
-		for i, r := range readers {
-			if r == nil {
-				onlineDisks[i] = OfflineDisk
 			}
 		}
 		// Track total bytes read from disk and written to the client.
@@ -420,7 +430,9 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 
 // GetObjectInfo - reads object metadata and replies back ObjectInfo.
 func (er erasureObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (info ObjectInfo, err error) {
-	auditObjectErasureSet(ctx, object, &er)
+	if !opts.NoAuditLog {
+		auditObjectErasureSet(ctx, "GetObjectInfo", object, &er)
+	}
 
 	if !opts.NoLock {
 		// Lock the object before reading.
@@ -436,7 +448,7 @@ func (er erasureObjects) GetObjectInfo(ctx context.Context, bucket, object strin
 	return er.getObjectInfo(ctx, bucket, object, opts)
 }
 
-func auditDanglingObjectDeletion(ctx context.Context, bucket, object, versionID string, tags map[string]interface{}) {
+func auditDanglingObjectDeletion(ctx context.Context, bucket, object, versionID string, tags map[string]string) {
 	if len(logger.AuditTargets()) == 0 {
 		return
 	}
@@ -452,130 +464,109 @@ func auditDanglingObjectDeletion(ctx context.Context, bucket, object, versionID 
 	auditLogInternal(ctx, opts)
 }
 
-func joinErrs(errs []error) []string {
-	s := make([]string, len(errs))
+func joinErrs(errs []error) string {
+	var s string
 	for i := range s {
+		if s != "" {
+			s += ","
+		}
 		if errs[i] == nil {
-			s[i] = "<nil>"
+			s += "<nil>"
 		} else {
-			s[i] = errs[i].Error()
+			s += errs[i].Error()
 		}
 	}
 	return s
 }
 
-func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object string, metaArr []FileInfo, errs []error, dataErrs []error, opts ObjectOptions) (FileInfo, error) {
-	var err error
-	m, ok := isObjectDangling(metaArr, errs, dataErrs)
-	if ok {
-		tags := make(map[string]interface{}, 4)
-		tags["set"] = er.setIndex
-		tags["pool"] = er.poolIndex
-		tags["merrs"] = joinErrs(errs)
-		tags["derrs"] = joinErrs(dataErrs)
-		if m.IsValid() {
-			tags["size"] = m.Size
-			tags["mtime"] = m.ModTime.Format(http.TimeFormat)
-			tags["data"] = m.Erasure.DataBlocks
-			tags["parity"] = m.Erasure.ParityBlocks
-		} else {
-			tags["invalid-meta"] = true
-			tags["data"] = er.setDriveCount - er.defaultParityCount
-			tags["parity"] = er.defaultParityCount
-		}
-
-		// count the number of offline disks
-		offline := 0
-		for i := 0; i < max(len(errs), len(dataErrs)); i++ {
-			if i < len(errs) && errors.Is(errs[i], errDiskNotFound) || i < len(dataErrs) && errors.Is(dataErrs[i], errDiskNotFound) {
-				offline++
-			}
-		}
-		if offline > 0 {
-			tags["offline"] = offline
-		}
-
-		_, file, line, cok := runtime.Caller(1)
-		if cok {
-			tags["caller"] = fmt.Sprintf("%s:%d", file, line)
-		}
-
-		defer auditDanglingObjectDeletion(ctx, bucket, object, m.VersionID, tags)
-
-		err = errFileNotFound
-		if opts.VersionID != "" {
-			err = errFileVersionNotFound
-		}
-
-		fi := FileInfo{
-			VersionID: m.VersionID,
-		}
-		if opts.VersionID != "" {
-			fi.VersionID = opts.VersionID
-		}
-		fi.SetTierFreeVersionID(mustGetUUID())
-		disks := er.getDisks()
-		g := errgroup.WithNErrs(len(disks))
-		for index := range disks {
-			index := index
-			g.Go(func() error {
-				if disks[index] == nil {
-					return errDiskNotFound
-				}
-				return disks[index].DeleteVersion(ctx, bucket, object, fi, false, DeleteOptions{})
-			}, index)
-		}
-
-		rmDisks := make(map[string]string, len(disks))
-		for index, err := range g.Wait() {
-			var errStr, diskName string
-			if err != nil {
-				errStr = err.Error()
-			} else {
-				errStr = "<nil>"
-			}
-			if disks[index] != nil {
-				diskName = disks[index].String()
-			} else {
-				diskName = fmt.Sprintf("disk-%d", index)
-			}
-			rmDisks[diskName] = errStr
-		}
-		tags["cleanupResult"] = rmDisks
+func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object string, metaArr []FileInfo, errs []error, dataErrsByPart map[int][]int, opts ObjectOptions) (FileInfo, error) {
+	m, ok := isObjectDangling(metaArr, errs, dataErrsByPart)
+	if !ok {
+		// We only come here if we cannot figure out if the object
+		// can be deleted safely, in such a scenario return ReadQuorum error.
+		return FileInfo{}, errErasureReadQuorum
 	}
-	return m, err
+	tags := make(map[string]string, 16)
+	tags["set"] = strconv.Itoa(er.setIndex)
+	tags["pool"] = strconv.Itoa(er.poolIndex)
+	tags["merrs"] = joinErrs(errs)
+	tags["derrs"] = fmt.Sprintf("%v", dataErrsByPart)
+	if m.IsValid() {
+		tags["sz"] = strconv.FormatInt(m.Size, 10)
+		tags["mt"] = m.ModTime.Format(iso8601Format)
+		tags["d:p"] = fmt.Sprintf("%d:%d", m.Erasure.DataBlocks, m.Erasure.ParityBlocks)
+	} else {
+		tags["invalid"] = "1"
+		tags["d:p"] = fmt.Sprintf("%d:%d", er.setDriveCount-er.defaultParityCount, er.defaultParityCount)
+	}
+
+	// count the number of offline disks
+	offline := 0
+	for i := 0; i < len(errs); i++ {
+		var found bool
+		switch {
+		case errors.Is(errs[i], errDiskNotFound):
+			found = true
+		default:
+			for p := range dataErrsByPart {
+				if dataErrsByPart[p][i] == checkPartDiskNotFound {
+					found = true
+					break
+				}
+			}
+		}
+		if found {
+			offline++
+		}
+	}
+	if offline > 0 {
+		tags["offline"] = strconv.Itoa(offline)
+	}
+
+	_, file, line, cok := runtime.Caller(1)
+	if cok {
+		tags["caller"] = fmt.Sprintf("%s:%d", file, line)
+	}
+
+	defer auditDanglingObjectDeletion(ctx, bucket, object, m.VersionID, tags)
+
+	fi := FileInfo{
+		VersionID: m.VersionID,
+	}
+	if opts.VersionID != "" {
+		fi.VersionID = opts.VersionID
+	}
+	fi.SetTierFreeVersionID(mustGetUUID())
+	disks := er.getDisks()
+	g := errgroup.WithNErrs(len(disks))
+	for index := range disks {
+		index := index
+		g.Go(func() error {
+			if disks[index] == nil {
+				return errDiskNotFound
+			}
+			return disks[index].DeleteVersion(ctx, bucket, object, fi, false, DeleteOptions{})
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		var errStr string
+		if err != nil {
+			errStr = err.Error()
+		} else {
+			errStr = "<nil>"
+		}
+		tags[fmt.Sprintf("ddisk-%d", index)] = errStr
+	}
+
+	return m, nil
 }
 
-func fileInfoFromRaw(ri RawFileInfo, bucket, object string, readData, inclFreeVers, allParts bool) (FileInfo, error) {
-	var xl xlMetaV2
-	if err := xl.LoadOrConvert(ri.Buf); err != nil {
-		return FileInfo{}, err
-	}
-
-	fi, err := xl.ToFileInfo(bucket, object, "", inclFreeVers, allParts)
-	if err != nil {
-		return FileInfo{}, err
-	}
-
-	if !fi.IsValid() {
-		return FileInfo{}, errCorruptedFormat
-	}
-
-	versionID := fi.VersionID
-	if versionID == "" {
-		versionID = nullVersionID
-	}
-
-	fileInfo, err := xl.ToFileInfo(bucket, object, versionID, inclFreeVers, allParts)
-	if err != nil {
-		return FileInfo{}, err
-	}
-
-	if readData {
-		fileInfo.Data = xl.data.find(versionID)
-	}
-
-	return fileInfo, nil
+func fileInfoFromRaw(ri RawFileInfo, bucket, object string, readData, inclFreeVers bool) (FileInfo, error) {
+	return getFileInfo(ri.Buf, bucket, object, "", fileInfoOpts{
+		Data:             readData,
+		InclFreeVersions: inclFreeVers,
+	})
 }
 
 func readAllRawFileInfo(ctx context.Context, disks []StorageAPI, bucket, object string, readData bool) ([]RawFileInfo, []error) {
@@ -599,7 +590,7 @@ func readAllRawFileInfo(ctx context.Context, disks []StorageAPI, bucket, object 
 	return rawFileInfos, g.Wait()
 }
 
-func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, errs []error, bucket, object string, readData, inclFreeVers, allParts bool) ([]FileInfo, []error) {
+func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, errs []error, bucket, object string, readData, inclFreeVers bool) ([]FileInfo, []error) {
 	metadataArray := make([]*xlMetaV2, len(rawFileInfos))
 	metaFileInfos := make([]FileInfo, len(rawFileInfos))
 	metadataShallowVersions := make([][]xlMetaV2ShallowVersion, len(rawFileInfos))
@@ -636,7 +627,7 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 
 	readQuorum := (len(rawFileInfos) + 1) / 2
 	meta := &xlMetaV2{versions: mergeXLV2Versions(readQuorum, false, 1, metadataShallowVersions...)}
-	lfi, err := meta.ToFileInfo(bucket, object, "", inclFreeVers, allParts)
+	lfi, err := meta.ToFileInfo(bucket, object, "", inclFreeVers, true)
 	if err != nil {
 		for i := range errs {
 			if errs[i] == nil {
@@ -648,7 +639,7 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 	if !lfi.IsValid() {
 		for i := range errs {
 			if errs[i] == nil {
-				errs[i] = errCorruptedFormat
+				errs[i] = errFileCorrupt
 			}
 		}
 		return metaFileInfos, errs
@@ -665,7 +656,7 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 		}
 
 		// make sure to preserve this for diskmtime based healing bugfix.
-		metaFileInfos[index], errs[index] = metadataArray[index].ToFileInfo(bucket, object, versionID, inclFreeVers, allParts)
+		metaFileInfos[index], errs[index] = metadataArray[index].ToFileInfo(bucket, object, versionID, inclFreeVers, true)
 		if errs[index] != nil {
 			continue
 		}
@@ -710,9 +701,9 @@ func shouldCheckForDangling(err error, errs []error, bucket string) bool {
 	return false
 }
 
-func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, readData, inclFreeVers, allParts bool) ([]FileInfo, []error) {
+func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, readData, inclFreeVers bool) ([]FileInfo, []error) {
 	rawFileInfos, errs := readAllRawFileInfo(ctx, disks, bucket, object, readData)
-	return pickLatestQuorumFilesInfo(ctx, rawFileInfos, errs, bucket, object, readData, inclFreeVers, allParts)
+	return pickLatestQuorumFilesInfo(ctx, rawFileInfos, errs, bucket, object, readData, inclFreeVers)
 }
 
 func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object string, opts ObjectOptions, readData bool) (FileInfo, []FileInfo, []StorageAPI, error) {
@@ -727,8 +718,9 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	disks := er.getDisks()
 
 	ropts := ReadOptions{
-		ReadData: readData,
-		Healing:  false,
+		ReadData:         readData,
+		InclFreeVersions: opts.InclFreeVersions,
+		Healing:          false,
 	}
 
 	mrfCheck := make(chan FileInfo)
@@ -768,7 +760,7 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 					// Read the latest version
 					rfi, err = disk.ReadXL(ctx, bucket, object, readData)
 					if err == nil {
-						fi, err = fileInfoFromRaw(rfi, bucket, object, readData, opts.InclFreeVersions, true)
+						fi, err = fileInfoFromRaw(rfi, bucket, object, readData, opts.InclFreeVersions)
 					}
 				}
 
@@ -814,13 +806,13 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 		// additionally do not heal delete markers inline, let them be
 		// healed upon regular heal process.
 		if missingBlocks > 0 && missingBlocks < fi.Erasure.DataBlocks {
-			globalMRFState.addPartialOp(partialOperation{
-				bucket:    fi.Volume,
-				object:    fi.Name,
-				versionID: fi.VersionID,
-				queued:    time.Now(),
-				setIndex:  er.setIndex,
-				poolIndex: er.poolIndex,
+			globalMRFState.addPartialOp(PartialOperation{
+				Bucket:    fi.Volume,
+				Object:    fi.Name,
+				VersionID: fi.VersionID,
+				Queued:    time.Now(),
+				SetIndex:  er.setIndex,
+				PoolIndex: er.poolIndex,
 			})
 		}
 
@@ -878,6 +870,20 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 		if success {
 			validResp++
 		}
+
+		if totalResp >= minDisks && opts.FastGetObjInfo {
+			rw.Lock()
+			ok := countErrs(errs, errFileNotFound) >= minDisks || countErrs(errs, errFileVersionNotFound) >= minDisks
+			rw.Unlock()
+			if ok {
+				err = errFileNotFound
+				if opts.VersionID != "" {
+					err = errFileVersionNotFound
+				}
+				break
+			}
+		}
+
 		if totalResp < er.setDriveCount {
 			if !opts.FastGetObjInfo {
 				continue
@@ -888,14 +894,16 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 		}
 
 		rw.Lock()
+		// when its a versioned bucket and empty versionID - at totalResp == setDriveCount
+		// we must use rawFileInfo to resolve versions to figure out the latest version.
 		if opts.VersionID == "" && totalResp == er.setDriveCount {
 			fi, onlineMeta, onlineDisks, modTime, etag, err = calcQuorum(pickLatestQuorumFilesInfo(ctx,
-				rawArr, errs, bucket, object, readData, opts.InclFreeVersions, true))
+				rawArr, errs, bucket, object, readData, opts.InclFreeVersions))
 		} else {
 			fi, onlineMeta, onlineDisks, modTime, etag, err = calcQuorum(metaArr, errs)
 		}
 		rw.Unlock()
-		if err == nil && fi.InlineData() {
+		if err == nil && (fi.InlineData() || len(fi.Data) > 0) {
 			break
 		}
 	}
@@ -905,8 +913,12 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 		// not we simply ignore it, since we can't tell for sure if its dangling object.
 		if totalResp == er.setDriveCount && shouldCheckForDangling(err, errs, bucket) {
 			_, derr := er.deleteIfDangling(context.Background(), bucket, object, metaArr, errs, nil, opts)
-			if derr != nil {
-				err = derr
+			if derr == nil {
+				if opts.VersionID != "" {
+					err = errFileVersionNotFound
+				} else {
+					err = errFileNotFound
+				}
 			}
 		}
 		return fi, nil, nil, toObjectErr(err, bucket, object)
@@ -915,7 +927,7 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	if !fi.Deleted && len(fi.Erasure.Distribution) != len(onlineDisks) {
 		err := fmt.Errorf("unexpected file distribution (%v) from online disks (%v), looks like backend disks have been manually modified refusing to heal %s/%s(%s)",
 			fi.Erasure.Distribution, onlineDisks, bucket, object, opts.VersionID)
-		logger.LogOnceIf(ctx, err, "get-object-file-info-manually-modified")
+		storageLogOnceIf(ctx, err, "get-object-file-info-manually-modified")
 		return fi, nil, nil, toObjectErr(err, bucket, object, opts.VersionID)
 	}
 
@@ -992,7 +1004,7 @@ func (er erasureObjects) getObjectInfoAndQuorum(ctx context.Context, bucket, obj
 }
 
 // Similar to rename but renames data from srcEntry to dstEntry at dataDir
-func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry string, metadata []FileInfo, dstBucket, dstEntry string, writeQuorum int) ([]StorageAPI, bool, error) {
+func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry string, metadata []FileInfo, dstBucket, dstEntry string, writeQuorum int) ([]StorageAPI, []byte, string, error) {
 	g := errgroup.WithNErrs(len(disks))
 
 	fvID := mustGetUUID()
@@ -1000,7 +1012,8 @@ func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry str
 		metadata[index].SetTierFreeVersionID(fvID)
 	}
 
-	diskVersions := make([]uint64, len(disks))
+	diskVersions := make([][]byte, len(disks))
+	dataDirs := make([]string, len(disks))
 	// Rename file on all underlying storage disks.
 	for index := range disks {
 		index := index
@@ -1019,19 +1032,18 @@ func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry str
 			if !fi.IsValid() {
 				return errFileCorrupt
 			}
-			sign, err := disks[index].RenameData(ctx, srcBucket, srcEntry, fi, dstBucket, dstEntry, RenameOptions{})
+			resp, err := disks[index].RenameData(ctx, srcBucket, srcEntry, fi, dstBucket, dstEntry, RenameOptions{})
 			if err != nil {
 				return err
 			}
-			diskVersions[index] = sign
+			diskVersions[index] = resp.Sign
+			dataDirs[index] = resp.OldDataDir
 			return nil
 		}, index)
 	}
 
 	// Wait for all renames to finish.
 	errs := g.Wait()
-
-	var versionsDisparity bool
 
 	err := reduceWriteQuorumErrs(ctx, errs, objectOpIgnoredErrs, writeQuorum)
 	if err != nil {
@@ -1046,27 +1058,35 @@ func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry str
 			// caller this dangling object will be now scheduled to be removed
 			// via active healing.
 			dg.Go(func() error {
-				return disks[index].DeleteVersion(context.Background(), dstBucket, dstEntry, metadata[index], false, DeleteOptions{UndoWrite: true})
+				return disks[index].DeleteVersion(context.Background(), dstBucket, dstEntry, metadata[index], false, DeleteOptions{
+					UndoWrite:  true,
+					OldDataDir: dataDirs[index],
+				})
 			}, index)
 		}
 		dg.Wait()
 	}
+	var dataDir string
+	var versions []byte
 	if err == nil {
-		versions := reduceCommonVersions(diskVersions, writeQuorum)
+		versions = reduceCommonVersions(diskVersions, writeQuorum)
 		for index, dversions := range diskVersions {
 			if errs[index] != nil {
 				continue
 			}
-			if versions != dversions {
-				versionsDisparity = true
+			if !bytes.Equal(dversions, versions) {
+				if len(dversions) > len(versions) {
+					versions = dversions
+				}
 				break
 			}
 		}
+		dataDir = reduceCommonDataDir(dataDirs, writeQuorum)
 	}
 
 	// We can safely allow RenameData errors up to len(er.getDisks()) - writeQuorum
 	// otherwise return failure.
-	return evalDisks(disks, errs), versionsDisparity, err
+	return evalDisks(disks, errs), versions, dataDir, err
 }
 
 func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
@@ -1094,7 +1114,7 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 
 	// Validate input data size and it can never be less than zero.
 	if data.Size() < -1 {
-		logger.LogIf(ctx, errInvalidArgument, logger.ErrorKind)
+		bugLogIf(ctx, errInvalidArgument, logger.ErrorKind)
 		return ObjectInfo{}, toObjectErr(errInvalidArgument)
 	}
 
@@ -1124,8 +1144,8 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 	case size == 0:
 		buffer = make([]byte, 1) // Allocate at least a byte to reach EOF
 	case size >= fi.Erasure.BlockSize:
-		buffer = globalBytePoolCap.Get()
-		defer globalBytePoolCap.Put(buffer)
+		buffer = globalBytePoolCap.Load().Get()
+		defer globalBytePoolCap.Load().Put(buffer)
 	case size < fi.Erasure.BlockSize:
 		// No need to allocate fully blockSizeV1 buffer if the incoming data is smaller.
 		buffer = make([]byte, size, 2*size+int64(fi.Erasure.ParityBlocks+fi.Erasure.DataBlocks-1))
@@ -1135,7 +1155,6 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 		buffer = buffer[:fi.Erasure.BlockSize]
 	}
 
-	shardFileSize := erasure.ShardFileSize(data.Size())
 	writers := make([]io.Writer, len(onlineDisks))
 	inlineBuffers := make([]*bytes.Buffer, len(onlineDisks))
 	for i, disk := range onlineDisks {
@@ -1143,7 +1162,9 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 			continue
 		}
 		if disk.IsOnline() {
-			inlineBuffers[i] = bytes.NewBuffer(make([]byte, 0, shardFileSize))
+			buf := grid.GetByteBufferCap(int(erasure.ShardFileSize(data.Size())) + 64)
+			inlineBuffers[i] = bytes.NewBuffer(buf[:0])
+			defer grid.PutByteBuffer(buf)
 			writers[i] = newStreamingBitrotWriterBuffer(inlineBuffers[i], DefaultBitrotAlgorithm, erasure.ShardSize())
 		}
 	}
@@ -1214,47 +1235,11 @@ func (er erasureObjects) PutObject(ctx context.Context, bucket string, object st
 	return er.putObject(ctx, bucket, object, data, opts)
 }
 
-// Heal up to two versions of one object when there is disparity between disks
-func healObjectVersionsDisparity(bucket string, entry metaCacheEntry, scanMode madmin.HealScanMode) error {
-	if entry.isDir() {
-		return nil
-	}
-	// We might land at .metacache, .trash, .multipart
-	// no need to heal them skip, only when bucket
-	// is '.minio.sys'
-	if bucket == minioMetaBucket {
-		if wildcard.Match("buckets/*/.metacache/*", entry.name) {
-			return nil
-		}
-		if wildcard.Match("tmp/*", entry.name) {
-			return nil
-		}
-		if wildcard.Match("multipart/*", entry.name) {
-			return nil
-		}
-		if wildcard.Match("tmp-old/*", entry.name) {
-			return nil
-		}
-	}
-
-	fivs, err := entry.fileInfoVersions(bucket)
-	if err != nil {
-		healObject(bucket, entry.name, "", madmin.HealDeepScan)
-		return err
-	}
-
-	if len(fivs.Versions) <= 2 {
-		for _, version := range fivs.Versions {
-			healObject(bucket, entry.name, version.VersionID, scanMode)
-		}
-	}
-
-	return nil
-}
-
 // putObject wrapper for erasureObjects PutObject
 func (er erasureObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	auditObjectErasureSet(ctx, object, &er)
+	if !opts.NoAuditLog {
+		auditObjectErasureSet(ctx, "PutObject", object, &er)
+	}
 
 	data := r.Reader
 
@@ -1281,7 +1266,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 
 	// Validate input data size and it can never be less than -1.
 	if data.Size() < -1 {
-		logger.LogIf(ctx, errInvalidArgument, logger.ErrorKind)
+		bugLogIf(ctx, errInvalidArgument, logger.ErrorKind)
 		return ObjectInfo{}, toObjectErr(errInvalidArgument)
 	}
 
@@ -1289,25 +1274,21 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 
 	storageDisks := er.getDisks()
 
-	parityDrives := len(storageDisks) / 2
-	if !opts.MaxParity {
-		// Get parity and data drive count based on storage class metadata
-		parityDrives = globalStorageClass.GetParityForSC(userDefined[xhttp.AmzStorageClass])
-		if parityDrives < 0 {
-			parityDrives = er.defaultParityCount
-		}
-
+	// Get parity and data drive count based on storage class metadata
+	parityDrives := globalStorageClass.GetParityForSC(userDefined[xhttp.AmzStorageClass])
+	if parityDrives < 0 {
+		parityDrives = er.defaultParityCount
+	}
+	if opts.MaxParity {
+		parityDrives = len(storageDisks) / 2
+	}
+	if !opts.MaxParity && globalStorageClass.AvailabilityOptimized() {
 		// If we have offline disks upgrade the number of erasure codes for this object.
 		parityOrig := parityDrives
 
 		var offlineDrives int
 		for _, disk := range storageDisks {
-			if disk == nil {
-				parityDrives++
-				offlineDrives++
-				continue
-			}
-			if !disk.IsOnline() {
+			if disk == nil || !disk.IsOnline() {
 				parityDrives++
 				offlineDrives++
 				continue
@@ -1352,6 +1333,12 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	if opts.EncryptFn != nil {
 		fi.Checksum = opts.EncryptFn("object-checksum", fi.Checksum)
 	}
+	if userDefined[ReplicationSsecChecksumHeader] != "" {
+		if v, err := base64.StdEncoding.DecodeString(userDefined[ReplicationSsecChecksumHeader]); err == nil {
+			fi.Checksum = v
+		}
+	}
+	delete(userDefined, ReplicationSsecChecksumHeader)
 	uniqueID := mustGetUUID()
 	tempObj := uniqueID
 
@@ -1375,8 +1362,8 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	case size == 0:
 		buffer = make([]byte, 1) // Allocate at least a byte to reach EOF
 	case size >= fi.Erasure.BlockSize || size == -1:
-		buffer = globalBytePoolCap.Get()
-		defer globalBytePoolCap.Put(buffer)
+		buffer = globalBytePoolCap.Load().Get()
+		defer globalBytePoolCap.Load().Put(buffer)
 	case size < fi.Erasure.BlockSize:
 		// No need to allocate fully blockSizeV1 buffer if the incoming data is smaller.
 		buffer = make([]byte, size, 2*size+int64(fi.Erasure.ParityBlocks+fi.Erasure.DataBlocks-1))
@@ -1392,20 +1379,25 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	defer er.deleteAll(context.Background(), minioMetaTmpBucket, tempObj)
 
 	shardFileSize := erasure.ShardFileSize(data.Size())
+	inlineBlock := globalStorageClass.InlineBlock()
+	if inlineBlock <= 0 {
+		inlineBlock = 128 * humanize.KiByte
+	}
+
 	writers := make([]io.Writer, len(onlineDisks))
 	var inlineBuffers []*bytes.Buffer
 	if shardFileSize >= 0 {
-		if !opts.Versioned && shardFileSize < smallFileThreshold {
+		if !opts.Versioned && shardFileSize <= inlineBlock {
 			inlineBuffers = make([]*bytes.Buffer, len(onlineDisks))
-		} else if shardFileSize < smallFileThreshold/8 {
+		} else if shardFileSize < inlineBlock/8 {
 			inlineBuffers = make([]*bytes.Buffer, len(onlineDisks))
 		}
 	} else {
 		// If compressed, use actual size to determine.
 		if sz := erasure.ShardFileSize(data.ActualSize()); sz > 0 {
-			if !opts.Versioned && sz < smallFileThreshold {
+			if !opts.Versioned && sz <= inlineBlock {
 				inlineBuffers = make([]*bytes.Buffer, len(onlineDisks))
-			} else if sz < smallFileThreshold/8 {
+			} else if sz < inlineBlock/8 {
 				inlineBuffers = make([]*bytes.Buffer, len(onlineDisks))
 			}
 		}
@@ -1420,11 +1412,9 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		}
 
 		if len(inlineBuffers) > 0 {
-			sz := shardFileSize
-			if sz < 0 {
-				sz = data.ActualSize()
-			}
-			inlineBuffers[i] = bytes.NewBuffer(make([]byte, 0, sz))
+			buf := grid.GetByteBufferCap(int(shardFileSize) + 64)
+			inlineBuffers[i] = bytes.NewBuffer(buf[:0])
+			defer grid.PutByteBuffer(buf)
 			writers[i] = newStreamingBitrotWriterBuffer(inlineBuffers[i], DefaultBitrotAlgorithm, erasure.ShardSize())
 			continue
 		}
@@ -1433,18 +1423,19 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	}
 
 	toEncode := io.Reader(data)
-	if data.Size() > bigFileThreshold {
+	if data.Size() >= bigFileThreshold {
 		// We use 2 buffers, so we always have a full buffer of input.
-		bufA := globalBytePoolCap.Get()
-		bufB := globalBytePoolCap.Get()
-		defer globalBytePoolCap.Put(bufA)
-		defer globalBytePoolCap.Put(bufB)
+		pool := globalBytePoolCap.Load()
+		bufA := pool.Get()
+		bufB := pool.Get()
+		defer pool.Put(bufA)
+		defer pool.Put(bufB)
 		ra, err := readahead.NewReaderBuffer(data, [][]byte{bufA[:fi.Erasure.BlockSize], bufB[:fi.Erasure.BlockSize]})
 		if err == nil {
 			toEncode = ra
 			defer ra.Close()
 		}
-		logger.LogIf(ctx, err)
+		bugLogIf(ctx, err)
 	}
 	n, erasureErr := erasure.Encode(ctx, toEncode, writers, buffer, writeQuorum)
 	closeBitrotWriters(writers)
@@ -1530,11 +1521,20 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	}
 
 	// Rename the successfully written temporary object to final location.
-	onlineDisks, versionsDisparity, err := renameData(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, bucket, object, writeQuorum)
+	onlineDisks, versions, oldDataDir, err := renameData(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, bucket, object, writeQuorum)
 	if err != nil {
 		if errors.Is(err, errFileNotFound) {
-			return ObjectInfo{}, toObjectErr(errErasureWriteQuorum, bucket, object)
+			// An in-quorum errFileNotFound means that client stream
+			// prematurely closed and we do not find any xl.meta or
+			// part.1's - in such a scenario we must return as if client
+			// disconnected. This means that erasure.Encode() CreateFile()
+			// did not do anything.
+			return ObjectInfo{}, IncompleteBody{Bucket: bucket, Object: object}
 		}
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	if err = er.commitRenameDataDir(ctx, bucket, object, oldDataDir, onlineDisks, writeQuorum); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
@@ -1552,7 +1552,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		// When there is versions disparity we are healing
 		// the content implicitly for all versions, we can
 		// avoid triggering another MRF heal for offline drives.
-		if !versionsDisparity {
+		if len(versions) == 0 {
 			// Whether a disk was initially or becomes offline
 			// during this upload, send it to the MRF list.
 			for i := 0; i < len(onlineDisks); i++ {
@@ -1564,13 +1564,13 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 				break
 			}
 		} else {
-			globalMRFState.addPartialOp(partialOperation{
-				bucket:      bucket,
-				object:      object,
-				queued:      time.Now(),
-				allVersions: true,
-				setIndex:    er.setIndex,
-				poolIndex:   er.poolIndex,
+			globalMRFState.addPartialOp(PartialOperation{
+				Bucket:    bucket,
+				Object:    object,
+				Queued:    time.Now(),
+				Versions:  versions,
+				SetIndex:  er.setIndex,
+				PoolIndex: er.poolIndex,
 			})
 		}
 	}
@@ -1611,8 +1611,10 @@ func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object
 // into smaller bulks if some object names are found to be duplicated in the delete list, splitting
 // into smaller bulks will avoid holding twice the write lock of the duplicated object names.
 func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
-	for _, obj := range objects {
-		auditObjectErasureSet(ctx, obj.ObjectV.ObjectName, &er)
+	if !opts.NoAuditLog {
+		for _, obj := range objects {
+			auditObjectErasureSet(ctx, "DeleteObjects", obj.ObjectV.ObjectName, &er)
+		}
 	}
 
 	errs := make([]error, len(objects))
@@ -1778,48 +1780,60 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 	return dobjects, errs
 }
 
+func (er erasureObjects) commitRenameDataDir(ctx context.Context, bucket, object, dataDir string, onlineDisks []StorageAPI, writeQuorum int) error {
+	if dataDir == "" {
+		return nil
+	}
+	g := errgroup.WithNErrs(len(onlineDisks))
+	for index := range onlineDisks {
+		index := index
+		g.Go(func() error {
+			if onlineDisks[index] == nil {
+				return nil
+			}
+			return onlineDisks[index].Delete(ctx, bucket, pathJoin(object, dataDir), DeleteOptions{
+				Recursive: true,
+			})
+		}, index)
+	}
+
+	return reduceWriteQuorumErrs(ctx, g.Wait(), objectOpIgnoredErrs, writeQuorum)
+}
+
 func (er erasureObjects) deletePrefix(ctx context.Context, bucket, prefix string) error {
 	disks := er.getDisks()
+	// Assume (N/2 + 1) quorum for Delete()
+	// this is a theoretical assumption such that
+	// for delete's we do not need to honor storage
+	// class for objects that have reduced quorum
+	// due to storage class - this only needs to be honored
+	// for Read() requests alone that we already do.
+	writeQuorum := len(disks)/2 + 1
+
 	g := errgroup.WithNErrs(len(disks))
-	dirPrefix := encodeDirObject(prefix)
 	for index := range disks {
 		index := index
 		g.Go(func() error {
 			if disks[index] == nil {
 				return nil
 			}
-			// Deletes
-			// - The prefix and its children
-			// - The prefix__XLDIR__
-			defer disks[index].Delete(ctx, bucket, dirPrefix, DeleteOptions{
-				Recursive: true,
-				Immediate: true,
-			})
 			return disks[index].Delete(ctx, bucket, prefix, DeleteOptions{
 				Recursive: true,
 				Immediate: true,
 			})
 		}, index)
 	}
-	for _, err := range g.Wait() {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+
+	// return errors if any during deletion
+	return reduceWriteQuorumErrs(ctx, g.Wait(), objectOpIgnoredErrs, writeQuorum)
 }
 
 // DeleteObject - deletes an object, this call doesn't necessary reply
 // any error as it is not necessary for the handler to reply back a
 // response to the client request.
 func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	auditObjectErasureSet(ctx, object, &er)
-
-	if opts.DeletePrefix {
-		if globalCacheConfig.Enabled() {
-			return ObjectInfo{}, toObjectErr(errMethodNotAllowed, bucket, object)
-		}
-		return ObjectInfo{}, toObjectErr(er.deletePrefix(ctx, bucket, object), bucket, object)
+	if !opts.NoAuditLog {
+		auditObjectErasureSet(ctx, "DeleteObject", object, &er)
 	}
 
 	var lc *lifecycle.Lifecycle
@@ -1827,9 +1841,18 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	var replcfg *replication.Config
 	if opts.Expiration.Expire {
 		// Check if the current bucket has a configured lifecycle policy
-		lc, _ = globalLifecycleSys.Get(bucket)
-		rcfg, _ = globalBucketObjectLockSys.Get(bucket)
-		replcfg, _ = getReplicationConfig(ctx, bucket)
+		lc, err = globalLifecycleSys.Get(bucket)
+		if err != nil && !errors.Is(err, BucketLifecycleNotFound{Bucket: bucket}) {
+			return objInfo, err
+		}
+		rcfg, err = globalBucketObjectLockSys.Get(bucket)
+		if err != nil {
+			return objInfo, err
+		}
+		replcfg, err = getReplicationConfig(ctx, bucket)
+		if err != nil {
+			return objInfo, err
+		}
 	}
 
 	// expiration attempted on a bucket with no lifecycle
@@ -1848,23 +1871,79 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
+	if opts.DeletePrefix {
+		if opts.Expiration.Expire {
+			// Expire all versions expiration must still verify the state() on disk
+			// via a getObjectInfo() call as follows, any read quorum issues we
+			// must not proceed further for safety reasons. attempt a MRF heal
+			// while we see such quorum errors.
+			goi, _, gerr := er.getObjectInfoAndQuorum(ctx, bucket, object, opts)
+			if gerr != nil && goi.Name == "" {
+				if _, ok := gerr.(InsufficientReadQuorum); ok {
+					// Add an MRF heal for next time.
+					er.addPartial(bucket, object, opts.VersionID)
+
+					return objInfo, InsufficientWriteQuorum{}
+				}
+				return objInfo, gerr
+			}
+
+			// Add protection and re-verify the ILM rules for qualification
+			// based on the latest objectInfo and see if the object still
+			// qualifies for deletion.
+			if gerr == nil {
+				var isErr bool
+				evt := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, goi)
+				switch evt.Action {
+				case lifecycle.DeleteAllVersionsAction, lifecycle.DelMarkerDeleteAllVersionsAction:
+					// opts.DeletePrefix is used only in the above lifecycle Expiration actions.
+				default:
+					// object has been modified since lifecycle action was previously evaluated
+					isErr = true
+				}
+				if isErr {
+					if goi.VersionID != "" {
+						return goi, VersionNotFound{
+							Bucket:    bucket,
+							Object:    object,
+							VersionID: goi.VersionID,
+						}
+					}
+					return goi, ObjectNotFound{
+						Bucket: bucket,
+						Object: object,
+					}
+				}
+			}
+		} // Delete marker and any latest that qualifies shall be expired permanently.
+
+		return ObjectInfo{}, toObjectErr(er.deletePrefix(ctx, bucket, object), bucket, object)
+	}
+
 	storageDisks := er.getDisks()
 	versionFound := true
 	objInfo = ObjectInfo{VersionID: opts.VersionID} // version id needed in Delete API response.
 	goi, _, gerr := er.getObjectInfoAndQuorum(ctx, bucket, object, opts)
+	tryDel := false
 	if gerr != nil && goi.Name == "" {
 		if _, ok := gerr.(InsufficientReadQuorum); ok {
-			return objInfo, InsufficientWriteQuorum{}
+			if opts.Versioned || opts.VersionSuspended || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
+				// Add an MRF heal for next time.
+				er.addPartial(bucket, object, opts.VersionID)
+				return objInfo, InsufficientWriteQuorum{}
+			}
+			tryDel = true // only for unversioned objects if there is write quorum
 		}
 		// For delete marker replication, versionID being replicated will not exist on disk
 		if opts.DeleteMarker {
 			versionFound = false
-		} else {
+		} else if !tryDel {
 			return objInfo, gerr
 		}
 	}
+
 	if opts.EvalMetadataFn != nil {
-		dsc, err := opts.EvalMetadataFn(&goi, err)
+		dsc, err := opts.EvalMetadataFn(&goi, gerr)
 		if err != nil {
 			return ObjectInfo{}, err
 		}
@@ -2020,11 +2099,11 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 // Send the successful but partial upload/delete, however ignore
 // if the channel is blocked by other items.
 func (er erasureObjects) addPartial(bucket, object, versionID string) {
-	globalMRFState.addPartialOp(partialOperation{
-		bucket:    bucket,
-		object:    object,
-		versionID: versionID,
-		queued:    time.Now(),
+	globalMRFState.addPartialOp(PartialOperation{
+		Bucket:    bucket,
+		Object:    object,
+		VersionID: versionID,
+		Queued:    time.Now(),
 	})
 }
 
@@ -2049,15 +2128,19 @@ func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object s
 	if opts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, disks, "", bucket, object, opts.VersionID, false, false)
 	} else {
-		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false, true)
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false)
 	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
 	if err != nil {
 		if errors.Is(err, errErasureReadQuorum) && !strings.HasPrefix(bucket, minioMetaBucket) {
 			_, derr := er.deleteIfDangling(context.Background(), bucket, object, metaArr, errs, nil, opts)
-			if derr != nil {
-				err = derr
+			if derr == nil {
+				if opts.VersionID != "" {
+					err = errFileVersionNotFound
+				} else {
+					err = errFileNotFound
+				}
 			}
 		}
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
@@ -2122,15 +2205,19 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 	if opts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, disks, "", bucket, object, opts.VersionID, false, false)
 	} else {
-		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false, true)
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false)
 	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
 	if err != nil {
 		if errors.Is(err, errErasureReadQuorum) && !strings.HasPrefix(bucket, minioMetaBucket) {
 			_, derr := er.deleteIfDangling(context.Background(), bucket, object, metaArr, errs, nil, opts)
-			if derr != nil {
-				err = derr
+			if derr == nil {
+				if opts.VersionID != "" {
+					err = errFileVersionNotFound
+				} else {
+					err = errFileNotFound
+				}
 			}
 		}
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
@@ -2213,7 +2300,7 @@ func (er erasureObjects) GetObjectTags(ctx context.Context, bucket, object strin
 
 // TransitionObject - transition object content to target tier.
 func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
-	tgtClient, err := globalTierConfigMgr.getDriver(opts.Transition.Tier)
+	tgtClient, err := globalTierConfigMgr.getDriver(ctx, opts.Transition.Tier)
 	if err != nil {
 		return err
 	}
@@ -2333,7 +2420,7 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 	}, ObjectOptions{
 		VersionID: oi.VersionID,
 	}); err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
+		storageLogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
 		return err
 	}
 	return nil

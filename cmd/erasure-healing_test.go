@@ -49,7 +49,7 @@ func TestIsObjectDangling(t *testing.T) {
 		name             string
 		metaArr          []FileInfo
 		errs             []error
-		dataErrs         []error
+		dataErrs         map[int][]int
 		expectedMeta     FileInfo
 		expectedDangling bool
 	}{
@@ -165,11 +165,8 @@ func TestIsObjectDangling(t *testing.T) {
 				nil,
 				nil,
 			},
-			dataErrs: []error{
-				errFileCorrupt,
-				errFileNotFound,
-				nil,
-				errFileCorrupt,
+			dataErrs: map[int][]int{
+				0: {checkPartFileCorrupt, checkPartFileNotFound, checkPartSuccess, checkPartFileCorrupt},
 			},
 			expectedMeta:     fi,
 			expectedDangling: false,
@@ -188,11 +185,8 @@ func TestIsObjectDangling(t *testing.T) {
 				errFileNotFound,
 				nil,
 			},
-			dataErrs: []error{
-				errFileNotFound,
-				errFileCorrupt,
-				nil,
-				nil,
+			dataErrs: map[int][]int{
+				0: {checkPartFileNotFound, checkPartFileCorrupt, checkPartSuccess, checkPartSuccess},
 			},
 			expectedMeta:     fi,
 			expectedDangling: false,
@@ -247,15 +241,58 @@ func TestIsObjectDangling(t *testing.T) {
 				nil,
 				nil,
 			},
-			dataErrs: []error{
-				errFileNotFound,
-				errFileNotFound,
-				nil,
-				errFileNotFound,
+			dataErrs: map[int][]int{
+				0: {checkPartFileNotFound, checkPartFileNotFound, checkPartSuccess, checkPartFileNotFound},
 			},
 			expectedMeta:     fi,
 			expectedDangling: true,
 		},
+		{
+			name: "FileInfoDecided-case4-(missing data-dir for part 2)",
+			metaArr: []FileInfo{
+				{},
+				{},
+				{},
+				fi,
+			},
+			errs: []error{
+				errFileNotFound,
+				errFileNotFound,
+				nil,
+				nil,
+			},
+			dataErrs: map[int][]int{
+				0: {checkPartSuccess, checkPartSuccess, checkPartSuccess, checkPartSuccess},
+				1: {checkPartSuccess, checkPartFileNotFound, checkPartFileNotFound, checkPartFileNotFound},
+			},
+			expectedMeta:     fi,
+			expectedDangling: true,
+		},
+
+		{
+			name: "FileInfoDecided-case4-(enough data-dir existing for each part)",
+			metaArr: []FileInfo{
+				{},
+				{},
+				{},
+				fi,
+			},
+			errs: []error{
+				errFileNotFound,
+				errFileNotFound,
+				nil,
+				nil,
+			},
+			dataErrs: map[int][]int{
+				0: {checkPartFileNotFound, checkPartSuccess, checkPartSuccess, checkPartSuccess},
+				1: {checkPartSuccess, checkPartFileNotFound, checkPartSuccess, checkPartSuccess},
+				2: {checkPartSuccess, checkPartSuccess, checkPartFileNotFound, checkPartSuccess},
+				3: {checkPartSuccess, checkPartSuccess, checkPartSuccess, checkPartFileNotFound},
+			},
+			expectedMeta:     fi,
+			expectedDangling: false,
+		},
+
 		// Add new cases as seen
 	}
 	for _, testCase := range testCases {
@@ -634,7 +671,7 @@ func TestHealingDanglingObject(t *testing.T) {
 	defer removeRoots(fsDirs)
 
 	// Everything is fine, should return nil
-	objLayer, disks, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
+	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,7 +687,7 @@ func TestHealingDanglingObject(t *testing.T) {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
 
-	disks = objLayer.(*erasureServerPools).serverPools[0].erasureDisks[0]
+	disks := objLayer.(*erasureServerPools).serverPools[0].erasureDisks[0]
 	orgDisks := append([]StorageAPI{}, disks...)
 
 	// Enable versioning.
@@ -1497,7 +1534,13 @@ func TestHealObjectErasure(t *testing.T) {
 	er.getDisks = func() []StorageAPI {
 		// Nil more than half the disks, to remove write quorum.
 		for i := 0; i <= len(erasureDisks)/2; i++ {
-			erasureDisks[i] = nil
+			err := erasureDisks[i].Delete(context.Background(), bucket, object, DeleteOptions{
+				Recursive: true,
+				Immediate: false,
+			})
+			if err != nil {
+				t.Fatalf("Failed to delete a file - %v", err)
+			}
 		}
 		return erasureDisks
 	}

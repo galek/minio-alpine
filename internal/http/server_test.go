@@ -24,7 +24,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/minio/pkg/v2/certs"
+	"github.com/minio/pkg/v3/certs"
 )
 
 func TestNewServer(t *testing.T) {
@@ -48,8 +48,7 @@ func TestNewServer(t *testing.T) {
 
 	for i, testCase := range testCases {
 		server := NewServer(testCase.addrs).
-			UseHandler(testCase.handler).
-			UseShutdownTimeout(DefaultShutdownTimeout)
+			UseHandler(testCase.handler)
 		if testCase.certFn != nil {
 			server = server.UseTLSConfig(&tls.Config{
 				PreferServerCipherSuites: true,
@@ -58,16 +57,9 @@ func TestNewServer(t *testing.T) {
 		}
 		if server == nil {
 			t.Fatalf("Case %v: server: expected: <non-nil>, got: <nil>", (i + 1))
-		}
-
-		if !reflect.DeepEqual(server.Addrs, testCase.addrs) {
+		} else if !reflect.DeepEqual(server.Addrs, testCase.addrs) {
 			t.Fatalf("Case %v: server.Addrs: expected: %v, got: %v", (i + 1), testCase.addrs, server.Addrs)
 		}
-
-		// Interfaces are not comparable even with reflection.
-		// if !reflect.DeepEqual(server.Handler, testCase.handler) {
-		// 	t.Fatalf("Case %v: server.Handler: expected: %v, got: %v", (i + 1), testCase.handler, server.Handler)
-		// }
 
 		if testCase.certFn == nil {
 			if server.TLSConfig != nil {
@@ -77,10 +69,6 @@ func TestNewServer(t *testing.T) {
 			if server.TLSConfig == nil {
 				t.Fatalf("Case %v: server.TLSConfig: expected: <non-nil>, got: <nil>", (i + 1))
 			}
-		}
-
-		if server.ShutdownTimeout != DefaultShutdownTimeout {
-			t.Fatalf("Case %v: server.ShutdownTimeout: expected: %v, got: %v", (i + 1), DefaultShutdownTimeout, server.ShutdownTimeout)
 		}
 
 		if server.MaxHeaderBytes != DefaultMaxHeaderBytes {

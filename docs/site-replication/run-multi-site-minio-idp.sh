@@ -59,8 +59,6 @@ site3_pid1=$!
 minio server --config-dir /tmp/minio-internal --address ":9030" http://localhost:9003/tmp/minio-internal-idp3/{1...4} http://localhost:9030/tmp/minio-internal-idp3/{5...8} >/tmp/minio3_2.log 2>&1 &
 site3_pid2=$!
 
-sleep 10
-
 export MC_HOST_minio1=http://minio:minio123@localhost:9001
 export MC_HOST_minio2=http://minio:minio123@localhost:9002
 export MC_HOST_minio3=http://minio:minio123@localhost:9003
@@ -68,6 +66,13 @@ export MC_HOST_minio3=http://minio:minio123@localhost:9003
 export MC_HOST_minio10=http://minio:minio123@localhost:9010
 export MC_HOST_minio20=http://minio:minio123@localhost:9020
 export MC_HOST_minio30=http://minio:minio123@localhost:9030
+
+./mc ready minio1
+./mc ready minio2
+./mc ready minio3
+./mc ready minio10
+./mc ready minio20
+./mc ready minio30
 
 ./mc admin replicate add minio1 minio2
 
@@ -164,7 +169,20 @@ if [ $? -ne 0 ]; then
 	exit_1
 fi
 
+./mc admin user svcacct add minio2 minio --access-key testsvc2 --secret-key testsvc123
+if [ $? -ne 0 ]; then
+	echo "adding root svc account testsvc2 failed, exiting.."
+	exit_1
+fi
+
 sleep 10
+
+export MC_HOST_rootsvc=http://testsvc2:testsvc123@localhost:9002
+./mc ls rootsvc
+if [ $? -ne 0 ]; then
+	echo "root service account not inherited root permissions, exiting.."
+	exit_1
+fi
 
 ./mc admin user svcacct info minio1 testsvc
 if [ $? -ne 0 ]; then

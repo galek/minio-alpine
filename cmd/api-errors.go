@@ -28,7 +28,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/minio/minio/internal/ioutil"
 	"google.golang.org/api/googleapi"
 
@@ -48,7 +48,7 @@ import (
 	levent "github.com/minio/minio/internal/config/lambda/event"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/hash"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // APIError structure
@@ -56,19 +56,23 @@ type APIError struct {
 	Code           string
 	Description    string
 	HTTPStatusCode int
+	ObjectSize     string
+	RangeRequested string
 }
 
 // APIErrorResponse - error response format
 type APIErrorResponse struct {
-	XMLName    xml.Name `xml:"Error" json:"-"`
-	Code       string
-	Message    string
-	Key        string `xml:"Key,omitempty" json:"Key,omitempty"`
-	BucketName string `xml:"BucketName,omitempty" json:"BucketName,omitempty"`
-	Resource   string
-	Region     string `xml:"Region,omitempty" json:"Region,omitempty"`
-	RequestID  string `xml:"RequestId" json:"RequestId"`
-	HostID     string `xml:"HostId" json:"HostId"`
+	XMLName          xml.Name `xml:"Error" json:"-"`
+	Code             string
+	Message          string
+	Key              string `xml:"Key,omitempty" json:"Key,omitempty"`
+	BucketName       string `xml:"BucketName,omitempty" json:"BucketName,omitempty"`
+	Resource         string
+	Region           string `xml:"Region,omitempty" json:"Region,omitempty"`
+	RequestID        string `xml:"RequestId" json:"RequestId"`
+	HostID           string `xml:"HostId" json:"HostId"`
+	ActualObjectSize string `xml:"ActualObjectSize,omitempty" json:"ActualObjectSize,omitempty"`
+	RangeRequested   string `xml:"RangeRequested,omitempty" json:"RangeRequested,omitempty"`
 }
 
 // APIErrorCode type of error status.
@@ -263,6 +267,7 @@ const (
 	ErrInvalidResourceName
 	ErrInvalidLifecycleQueryParameter
 	ErrServerNotInitialized
+	ErrBucketMetadataNotInitialized
 	ErrRequestTimedout
 	ErrClientDisconnected
 	ErrTooManyRequests
@@ -278,9 +283,11 @@ const (
 	ErrMalformedJSON
 	ErrAdminNoSuchUser
 	ErrAdminNoSuchUserLDAPWarn
+	ErrAdminLDAPExpectedLoginName
 	ErrAdminNoSuchGroup
 	ErrAdminGroupNotEmpty
 	ErrAdminGroupDisabled
+	ErrAdminInvalidGroupName
 	ErrAdminNoSuchJob
 	ErrAdminNoSuchPolicy
 	ErrAdminPolicyChangeAlreadyApplied
@@ -300,6 +307,7 @@ const (
 	ErrAdminConfigIDPCfgNameDoesNotExist
 	ErrInsecureClientRequest
 	ErrObjectTampered
+	ErrAdminLDAPNotEnabled
 
 	// Site-Replication errors
 	ErrSiteReplicationInvalidRequest
@@ -418,6 +426,7 @@ const (
 	ErrAdminProfilerNotEnabled
 	ErrInvalidDecompressedSize
 	ErrAddUserInvalidArgument
+	ErrAddUserValidUTF
 	ErrAdminResourceInvalidArgument
 	ErrAdminAccountNotEligible
 	ErrAccountNotEligible
@@ -436,6 +445,8 @@ const (
 	ErrAdminNoAccessKey
 	ErrAdminNoSecretKey
 
+	ErrIAMNotInitialized
+
 	apiErrCodeEnd // This is used only for the testing code
 )
 
@@ -449,9 +460,9 @@ func (e errorCodeMap) ToAPIErrWithErr(errCode APIErrorCode, err error) APIError 
 	if err != nil {
 		apiErr.Description = fmt.Sprintf("%s (%s)", apiErr.Description, err)
 	}
-	if globalSite.Region != "" {
+	if region := globalSite.Region(); region != "" {
 		if errCode == ErrAuthorizationHeaderMalformed {
-			apiErr.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalSite.Region)
+			apiErr.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", region)
 			return apiErr
 		}
 	}
@@ -958,7 +969,7 @@ var errorCodes = errorCodeMap{
 	ErrReplicationRemoteConnectionError: {
 		Code:           "XMinioAdminReplicationRemoteConnectionError",
 		Description:    "Remote service connection error",
-		HTTPStatusCode: http.StatusNotFound,
+		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrReplicationBandwidthLimitError: {
 		Code:           "XMinioAdminReplicationBandwidthLimitError",
@@ -1293,7 +1304,17 @@ var errorCodes = errorCodeMap{
 	},
 	ErrServerNotInitialized: {
 		Code:           "XMinioServerNotInitialized",
-		Description:    "Server not initialized, please try again.",
+		Description:    "Server not initialized yet, please try again.",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrIAMNotInitialized: {
+		Code:           "XMinioIAMNotInitialized",
+		Description:    "IAM sub-system not initialized yet, please try again.",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrBucketMetadataNotInitialized: {
+		Code:           "XMinioBucketMetadataNotInitialized",
+		Description:    "Bucket metadata not initialized yet, please try again.",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrMalformedJSON: {
@@ -1465,8 +1486,8 @@ var errorCodes = errorCodeMap{
 	},
 	ErrTooManyRequests: {
 		Code:           "TooManyRequests",
-		Description:    "Deadline exceeded while waiting in incoming queue, please reduce your request rate",
-		HTTPStatusCode: http.StatusServiceUnavailable,
+		Description:    "Please reduce your request rate",
+		HTTPStatusCode: http.StatusTooManyRequests,
 	},
 	ErrUnsupportedMetadata: {
 		Code:           "InvalidArgument",
@@ -2079,7 +2100,26 @@ var errorCodes = errorCodeMap{
 		Description:    "Invalid attribute name specified.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
-	// Add your error structure here.
+	ErrAdminLDAPNotEnabled: {
+		Code:           "XMinioLDAPNotEnabled",
+		Description:    "LDAP is not enabled. LDAP must be enabled to make LDAP requests.",
+		HTTPStatusCode: http.StatusNotImplemented,
+	},
+	ErrAdminLDAPExpectedLoginName: {
+		Code:           "XMinioLDAPExpectedLoginName",
+		Description:    "Expected LDAP short username but was given full DN.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAdminInvalidGroupName: {
+		Code:           "XMinioInvalidGroupName",
+		Description:    "The group name is invalid.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAddUserValidUTF: {
+		Code:           "XMinioInvalidUTF",
+		Description:    "Invalid UTF-8 character detected.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 }
 
 // toAPIErrorCode - Converts embedded errors. Convenience
@@ -2119,6 +2159,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrAdminNoSuchGroup
 	case errGroupNotEmpty:
 		apiErr = ErrAdminGroupNotEmpty
+	case errGroupNameContainsReservedChars:
+		apiErr = ErrAdminInvalidGroupName
 	case errNoSuchJob:
 		apiErr = ErrAdminNoSuchJob
 	case errNoPolicyToAttachOrDetach:
@@ -2133,6 +2175,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrEntityTooSmall
 	case errAuthentication:
 		apiErr = ErrAccessDenied
+	case auth.ErrContainsReservedChars:
+		apiErr = ErrAdminInvalidAccessKey
 	case auth.ErrInvalidAccessKeyLength:
 		apiErr = ErrAdminInvalidAccessKey
 	case auth.ErrInvalidSecretKeyLength:
@@ -2200,6 +2244,10 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrInvalidMaxParts
 	case ioutil.ErrOverread:
 		apiErr = ErrExcessData
+	case errServerNotInitialized:
+		apiErr = ErrServerNotInitialized
+	case errBucketMetadataNotInitialized:
+		apiErr = ErrBucketMetadataNotInitialized
 	}
 
 	// Compression errors
@@ -2391,10 +2439,9 @@ func toAPIError(ctx context.Context, err error) APIError {
 	apiErr := errorCodes.ToAPIErr(toAPIErrorCode(ctx, err))
 	switch apiErr.Code {
 	case "NotImplemented":
-		desc := fmt.Sprintf("%s (%v)", apiErr.Description, err)
 		apiErr = APIError{
 			Code:           apiErr.Code,
-			Description:    desc,
+			Description:    fmt.Sprintf("%s (%v)", apiErr.Description, err),
 			HTTPStatusCode: apiErr.HTTPStatusCode,
 		}
 	case "XMinioBackendDown":
@@ -2406,12 +2453,24 @@ func toAPIError(ctx context.Context, err error) APIError {
 		switch e := err.(type) {
 		case kms.Error:
 			apiErr = APIError{
-				Description:    e.Err.Error(),
 				Code:           e.APICode,
-				HTTPStatusCode: e.HTTPStatusCode,
+				Description:    e.Err,
+				HTTPStatusCode: e.Code,
 			}
 		case batchReplicationJobError:
-			apiErr = APIError(e)
+			apiErr = APIError{
+				Description:    e.Description,
+				Code:           e.Code,
+				HTTPStatusCode: e.HTTPStatusCode,
+			}
+		case InvalidRange:
+			apiErr = APIError{
+				Code:           "InvalidRange",
+				Description:    e.Error(),
+				HTTPStatusCode: errorCodes[ErrInvalidRange].HTTPStatusCode,
+				ObjectSize:     strconv.FormatInt(e.ResourceSize, 10),
+				RangeRequested: fmt.Sprintf("%d-%d", e.OffsetBegin, e.OffsetEnd),
+			}
 		case InvalidArgument:
 			apiErr = APIError{
 				Code:           "InvalidArgument",
@@ -2490,11 +2549,11 @@ func toAPIError(ctx context.Context, err error) APIError {
 			if len(e.Errors) >= 1 {
 				apiErr.Code = e.Errors[0].Reason
 			}
-		case azblob.StorageError:
+		case *azcore.ResponseError:
 			apiErr = APIError{
-				Code:           string(e.ServiceCode()),
+				Code:           e.ErrorCode,
 				Description:    e.Error(),
-				HTTPStatusCode: e.Response().StatusCode,
+				HTTPStatusCode: e.StatusCode,
 			}
 			// Add more other SDK related errors here if any in future.
 		default:
@@ -2519,7 +2578,7 @@ func toAPIError(ctx context.Context, err error) APIError {
 		// Make sure to log the errors which we cannot translate
 		// to a meaningful S3 API errors. This is added to aid in
 		// debugging unexpected/unhandled errors.
-		logger.LogIf(ctx, err)
+		internalLogIf(ctx, err)
 	}
 
 	return apiErr
@@ -2533,18 +2592,20 @@ func getAPIError(code APIErrorCode) APIError {
 	return errorCodes.ToAPIErr(ErrInternalError)
 }
 
-// getErrorResponse gets in standard error and resource value and
+// getAPIErrorResponse gets in standard error and resource value and
 // provides a encodable populated response values
 func getAPIErrorResponse(ctx context.Context, err APIError, resource, requestID, hostID string) APIErrorResponse {
 	reqInfo := logger.GetReqInfo(ctx)
 	return APIErrorResponse{
-		Code:       err.Code,
-		Message:    err.Description,
-		BucketName: reqInfo.BucketName,
-		Key:        reqInfo.ObjectName,
-		Resource:   resource,
-		Region:     globalSite.Region,
-		RequestID:  requestID,
-		HostID:     hostID,
+		Code:             err.Code,
+		Message:          err.Description,
+		BucketName:       reqInfo.BucketName,
+		Key:              reqInfo.ObjectName,
+		Resource:         resource,
+		Region:           globalSite.Region(),
+		RequestID:        requestID,
+		HostID:           hostID,
+		ActualObjectSize: err.ObjectSize,
+		RangeRequested:   err.RangeRequested,
 	}
 }

@@ -19,11 +19,8 @@ package cmd
 
 import (
 	"context"
-	"encoding/gob"
 	"errors"
 	"fmt"
-	"io"
-	"net/url"
 	"sort"
 	"strconv"
 	"sync/atomic"
@@ -31,10 +28,7 @@ import (
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/grid"
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/rest"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/sync/errgroup"
 	"golang.org/x/exp/slices"
 )
 
@@ -92,37 +86,12 @@ func (l localPeerS3Client) DeleteBucket(ctx context.Context, bucket string, opts
 
 // client to talk to peer Nodes.
 type remotePeerS3Client struct {
-	node       Node
-	pools      []int
-	restClient *rest.Client
+	node  Node
+	pools []int
 
 	// Function that returns the grid connection for this peer when initialized.
 	// Will return nil if the grid connection is not initialized yet.
 	gridConn func() *grid.Connection
-}
-
-// Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
-// permanently. The only way to restore the connection is at the xl-sets layer by xlsets.monitorAndConnectEndpoints()
-// after verifying format.json
-func (client *remotePeerS3Client) call(method string, values url.Values, body io.Reader, length int64) (respBody io.ReadCloser, err error) {
-	return client.callWithContext(GlobalContext, method, values, body, length)
-}
-
-// Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
-// permanently. The only way to restore the connection is at the xl-sets layer by xlsets.monitorAndConnectEndpoints()
-// after verifying format.json
-func (client *remotePeerS3Client) callWithContext(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (respBody io.ReadCloser, err error) {
-	if values == nil {
-		values = make(url.Values)
-	}
-
-	respBody, err = client.restClient.Call(ctx, method, values, body, length)
-	if err == nil {
-		return respBody, nil
-	}
-
-	err = toStorageErr(err)
-	return nil, err
 }
 
 // S3PeerSys - S3 peer call system.
@@ -169,8 +138,12 @@ func (sys *S3PeerSys) HealBucket(ctx context.Context, bucket string, opts madmin
 		poolErrs = append(poolErrs, reduceWriteQuorumErrs(ctx, perPoolErrs, bucketOpIgnoredErrs, quorum))
 	}
 
-	opts.Remove = isAllBucketsNotFound(poolErrs)
-	opts.Recreate = !opts.Remove
+	if !opts.Recreate {
+		// when there is no force recreate look for pool
+		// errors to recreate the bucket on all pools.
+		opts.Remove = isAllBucketsNotFound(poolErrs)
+		opts.Recreate = !opts.Remove
+	}
 
 	g = errgroup.WithNErrs(len(sys.peerClients))
 	healBucketResults := make([]madmin.HealResultItem, len(sys.peerClients))
@@ -285,9 +258,9 @@ func (sys *S3PeerSys) ListBuckets(ctx context.Context, opts BucketOptions) ([]Bu
 		for bktName, count := range bucketsMap {
 			if count < quorum {
 				// Queue a bucket heal task
-				globalMRFState.addPartialOp(partialOperation{
-					bucket: bktName,
-					queued: time.Now(),
+				globalMRFState.addPartialOp(PartialOperation{
+					Bucket: bktName,
+					Queued: time.Now(),
 				})
 			}
 		}
@@ -351,18 +324,21 @@ func (sys *S3PeerSys) GetBucketInfo(ctx context.Context, bucket string, opts Buc
 }
 
 func (client *remotePeerS3Client) ListBuckets(ctx context.Context, opts BucketOptions) ([]BucketInfo, error) {
-	v := url.Values{}
-	v.Set(peerS3BucketDeleted, strconv.FormatBool(opts.Deleted))
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
 
-	respBody, err := client.call(peerS3MethodListBuckets, v, nil, -1)
+	bi, err := listBucketsRPC.Call(ctx, client.gridConn(), &opts)
 	if err != nil {
-		return nil, err
+		return nil, toStorageErr(err)
 	}
-	defer xhttp.DrainBody(respBody)
-
-	var buckets []BucketInfo
-	err = gob.NewDecoder(respBody).Decode(&buckets)
-	return buckets, err
+	buckets := make([]BucketInfo, 0, len(bi.Value()))
+	for _, b := range bi.Value() {
+		if b != nil {
+			buckets = append(buckets, *b)
+		}
+	}
+	bi.Recycle() // BucketInfo has no internal pointers, so it's safe to recycle.
+	return buckets, nil
 }
 
 func (client *remotePeerS3Client) HealBucket(ctx context.Context, bucket string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
@@ -375,6 +351,9 @@ func (client *remotePeerS3Client) HealBucket(ctx context.Context, bucket string,
 		peerS3Bucket:        bucket,
 		peerS3BucketDeleted: strconv.FormatBool(opts.Remove),
 	})
+
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
 
 	_, err := healBucketRPC.Call(ctx, conn, mss)
 
@@ -397,6 +376,9 @@ func (client *remotePeerS3Client) GetBucketInfo(ctx context.Context, bucket stri
 		peerS3Bucket:        bucket,
 		peerS3BucketDeleted: strconv.FormatBool(opts.Deleted),
 	})
+
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
 
 	volInfo, err := headBucketRPC.Call(ctx, conn, mss)
 	if err != nil {
@@ -449,6 +431,9 @@ func (client *remotePeerS3Client) MakeBucket(ctx context.Context, bucket string,
 		peerS3BucketForceCreate: strconv.FormatBool(opts.ForceCreate),
 	})
 
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
+
 	_, err := makeBucketRPC.Call(ctx, conn, mss)
 	return toStorageErr(err)
 }
@@ -498,6 +483,9 @@ func (client *remotePeerS3Client) DeleteBucket(ctx context.Context, bucket strin
 		peerS3BucketForceDelete: strconv.FormatBool(opts.Force),
 	})
 
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
+
 	_, err := deleteBucketRPC.Call(ctx, conn, mss)
 	return toStorageErr(err)
 }
@@ -533,40 +521,15 @@ func newPeerS3Clients(endpoints EndpointServerPools) (peers []peerS3Client) {
 
 // Returns a peer S3 client.
 func newPeerS3Client(node Node) peerS3Client {
-	scheme := "http"
-	if globalIsTLS {
-		scheme = "https"
-	}
-
-	serverURL := &url.URL{
-		Scheme: scheme,
-		Host:   node.Host,
-		Path:   peerS3Path,
-	}
-
-	restClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
-	// Use a separate client to avoid recursive calls.
-	healthClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
-	healthClient.NoMetrics = true
-
-	// Construct a new health function.
-	restClient.HealthCheckFn = func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), restClient.HealthCheckTimeout)
-		defer cancel()
-		respBody, err := healthClient.Call(ctx, peerS3MethodHealth, nil, nil, -1)
-		xhttp.DrainBody(respBody)
-		return !isNetworkError(err)
-	}
-
 	var gridConn atomic.Pointer[grid.Connection]
 
 	return &remotePeerS3Client{
-		node: node, restClient: restClient,
+		node: node,
 		gridConn: func() *grid.Connection {
 			// Lazy initialization of grid connection.
 			// When we create this peer client, the grid connection is likely not yet initialized.
 			if node.GridHost == "" {
-				logger.LogOnceIf(context.Background(), fmt.Errorf("gridHost is empty for peer %s", node.Host), node.Host+":gridHost")
+				bugLogIf(context.Background(), fmt.Errorf("gridHost is empty for peer %s", node.Host), node.Host+":gridHost")
 				return nil
 			}
 			gc := gridConn.Load()
@@ -579,7 +542,7 @@ func newPeerS3Client(node Node) peerS3Client {
 			}
 			gc = gm.Connection(node.GridHost)
 			if gc == nil {
-				logger.LogOnceIf(context.Background(), fmt.Errorf("gridHost %s not found for peer %s", node.GridHost, node.Host), node.Host+":gridHost")
+				bugLogIf(context.Background(), fmt.Errorf("gridHost %s not found for peer %s", node.GridHost, node.Host), node.Host+":gridHost")
 				return nil
 			}
 			gridConn.Store(gc)

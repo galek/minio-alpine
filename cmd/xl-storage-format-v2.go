@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,31 +36,8 @@ import (
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/config/storageclass"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/env"
 	"github.com/tinylib/msgp/msgp"
 )
-
-// Reject creating new versions when a single object is cross maxObjectVersions
-var maxObjectVersions = 10000
-
-func init() {
-	v := env.Get("_MINIO_OBJECT_MAX_VERSIONS", "")
-	if v != "" {
-		maxv, err := strconv.Atoi(v)
-		if err != nil {
-			logger.Info("invalid _MINIO_OBJECT_MAX_VERSIONS value: %s, defaulting to '10000'", v)
-			maxObjectVersions = 10000
-		} else {
-			if maxv < 10 {
-				logger.Info("invalid _MINIO_OBJECT_MAX_VERSIONS value: %s, minimum allowed is '10' defaulting to '10000'", v)
-				maxObjectVersions = 10000
-			} else {
-				maxObjectVersions = maxv
-			}
-		}
-	}
-}
 
 var (
 	// XL header specifies the format
@@ -274,15 +250,17 @@ type xlMetaV2VersionHeader struct {
 	Signature [4]byte
 	Type      VersionType
 	Flags     xlFlags
+	EcN, EcM  uint8 // Note that these will be 0/0 for non-v2 objects and older xl.meta
 }
 
 func (x xlMetaV2VersionHeader) String() string {
-	return fmt.Sprintf("Type: %s, VersionID: %s, Signature: %s, ModTime: %s, Flags: %s",
+	return fmt.Sprintf("Type: %s, VersionID: %s, Signature: %s, ModTime: %s, Flags: %s, N: %d, M: %d",
 		x.Type.String(),
 		hex.EncodeToString(x.VersionID[:]),
 		hex.EncodeToString(x.Signature[:]),
 		time.Unix(0, x.ModTime),
 		x.Flags.String(),
+		x.EcN, x.EcM,
 	)
 }
 
@@ -296,6 +274,11 @@ func (x xlMetaV2VersionHeader) matchesNotStrict(o xlMetaV2VersionHeader) bool {
 	}
 	return x.VersionID == o.VersionID &&
 		x.Type == o.Type
+}
+
+// hasEC will return true if the version has erasure coding information.
+func (x xlMetaV2VersionHeader) hasEC() bool {
+	return x.EcM > 0 && x.EcN > 0
 }
 
 // sortsBefore can be used as a tiebreaker for stable sorting/selecting.
@@ -375,12 +358,18 @@ func (j *xlMetaV2Version) header() xlMetaV2VersionHeader {
 	if j.Type == ObjectType && j.ObjectV2.InlineData() {
 		flags |= xlFlagInlineData
 	}
+	var ecM, ecN uint8
+	if j.Type == ObjectType && j.ObjectV2 != nil {
+		ecM, ecN = uint8(j.ObjectV2.ErasureM), uint8(j.ObjectV2.ErasureN)
+	}
 	return xlMetaV2VersionHeader{
 		VersionID: j.getVersionID(),
 		ModTime:   j.getModTime().UnixNano(),
 		Signature: j.getSignature(),
 		Type:      j.Type,
 		Flags:     flags,
+		EcN:       ecN,
+		EcM:       ecM,
 	}
 }
 
@@ -464,7 +453,7 @@ func (j *xlMetaV2Version) ToFileInfo(volume, path string, allParts bool) (fi Fil
 }
 
 const (
-	xlHeaderVersion = 2
+	xlHeaderVersion = 3
 	xlMetaVersion   = 2
 )
 
@@ -962,7 +951,7 @@ func (x *xlMetaV2) loadIndexed(buf xlMetaBuf, data xlMetaInlineData) error {
 	x.metaV = metaV
 	if err = x.data.validate(); err != nil {
 		x.data.repair()
-		logger.LogIf(GlobalContext, fmt.Errorf("xlMetaV2.loadIndexed: data validation failed: %v. %d entries after repair", err, x.data.entries()))
+		storageLogIf(GlobalContext, fmt.Errorf("xlMetaV2.loadIndexed: data validation failed: %v. %d entries after repair", err, x.data.entries()))
 	}
 	return decodeVersions(buf, versions, func(i int, hdr, meta []byte) error {
 		ver := &x.versions[i]
@@ -1029,7 +1018,7 @@ func (x *xlMetaV2) loadLegacy(buf []byte) error {
 			x.data = buf
 			if err = x.data.validate(); err != nil {
 				x.data.repair()
-				logger.LogIf(GlobalContext, fmt.Errorf("xlMetaV2.Load: data validation failed: %v. %d entries after repair", err, x.data.entries()))
+				storageLogIf(GlobalContext, fmt.Errorf("xlMetaV2.Load: data validation failed: %v. %d entries after repair", err, x.data.entries()))
 			}
 		default:
 			return errors.New("unknown minor metadata version")
@@ -1111,8 +1100,8 @@ func (x *xlMetaV2) addVersion(ver xlMetaV2Version) error {
 		return err
 	}
 
-	// returns error if we have exceeded maxObjectVersions
-	if len(x.versions)+1 > maxObjectVersions {
+	// returns error if we have exceeded configured object max versions
+	if int64(len(x.versions)+1) > globalAPIConfig.getObjectMaxVersions() {
 		return errMaxVersionsExceeded
 	}
 
@@ -1256,7 +1245,7 @@ func (x *xlMetaV2) setIdx(idx int, ver xlMetaV2Version) (err error) {
 // getDataDirs will return all data directories in the metadata
 // as well as all version ids used for inline data.
 func (x *xlMetaV2) getDataDirs() ([]string, error) {
-	dds := make([]string, len(x.versions)*2)
+	dds := make([]string, 0, len(x.versions)*2)
 	for i, ver := range x.versions {
 		if ver.header.Type == DeleteType {
 			continue
@@ -1768,7 +1757,7 @@ func (x xlMetaV2) ToFileInfo(volume, path, versionID string, inclFreeVers, allPa
 	if versionID != "" && versionID != nullVersionID {
 		uv, err = uuid.Parse(versionID)
 		if err != nil {
-			logger.LogIf(GlobalContext, fmt.Errorf("invalid versionID specified %s", versionID))
+			storageLogIf(GlobalContext, fmt.Errorf("invalid versionID specified %s", versionID))
 			return fi, errFileVersionNotFound
 		}
 	}
@@ -1879,6 +1868,7 @@ func (x xlMetaV2) ListVersions(volume, path string, allParts bool) ([]FileInfo, 
 
 // mergeXLV2Versions will merge all versions, typically from different disks
 // that have at least quorum entries in all metas.
+// Each version slice should be sorted.
 // Quorum must be the minimum number of matching metadata files.
 // Quorum should be > 1 and <= len(versions).
 // If strict is set to false, entries that match type
@@ -2073,7 +2063,7 @@ func (x xlMetaBuf) ToFileInfo(volume, path, versionID string, allParts bool) (fi
 	if versionID != "" && versionID != nullVersionID {
 		uv, err = uuid.Parse(versionID)
 		if err != nil {
-			logger.LogIf(GlobalContext, fmt.Errorf("invalid versionID specified %s", versionID))
+			storageLogIf(GlobalContext, fmt.Errorf("invalid versionID specified %s", versionID))
 			return fi, errFileVersionNotFound
 		}
 	}

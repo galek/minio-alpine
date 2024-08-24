@@ -102,14 +102,8 @@ func (d *naughtyDisk) GetDiskLoc() (poolIdx, setIdx, diskIdx int) {
 	return -1, -1, -1
 }
 
-func (d *naughtyDisk) SetDiskLoc(poolIdx, setIdx, diskIdx int) {}
-
 func (d *naughtyDisk) GetDiskID() (string, error) {
 	return d.disk.GetDiskID()
-}
-
-func (d *naughtyDisk) SetFormatData(b []byte) {
-	d.disk.SetFormatData(b)
 }
 
 func (d *naughtyDisk) SetDiskID(id string) {
@@ -207,11 +201,25 @@ func (d *naughtyDisk) AppendFile(ctx context.Context, volume string, path string
 	return d.disk.AppendFile(ctx, volume, path, buf)
 }
 
-func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (uint64, error) {
+func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (RenameDataResp, error) {
 	if err := d.calcError(); err != nil {
-		return 0, err
+		return RenameDataResp{}, err
 	}
 	return d.disk.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath, opts)
+}
+
+func (d *naughtyDisk) RenamePart(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string, meta []byte) error {
+	if err := d.calcError(); err != nil {
+		return err
+	}
+	return d.disk.RenamePart(ctx, srcVolume, srcPath, dstVolume, dstPath, meta)
+}
+
+func (d *naughtyDisk) ReadParts(ctx context.Context, bucket string, partMetaPaths ...string) ([]*ObjectPartInfo, error) {
+	if err := d.calcError(); err != nil {
+		return nil, err
+	}
+	return d.disk.ReadParts(ctx, bucket, partMetaPaths...)
 }
 
 func (d *naughtyDisk) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) error {
@@ -221,11 +229,18 @@ func (d *naughtyDisk) RenameFile(ctx context.Context, srcVolume, srcPath, dstVol
 	return d.disk.RenameFile(ctx, srcVolume, srcPath, dstVolume, dstPath)
 }
 
-func (d *naughtyDisk) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) (err error) {
+func (d *naughtyDisk) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) (*CheckPartsResp, error) {
+	if err := d.calcError(); err != nil {
+		return nil, err
+	}
+	return d.disk.CheckParts(ctx, volume, path, fi)
+}
+
+func (d *naughtyDisk) DeleteBulk(ctx context.Context, volume string, paths ...string) (err error) {
 	if err := d.calcError(); err != nil {
 		return err
 	}
-	return d.disk.CheckParts(ctx, volume, path, fi)
+	return d.disk.DeleteBulk(ctx, volume, paths...)
 }
 
 func (d *naughtyDisk) Delete(ctx context.Context, volume string, path string, deleteOpts DeleteOptions) (err error) {
@@ -295,9 +310,9 @@ func (d *naughtyDisk) ReadXL(ctx context.Context, volume string, path string, re
 	return d.disk.ReadXL(ctx, volume, path, readData)
 }
 
-func (d *naughtyDisk) VerifyFile(ctx context.Context, volume, path string, fi FileInfo) error {
+func (d *naughtyDisk) VerifyFile(ctx context.Context, volume, path string, fi FileInfo) (*CheckPartsResp, error) {
 	if err := d.calcError(); err != nil {
-		return err
+		return nil, err
 	}
 	return d.disk.VerifyFile(ctx, volume, path, fi)
 }

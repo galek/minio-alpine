@@ -22,6 +22,12 @@ export MINIO_CI_CD=1
 if [ ! -f ./mc ]; then
 	os="$(uname -s)"
 	arch="$(uname -m)"
+	case "${arch}" in
+	"x86_64")
+		arch="amd64"
+		;;
+	esac
+
 	wget -O mc https://dl.minio.io/client/mc/release/${os,,}-${arch,,}/mc &&
 		chmod +x mc
 fi
@@ -57,8 +63,6 @@ minio server --config /tmp/minio.configfile.3 >/tmp/minio3_1.log 2>&1 &
 site3_pid=$!
 minio server --config /tmp/minio.configfile.4 >/tmp/minio4_1.log 2>&1 &
 site4_pid=$!
-
-sleep 30
 
 export MC_HOST_minio1=http://minr0otUS2r:pBU94AGAY85e@localhost:9001
 export MC_HOST_minio3=http://minr0otUS2r:pBU94AGAY85e@localhost:9003

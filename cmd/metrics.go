@@ -19,13 +19,12 @@ package cmd
 
 import (
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
 )
@@ -156,9 +155,9 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
 				prometheus.BuildFQName(healMetricsNamespace, "objects", "scanned"),
-				"Objects scanned in current self healing run",
+				"Objects scanned since uptime",
 				[]string{"type"}, nil),
-			prometheus.GaugeValue,
+			prometheus.CounterValue,
 			float64(v), string(k),
 		)
 	}
@@ -166,23 +165,20 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
 				prometheus.BuildFQName(healMetricsNamespace, "objects", "healed"),
-				"Objects healed in current self healing run",
+				"Objects healed since uptime",
 				[]string{"type"}, nil),
-			prometheus.GaugeValue,
+			prometheus.CounterValue,
 			float64(v), string(k),
 		)
 	}
-	for k, v := range bgSeq.gethealFailedItemsMap() {
-		// healFailedItemsMap stores the endpoint and volume state separated by comma,
-		// split the fields and pass to channel at correct index
-		s := strings.Split(k, ",")
+	for k, v := range bgSeq.getHealFailedItemsMap() {
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
 				prometheus.BuildFQName(healMetricsNamespace, "objects", "heal_failed"),
-				"Objects for which healing failed in current self healing run",
-				[]string{"mount_path", "volume_status"}, nil),
-			prometheus.GaugeValue,
-			float64(v), s[0], s[1],
+				"Objects for which healing failed since uptime",
+				[]string{"type"}, nil),
+			prometheus.CounterValue,
+			float64(v), string(k),
 		)
 	}
 }
@@ -304,7 +300,7 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 	}
 
 	for bucket, usageInfo := range dataUsageInfo.BucketsUsage {
-		stat := globalReplicationStats.getLatestReplicationStats(bucket)
+		stat := globalReplicationStats.Load().getLatestReplicationStats(bucket)
 		// Total space used by bucket
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(

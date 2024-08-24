@@ -73,6 +73,12 @@ var (
 		`Access key length should be at least 3, and secret key length at least 8 characters`,
 	)
 
+	ErrInvalidRootUserCredentials = newErrFn(
+		"Invalid credentials",
+		"Please provide correct credentials",
+		EnvRootUser+` length should be at least 3, and `+EnvRootPassword+` length at least 8 characters`,
+	)
+
 	ErrMissingEnvCredentialRootUser = newErrFn(
 		"Missing credential environment variable, \""+EnvRootUser+"\"",
 		"Environment variable \""+EnvRootUser+"\" is missing",
@@ -223,11 +229,6 @@ Examples:
 		"Invalid value for transition workers",
 		"",
 		"MINIO_API_TRANSITION_WORKERS: should be >= GOMAXPROCS/2",
-	)
-	ErrInvalidExpiryWorkersValue = newErrFn(
-		"Invalid value for expiry workers",
-		"",
-		"MINIO_API_EXPIRY_WORKERS: should be between 1 and 500",
 	)
 	ErrInvalidBatchKeyRotationWorkersWait = newErrFn(
 		"Invalid value for batch key rotation workers wait",

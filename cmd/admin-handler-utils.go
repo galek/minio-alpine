@@ -27,7 +27,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // validateAdminReq will validate request against and return whether it is allowed.
@@ -213,6 +213,12 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 		case errIsTierPermError(err):
 			apiErr = APIError{
 				Code:           "XMinioAdminTierInsufficientPermissions",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errTierInvalidConfig):
+			apiErr = APIError{
+				Code:           "XMinioAdminTierInvalidConfig",
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}

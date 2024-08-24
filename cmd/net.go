@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/url"
 	"runtime"
@@ -29,11 +28,19 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
-// IPv4 addresses of local host.
-var localIP4 = mustGetLocalIP4()
+var (
+	// IPv4 addresses of localhost.
+	localIP4 = mustGetLocalIP4()
+
+	// IPv6 addresses of localhost.
+	localIP6 = mustGetLocalIP6()
+
+	// List of all local loopback addresses.
+	localLoopbacks = mustGetLocalLoopbacks()
+)
 
 // mustSplitHostPort is a wrapper to net.SplitHostPort() where error is assumed to be a fatal.
 func mustSplitHostPort(hostPort string) (host, port string) {
@@ -74,6 +81,16 @@ func mustGetLocalIPs() (ipList []net.IP) {
 	return ipList
 }
 
+func mustGetLocalLoopbacks() (ipList set.StringSet) {
+	ipList = set.NewStringSet()
+	for _, ip := range mustGetLocalIPs() {
+		if ip != nil && ip.IsLoopback() {
+			ipList.Add(ip.String())
+		}
+	}
+	return
+}
+
 // mustGetLocalIP4 returns IPv4 addresses of localhost.  It panics on error.
 func mustGetLocalIP4() (ipList set.StringSet) {
 	ipList = set.NewStringSet()
@@ -98,12 +115,7 @@ func mustGetLocalIP6() (ipList set.StringSet) {
 
 // getHostIP returns IP address of given host.
 func getHostIP(host string) (ipList set.StringSet, err error) {
-	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = net.DefaultResolver.LookupHost
-	}
-
-	addrs, err := lookupHost(GlobalContext, host)
+	addrs, err := globalDNSCache.LookupHost(GlobalContext, host)
 	if err != nil {
 		return ipList, err
 	}
@@ -165,15 +177,15 @@ func getConsoleEndpoints() (consoleEndpoints []string) {
 	}
 	var ipList []string
 	if globalMinioConsoleHost == "" {
-		ipList = sortIPs(mustGetLocalIP4().ToSlice())
-		ipList = append(ipList, mustGetLocalIP6().ToSlice()...)
+		ipList = sortIPs(localIP4.ToSlice())
+		ipList = append(ipList, localIP6.ToSlice()...)
 	} else {
 		ipList = []string{globalMinioConsoleHost}
 	}
 
+	consoleEndpoints = make([]string, 0, len(ipList))
 	for _, ip := range ipList {
-		endpoint := fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(ip, globalMinioConsolePort))
-		consoleEndpoints = append(consoleEndpoints, endpoint)
+		consoleEndpoints = append(consoleEndpoints, getURLScheme(globalIsTLS)+"://"+net.JoinHostPort(ip, globalMinioConsolePort))
 	}
 
 	return consoleEndpoints
@@ -185,15 +197,15 @@ func getAPIEndpoints() (apiEndpoints []string) {
 	}
 	var ipList []string
 	if globalMinioHost == "" {
-		ipList = sortIPs(mustGetLocalIP4().ToSlice())
-		ipList = append(ipList, mustGetLocalIP6().ToSlice()...)
+		ipList = sortIPs(localIP4.ToSlice())
+		ipList = append(ipList, localIP6.ToSlice()...)
 	} else {
 		ipList = []string{globalMinioHost}
 	}
 
+	apiEndpoints = make([]string, 0, len(ipList))
 	for _, ip := range ipList {
-		endpoint := fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(ip, globalMinioPort))
-		apiEndpoints = append(apiEndpoints, endpoint)
+		apiEndpoints = append(apiEndpoints, getURLScheme(globalIsTLS)+"://"+net.JoinHostPort(ip, globalMinioPort))
 	}
 
 	return apiEndpoints

@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -30,7 +31,6 @@ import (
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
 	xxml "github.com/minio/xxml"
 )
 
@@ -50,11 +50,11 @@ func setEventStreamHeaders(w http.ResponseWriter) {
 // Write http common headers
 func setCommonHeaders(w http.ResponseWriter) {
 	// Set the "Server" http header.
-	w.Header().Set(xhttp.ServerInfo, "MinIO")
+	w.Header().Set(xhttp.ServerInfo, MinioStoreName)
 
 	// Set `x-amz-bucket-region` only if region is set on the server
 	// by default minio uses an empty region.
-	if region := globalSite.Region; region != "" {
+	if region := globalSite.Region(); region != "" {
 		w.Header().Set(xhttp.AmzBucketRegion, region)
 	}
 	w.Header().Set(xhttp.AcceptRanges, "bytes")
@@ -68,7 +68,7 @@ func encodeResponse(response interface{}) []byte {
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)
 	if err := xml.NewEncoder(&buf).Encode(response); err != nil {
-		logger.LogIf(GlobalContext, err)
+		bugLogIf(GlobalContext, err)
 		return nil
 	}
 	return buf.Bytes()
@@ -86,7 +86,7 @@ func encodeResponseList(response interface{}) []byte {
 	var buf bytes.Buffer
 	buf.WriteString(xxml.Header)
 	if err := xxml.NewEncoder(&buf).Encode(response); err != nil {
-		logger.LogIf(GlobalContext, err)
+		bugLogIf(GlobalContext, err)
 		return nil
 	}
 	return buf.Bytes()
@@ -108,7 +108,7 @@ func setPartsCountHeaders(w http.ResponseWriter, objInfo ObjectInfo) {
 }
 
 // Write object header
-func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSpec, opts ObjectOptions) (err error) {
+func setObjectHeaders(ctx context.Context, w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSpec, opts ObjectOptions) (err error) {
 	// set common headers
 	setCommonHeaders(w)
 
@@ -136,7 +136,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 	// Set tag count if object has tags
 	if len(objInfo.UserTags) > 0 {
 		tags, _ := tags.ParseObjectTags(objInfo.UserTags)
-		if tags.Count() > 0 {
+		if tags != nil && tags.Count() > 0 {
 			w.Header()[xhttp.AmzTagCount] = []string{strconv.Itoa(tags.Count())}
 			if opts.Tagging {
 				// This is MinIO only extension to return back tags along with the count.
@@ -213,7 +213,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 	if objInfo.IsRemote() {
 		// Check if object is being restored. For more information on x-amz-restore header see
 		// https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_ResponseSyntax
-		w.Header()[xhttp.AmzStorageClass] = []string{objInfo.TransitionedObject.Tier}
+		w.Header()[xhttp.AmzStorageClass] = []string{filterStorageClass(ctx, objInfo.TransitionedObject.Tier)}
 	}
 
 	if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil {

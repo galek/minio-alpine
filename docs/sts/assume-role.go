@@ -30,6 +30,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	cr "github.com/minio/minio-go/v7/pkg/credentials"
 )
@@ -85,6 +86,7 @@ func main() {
 		if f, err := os.Open(sessionPolicyFile); err != nil {
 			log.Fatalf("Unable to open session policy file: %v", err)
 		} else {
+			defer f.Close()
 			bs, err := io.ReadAll(f)
 			if err != nil {
 				log.Fatalf("Error reading session policy file: %v", err)
@@ -111,6 +113,11 @@ func main() {
 		Secure: stsEndpointURL.Scheme == "https",
 	}
 
+	mopts := &madmin.Options{
+		Creds:  li,
+		Secure: stsEndpointURL.Scheme == "https",
+	}
+
 	v, err := li.Get()
 	if err != nil {
 		log.Fatalf("Error retrieving STS credentials: %v", err)
@@ -122,6 +129,18 @@ func main() {
 		fmt.Println("SecretAccessKey:", v.SecretAccessKey)
 		fmt.Println("SessionToken:", v.SessionToken)
 		return
+	}
+
+	// API requests are secure (HTTPS) if secure=true and insecure (HTTP) otherwise.
+	// New returns an MinIO Admin client object.
+	madmClnt, err := madmin.NewWithOptions(stsEndpointURL.Host, mopts)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	err = madmClnt.ServiceRestart(context.Background())
+	if err != nil {
+		log.Fatalln(err)
 	}
 
 	// Use generated credentials to authenticate with MinIO server

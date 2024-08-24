@@ -41,7 +41,7 @@ import (
 	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 	"github.com/minio/sio"
 )
 
@@ -145,7 +145,7 @@ func (b *BucketMetadata) SetCreatedAt(createdAt time.Time) {
 // If an error is returned the returned metadata will be default initialized.
 func readBucketMetadata(ctx context.Context, api ObjectLayer, name string) (BucketMetadata, error) {
 	if name == "" {
-		logger.LogIf(ctx, errors.New("bucket name cannot be empty"))
+		internalLogIf(ctx, errors.New("bucket name cannot be empty"), logger.WarningKind)
 		return BucketMetadata{}, errInvalidArgument
 	}
 	b := newBucketMetadata(name)
@@ -400,7 +400,7 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 	for legacyFile := range configs {
 		configFile := path.Join(bucketMetaPrefix, b.Name, legacyFile)
 		if err := deleteConfig(ctx, objectAPI, configFile); err != nil && !errors.Is(err, errConfigNotFound) {
-			logger.LogIf(ctx, err)
+			internalLogIf(ctx, err, logger.WarningKind)
 		}
 	}
 
@@ -490,7 +490,7 @@ func encryptBucketMetadata(ctx context.Context, bucket string, input []byte, kms
 	}
 
 	metadata := make(map[string]string)
-	key, err := GlobalKMS.GenerateKey(ctx, "", kmsContext)
+	key, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{AssociatedData: kmsContext})
 	if err != nil {
 		return
 	}
@@ -519,7 +519,11 @@ func decryptBucketMetadata(input []byte, bucket string, meta map[string]string, 
 	if err != nil {
 		return nil, err
 	}
-	extKey, err := GlobalKMS.DecryptKey(keyID, kmsKey, kmsContext)
+	extKey, err := GlobalKMS.Decrypt(context.TODO(), &kms.DecryptRequest{
+		Name:           keyID,
+		Ciphertext:     kmsKey,
+		AssociatedData: kmsContext,
+	})
 	if err != nil {
 		return nil, err
 	}

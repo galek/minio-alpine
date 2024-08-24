@@ -32,7 +32,7 @@ import (
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // PolicySys - policy subsystem.
@@ -53,7 +53,7 @@ func (sys *PolicySys) IsAllowed(args policy.BucketPolicyArgs) bool {
 
 	// Log unhandled errors.
 	if _, ok := err.(BucketPolicyNotFound); !ok {
-		logger.LogIf(GlobalContext, err)
+		internalLogIf(GlobalContext, err, logger.WarningKind)
 	}
 
 	// As policy is not available for given bucket name, returns IsOwner i.e.

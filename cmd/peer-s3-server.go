@@ -19,31 +19,10 @@ package cmd
 
 import (
 	"context"
-	"encoding/gob"
 	"errors"
-	"net/http"
 
 	"github.com/minio/madmin-go/v3"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/sync/errgroup"
-)
-
-const (
-	peerS3Version = "v1" // First implementation
-
-	peerS3VersionPrefix = SlashSeparator + peerS3Version
-	peerS3Prefix        = minioReservedBucketPath + "/peer-s3"
-	peerS3Path          = peerS3Prefix + peerS3VersionPrefix
-)
-
-const (
-	peerS3MethodHealth        = "/health"
-	peerS3MethodMakeBucket    = "/make-bucket"
-	peerS3MethodGetBucketInfo = "/get-bucket-info"
-	peerS3MethodDeleteBucket  = "/delete-bucket"
-	peerS3MethodListBuckets   = "/list-buckets"
-	peerS3MethodHealBucket    = "/heal-bucket"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 const (
@@ -53,36 +32,9 @@ const (
 	peerS3BucketForceDelete = "force-delete"
 )
 
-type peerS3Server struct{}
-
-func (s *peerS3Server) writeErrorResponse(w http.ResponseWriter, err error) {
-	w.WriteHeader(http.StatusForbidden)
-	w.Write([]byte(err.Error()))
-}
-
-// IsValid - To authenticate and verify the time difference.
-func (s *peerS3Server) IsValid(w http.ResponseWriter, r *http.Request) bool {
-	objAPI := newObjectLayerFn()
-	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return false
-	}
-
-	if err := storageServerRequestValidate(r); err != nil {
-		s.writeErrorResponse(w, err)
-		return false
-	}
-	return true
-}
-
-// HealthHandler - returns true of health
-func (s *peerS3Server) HealthHandler(w http.ResponseWriter, r *http.Request) {
-	s.IsValid(w, r)
-}
-
 func healBucketLocal(ctx context.Context, bucket string, opts madmin.HealOpts) (res madmin.HealResultItem, err error) {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	// Initialize sync waitgroup.
@@ -171,7 +123,7 @@ func healBucketLocal(ctx context.Context, bucket string, opts madmin.HealOpts) (
 		g.Wait()
 	}
 
-	// Create the quorum lost volume only if its nor makred for delete
+	// Create the lost volume only if its not marked for delete
 	if !opts.Remove {
 		// Initialize sync waitgroup.
 		g = errgroup.WithNErrs(len(localDrives))
@@ -206,7 +158,7 @@ func healBucketLocal(ctx context.Context, bucket string, opts madmin.HealOpts) (
 
 func listBucketsLocal(ctx context.Context, opts BucketOptions) (buckets []BucketInfo, err error) {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	quorum := (len(localDrives) / 2)
@@ -252,15 +204,17 @@ func listBucketsLocal(ctx context.Context, opts BucketOptions) (buckets []Bucket
 	return buckets, nil
 }
 
-func cloneDrives(drives []StorageAPI) []StorageAPI {
-	newDrives := make([]StorageAPI, len(drives))
-	copy(newDrives, drives)
-	return newDrives
+func cloneDrives(drives map[string]StorageAPI) []StorageAPI {
+	copyDrives := make([]StorageAPI, 0, len(drives))
+	for _, drive := range drives {
+		copyDrives = append(copyDrives, drive)
+	}
+	return copyDrives
 }
 
 func getBucketInfoLocal(ctx context.Context, bucket string, opts BucketOptions) (BucketInfo, error) {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	g := errgroup.WithNErrs(len(localDrives)).WithConcurrency(32)
@@ -309,7 +263,7 @@ func getBucketInfoLocal(ctx context.Context, bucket string, opts BucketOptions) 
 
 func deleteBucketLocal(ctx context.Context, bucket string, opts DeleteBucketOptions) error {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	g := errgroup.WithNErrs(len(localDrives)).WithConcurrency(32)
@@ -325,29 +279,12 @@ func deleteBucketLocal(ctx context.Context, bucket string, opts DeleteBucketOpti
 		}, index)
 	}
 
-	var recreate bool
-	errs := g.Wait()
-	for index, err := range errs {
-		if errors.Is(err, errVolumeNotEmpty) {
-			recreate = true
-		}
-		if err == nil && recreate {
-			// ignore any errors
-			localDrives[index].MakeVol(ctx, bucket)
-		}
-	}
-
-	// Since we recreated buckets and error was `not-empty`, return not-empty.
-	if recreate {
-		return errVolumeNotEmpty
-	} // for all other errors reduce by write quorum.
-
-	return reduceWriteQuorumErrs(ctx, errs, bucketOpIgnoredErrs, (len(localDrives)/2)+1)
+	return reduceWriteQuorumErrs(ctx, g.Wait(), bucketOpIgnoredErrs, (len(localDrives)/2)+1)
 }
 
 func makeBucketLocal(ctx context.Context, bucket string, opts MakeBucketOptions) error {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	g := errgroup.WithNErrs(len(localDrives)).WithConcurrency(32)
@@ -371,35 +308,4 @@ func makeBucketLocal(ctx context.Context, bucket string, opts MakeBucketOptions)
 
 	errs := g.Wait()
 	return reduceWriteQuorumErrs(ctx, errs, bucketOpIgnoredErrs, (len(localDrives)/2)+1)
-}
-
-func (s *peerS3Server) ListBucketsHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		return
-	}
-
-	bucketDeleted := r.Form.Get(peerS3BucketDeleted) == "true"
-
-	buckets, err := listBucketsLocal(r.Context(), BucketOptions{
-		Deleted: bucketDeleted,
-	})
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-
-	logger.LogIf(r.Context(), gob.NewEncoder(w).Encode(buckets))
-}
-
-// registerPeerS3Handlers - register peer s3 router.
-func registerPeerS3Handlers(router *mux.Router) {
-	server := &peerS3Server{}
-	subrouter := router.PathPrefix(peerS3Prefix).Subrouter()
-
-	h := func(f http.HandlerFunc) http.HandlerFunc {
-		return collectInternodeStats(httpTraceHdrs(f))
-	}
-
-	subrouter.Methods(http.MethodPost).Path(peerS3VersionPrefix + peerS3MethodHealth).HandlerFunc(h(server.HealthHandler))
-	subrouter.Methods(http.MethodPost).Path(peerS3VersionPrefix + peerS3MethodListBuckets).HandlerFunc(h(server.ListBucketsHandler))
 }

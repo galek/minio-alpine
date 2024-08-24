@@ -28,7 +28,7 @@ import (
 	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -82,7 +82,7 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 		}, r.URL)
 		return
 	}
-	if _, err := getReplicationConfig(ctx, bucket); err == nil && v.Suspended() {
+	if rc, _ := getReplicationConfig(ctx, bucket); rc != nil && v.Suspended() {
 		writeErrorResponse(ctx, w, APIError{
 			Code:           "InvalidBucketState",
 			Description:    "A replication configuration is present on this bucket, bucket wide versioning cannot be suspended.",
@@ -108,7 +108,7 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 	// We encode the xml bytes as base64 to ensure there are no encoding
 	// errors.
 	cfgStr := base64.StdEncoding.EncodeToString(configData)
-	logger.LogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:       madmin.SRBucketMetaTypeVersionConfig,
 		Bucket:     bucket,
 		Versioning: &cfgStr,

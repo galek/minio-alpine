@@ -26,12 +26,12 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/amztime"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 // Object was stored with additional erasure codes due to degraded system at upload time
@@ -174,6 +174,7 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 		}
 	}
 	objInfo.Checksum = fi.Checksum
+	objInfo.decryptPartsChecksums(nil)
 	objInfo.Inlined = fi.InlineData()
 	// Success.
 	return objInfo
@@ -268,7 +269,7 @@ func (fi FileInfo) ObjectToPartOffset(ctx context.Context, offset int64) (partIn
 		// Continue to towards the next part.
 		partOffset -= part.Size
 	}
-	logger.LogIf(ctx, InvalidRange{})
+	internalLogIf(ctx, InvalidRange{})
 	// Offset beyond the size of the object return InvalidRange.
 	return 0, 0, InvalidRange{}
 }
@@ -276,7 +277,7 @@ func (fi FileInfo) ObjectToPartOffset(ctx context.Context, offset int64) (partIn
 func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.Time, etag string, quorum int) (FileInfo, error) {
 	// with less quorum return error.
 	if quorum < 1 {
-		return FileInfo{}, errErasureReadQuorum
+		return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInsufficientOnlineDrives}
 	}
 	metaHashes := make([]string, len(metaArr))
 	h := sha256.New()
@@ -288,13 +289,14 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 		mtimeValid := meta.ModTime.Equal(modTime)
 		if mtimeValid || etagOnly {
 			fmt.Fprintf(h, "%v", meta.XLV1)
-			if !etagOnly {
-				// Verify dataDir is same only when mtime is valid and etag is not considered.
-				fmt.Fprintf(h, "%v", meta.GetDataDir())
-			}
 			for _, part := range meta.Parts {
 				fmt.Fprintf(h, "part.%d", part.Number)
+				fmt.Fprintf(h, "part.%d", part.Size)
 			}
+			// Previously we checked if we had quorum on DataDir value.
+			// We have removed this check to allow reading objects with different DataDir
+			// values in a few drives (due to a rebalance-stop race bug)
+			// provided their their etags or ModTimes match.
 
 			if !meta.Deleted && meta.Size != 0 {
 				fmt.Fprintf(h, "%v+%v", meta.Erasure.DataBlocks, meta.Erasure.ParityBlocks)
@@ -342,12 +344,17 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 	}
 
 	if maxCount < quorum {
-		return FileInfo{}, errErasureReadQuorum
+		return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 	}
 
-	// Find the successor mod time in quorum, otherwise leave the
-	// candidate's successor modTime as found
-	succModTimeMap := make(map[time.Time]int)
+	// objProps represents properties that go beyond a single version
+	type objProps struct {
+		succModTime time.Time
+		numVersions int
+	}
+	// Find the successor mod time and numVersions in quorum, otherwise leave the
+	// candidate as found
+	otherPropsMap := make(counterMap[objProps])
 	var candidate FileInfo
 	var found bool
 	for i, hash := range metaHashes {
@@ -357,28 +364,25 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 					candidate = metaArr[i]
 					found = true
 				}
-				succModTimeMap[metaArr[i].SuccessorModTime]++
+				props := objProps{
+					succModTime: metaArr[i].SuccessorModTime,
+					numVersions: metaArr[i].NumVersions,
+				}
+				otherPropsMap[props]++
 			}
-		}
-	}
-	var succModTime time.Time
-	var smodTimeQuorum bool
-	for smodTime, count := range succModTimeMap {
-		if count >= quorum {
-			smodTimeQuorum = true
-			succModTime = smodTime
-			break
 		}
 	}
 
 	if found {
-		if smodTimeQuorum {
-			candidate.SuccessorModTime = succModTime
-			candidate.IsLatest = succModTime.IsZero()
+		// Update candidate FileInfo with succModTime and numVersions in quorum when available
+		if props, ok := otherPropsMap.GetValueWithQuorum(quorum); ok {
+			candidate.SuccessorModTime = props.succModTime
+			candidate.IsLatest = props.succModTime.IsZero()
+			candidate.NumVersions = props.numVersions
 		}
 		return candidate, nil
 	}
-	return FileInfo{}, errErasureReadQuorum
+	return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 }
 
 // pickValidFileInfo - picks one valid FileInfo content and returns from a
@@ -387,8 +391,7 @@ func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Tim
 	return findFileInfoInQuorum(ctx, metaArr, modTime, etag, quorum)
 }
 
-// writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
-func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+func writeAllMetadataWithRevert(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int, revert bool) ([]StorageAPI, error) {
 	g := errgroup.WithNErrs(len(disks))
 
 	// Start writing `xl.meta` to all disks in parallel.
@@ -404,7 +407,7 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bu
 			if fi.IsValid() {
 				return disks[index].WriteMetadata(ctx, origbucket, bucket, prefix, fi)
 			}
-			return errCorruptedFormat
+			return errFileCorrupt
 		}, index)
 	}
 
@@ -412,7 +415,35 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bu
 	mErrs := g.Wait()
 
 	err := reduceWriteQuorumErrs(ctx, mErrs, objectOpIgnoredErrs, quorum)
+	if err != nil && revert {
+		ng := errgroup.WithNErrs(len(disks))
+		for index := range disks {
+			if mErrs[index] != nil {
+				continue
+			}
+			index := index
+			ng.Go(func() error {
+				if disks[index] == nil {
+					return errDiskNotFound
+				}
+				return disks[index].Delete(ctx, bucket, pathJoin(prefix, xlStorageFormatFile), DeleteOptions{
+					Recursive: true,
+				})
+			}, index)
+		}
+		ng.Wait()
+	}
+
 	return evalDisks(disks, mErrs), err
+}
+
+func writeAllMetadata(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+	return writeAllMetadataWithRevert(ctx, disks, origbucket, bucket, prefix, files, quorum, true)
+}
+
+// writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
+func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+	return writeAllMetadataWithRevert(ctx, disks, origbucket, bucket, prefix, files, quorum, false)
 }
 
 func commonParity(parities []int, defaultParityCount int) int {
@@ -455,6 +486,7 @@ func commonParity(parities []int, defaultParityCount int) int {
 }
 
 func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int) {
+	totalShards := len(partsMetadata)
 	parities = make([]int, len(partsMetadata))
 	for index, metadata := range partsMetadata {
 		if errs[index] != nil {
@@ -465,9 +497,13 @@ func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int)
 			parities[index] = -1
 			continue
 		}
+		//nolint:gocritic
 		// Delete marker or zero byte objects take highest parity.
 		if metadata.Deleted || metadata.Size == 0 {
-			parities[index] = len(partsMetadata) / 2
+			parities[index] = totalShards / 2
+		} else if metadata.TransitionStatus == lifecycle.TransitionComplete {
+			// For tiered objects, read quorum is N/2+1 to ensure simple majority on xl.meta. It is not equal to EcM because the data integrity is entrusted with the warm tier.
+			parities[index] = totalShards - (totalShards/2 + 1)
 		} else {
 			parities[index] = metadata.Erasure.ParityBlocks
 		}
@@ -499,15 +535,7 @@ func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []
 	parities := listObjectParities(partsMetaData, errs)
 	parityBlocks := commonParity(parities, defaultParityCount)
 	if parityBlocks < 0 {
-		return -1, -1, errErasureReadQuorum
-	}
-
-	if parityBlocks == 0 {
-		// For delete markers do not use 'defaultParityCount' as it is not expected to be the case.
-		// Use maximum allowed read quorum instead, writeQuorum+1 is returned for compatibility sake
-		// but there are no callers that shall be using this.
-		readQuorum := len(partsMetaData) / 2
-		return readQuorum, readQuorum + 1, nil
+		return -1, -1, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInsufficientOnlineDrives}
 	}
 
 	dataBlocks := len(partsMetaData) - parityBlocks

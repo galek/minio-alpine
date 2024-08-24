@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,7 +38,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc"
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/dustin/go-humanize"
 	"github.com/felixge/fgprof"
 	"github.com/minio/madmin-go/v3"
@@ -48,7 +47,7 @@ import (
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
 	xtls "github.com/minio/minio/internal/config/identity/tls"
-	"github.com/minio/minio/internal/deadlineconn"
+	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash"
@@ -58,10 +57,10 @@ import (
 	"github.com/minio/minio/internal/logger/message/audit"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/certs"
-	"github.com/minio/pkg/v2/env"
-	pkgAudit "github.com/minio/pkg/v2/logger/message/audit"
-	xnet "github.com/minio/pkg/v2/net"
+	"github.com/minio/pkg/v3/certs"
+	"github.com/minio/pkg/v3/env"
+	xaudit "github.com/minio/pkg/v3/logger/message/audit"
+	xnet "github.com/minio/pkg/v3/net"
 	"golang.org/x/oauth2"
 )
 
@@ -572,13 +571,8 @@ func ToS3ETag(etag string) string {
 
 // GetDefaultConnSettings returns default HTTP connection settings.
 func GetDefaultConnSettings() xhttp.ConnSettings {
-	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = nil
-	}
-
 	return xhttp.ConnSettings{
-		LookupHost:  lookupHost,
+		LookupHost:  globalDNSCache.LookupHost,
 		DialTimeout: rest.DefaultTimeout,
 		RootCAs:     globalRootCAs,
 		TCPOptions:  globalTCPOptions,
@@ -588,13 +582,8 @@ func GetDefaultConnSettings() xhttp.ConnSettings {
 // NewInternodeHTTPTransport returns a transport for internode MinIO
 // connections.
 func NewInternodeHTTPTransport(maxIdleConnsPerHost int) func() http.RoundTripper {
-	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = nil
-	}
-
 	return xhttp.ConnSettings{
-		LookupHost:       lookupHost,
+		LookupHost:       globalDNSCache.LookupHost,
 		DialTimeout:      rest.DefaultTimeout,
 		RootCAs:          globalRootCAs,
 		CipherSuites:     fips.TLSCiphers(),
@@ -604,39 +593,17 @@ func NewInternodeHTTPTransport(maxIdleConnsPerHost int) func() http.RoundTripper
 	}.NewInternodeHTTPTransport(maxIdleConnsPerHost)
 }
 
-// NewCustomHTTPProxyTransport is used only for proxied requests, specifically
-// only supports HTTP/1.1
-func NewCustomHTTPProxyTransport() func() *http.Transport {
-	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = nil
-	}
-
-	return xhttp.ConnSettings{
-		LookupHost:       lookupHost,
-		DialTimeout:      rest.DefaultTimeout,
-		RootCAs:          globalRootCAs,
-		CipherSuites:     fips.TLSCiphers(),
-		CurvePreferences: fips.TLSCurveIDs(),
-		EnableHTTP2:      false,
-		TCPOptions:       globalTCPOptions,
-	}.NewCustomHTTPProxyTransport()
-}
-
 // NewHTTPTransportWithClientCerts returns a new http configuration
 // used while communicating with the cloud backends.
-func NewHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transport {
-	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = nil
-	}
-
+func NewHTTPTransportWithClientCerts(clientCert, clientKey string) http.RoundTripper {
 	s := xhttp.ConnSettings{
-		LookupHost:  lookupHost,
-		DialTimeout: defaultDialTimeout,
-		RootCAs:     globalRootCAs,
-		TCPOptions:  globalTCPOptions,
-		EnableHTTP2: false,
+		LookupHost:       globalDNSCache.LookupHost,
+		DialTimeout:      defaultDialTimeout,
+		RootCAs:          globalRootCAs,
+		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
+		CurvePreferences: fips.TLSCurveIDs(),
+		TCPOptions:       globalTCPOptions,
+		EnableHTTP2:      false,
 	}
 
 	if clientCert != "" && clientKey != "" {
@@ -644,12 +611,16 @@ func NewHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transpo
 		defer cancel()
 		transport, err := s.NewHTTPTransportWithClientCerts(ctx, clientCert, clientKey)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to load client key and cert, please check your client certificate configuration: %w", err))
+			internalLogIf(ctx, fmt.Errorf("Unable to load client key and cert, please check your client certificate configuration: %w", err))
+		}
+		if transport == nil {
+			// Client certs are not readable return default transport.
+			return s.NewHTTPTransportWithTimeout(1 * time.Minute)
 		}
 		return transport
 	}
 
-	return s.NewHTTPTransportWithTimeout(1 * time.Minute)
+	return globalRemoteTargetTransport
 }
 
 // NewHTTPTransport returns a new http configuration
@@ -663,56 +634,27 @@ const defaultDialTimeout = 5 * time.Second
 
 // NewHTTPTransportWithTimeout allows setting a timeout.
 func NewHTTPTransportWithTimeout(timeout time.Duration) *http.Transport {
-	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = nil
-	}
-
 	return xhttp.ConnSettings{
-		DialContext: newCustomDialContext(),
-		LookupHost:  lookupHost,
-		DialTimeout: defaultDialTimeout,
-		RootCAs:     globalRootCAs,
-		TCPOptions:  globalTCPOptions,
-		EnableHTTP2: false,
+		LookupHost:       globalDNSCache.LookupHost,
+		DialTimeout:      defaultDialTimeout,
+		RootCAs:          globalRootCAs,
+		TCPOptions:       globalTCPOptions,
+		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
+		CurvePreferences: fips.TLSCurveIDs(),
+		EnableHTTP2:      false,
 	}.NewHTTPTransportWithTimeout(timeout)
-}
-
-// newCustomDialContext setups a custom dialer for any external communication and proxies.
-func newCustomDialContext() xhttp.DialContext {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		dialer := &net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}
-
-		conn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-
-		dconn := deadlineconn.New(conn).
-			WithReadDeadline(globalConnReadDeadline).
-			WithWriteDeadline(globalConnWriteDeadline)
-
-		return dconn, nil
-	}
 }
 
 // NewRemoteTargetHTTPTransport returns a new http configuration
 // used while communicating with the remote replication targets.
 func NewRemoteTargetHTTPTransport(insecure bool) func() *http.Transport {
-	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = nil
-	}
-
 	return xhttp.ConnSettings{
-		DialContext: newCustomDialContext(),
-		LookupHost:  lookupHost,
-		RootCAs:     globalRootCAs,
-		TCPOptions:  globalTCPOptions,
-		EnableHTTP2: false,
+		LookupHost:       globalDNSCache.LookupHost,
+		RootCAs:          globalRootCAs,
+		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
+		CurvePreferences: fips.TLSCurveIDs(),
+		TCPOptions:       globalTCPOptions,
+		EnableHTTP2:      false,
 	}.NewRemoteTargetHTTPTransport(insecure)
 }
 
@@ -968,7 +910,7 @@ type AuditLogOptions struct {
 	Object    string
 	VersionID string
 	Error     string
-	Tags      map[string]interface{}
+	Tags      map[string]string
 }
 
 // sends audit logs for internal subsystem activity
@@ -976,26 +918,24 @@ func auditLogInternal(ctx context.Context, opts AuditLogOptions) {
 	if len(logger.AuditTargets()) == 0 {
 		return
 	}
+
 	entry := audit.NewEntry(globalDeploymentID())
 	entry.Trigger = opts.Event
 	entry.Event = opts.Event
 	entry.Error = opts.Error
 	entry.API.Name = opts.APIName
 	entry.API.Bucket = opts.Bucket
-	entry.API.Objects = []pkgAudit.ObjectVersion{{ObjectName: opts.Object, VersionID: opts.VersionID}}
+	entry.API.Objects = []xaudit.ObjectVersion{{ObjectName: opts.Object, VersionID: opts.VersionID}}
 	entry.API.Status = opts.Status
-	entry.Tags = opts.Tags
+	entry.Tags = make(map[string]interface{}, len(opts.Tags))
+	for k, v := range opts.Tags {
+		entry.Tags[k] = v
+	}
+
 	// Merge tag information if found - this is currently needed for tags
 	// set during decommissioning.
 	if reqInfo := logger.GetReqInfo(ctx); reqInfo != nil {
-		if tags := reqInfo.GetTagsMap(); len(tags) > 0 {
-			if entry.Tags == nil {
-				entry.Tags = make(map[string]interface{}, len(tags))
-			}
-			for k, v := range tags {
-				entry.Tags[k] = v
-			}
-		}
+		reqInfo.PopulateTagsMap(opts.Tags)
 	}
 	ctx = logger.SetAuditEntry(ctx, &entry)
 	logger.AuditLog(ctx, nil, nil, nil)
@@ -1188,16 +1128,26 @@ func ptr[T any](a T) *T {
 	return &a
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
+// sleepContext sleeps for d duration or until ctx is done.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
 	}
-	return b
+	return nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// helper type to return either item or error.
+type itemOrErr[V any] struct {
+	Item V
+	Err  error
+}
+
+func filterStorageClass(ctx context.Context, s string) string {
+	// Veeam 14.0 and later clients are not compatible with custom storage classes.
+	if globalVeeamForceSC != "" && s != storageclass.STANDARD && s != storageclass.RRS && isVeeamClient(ctx) {
+		return globalVeeamForceSC
 	}
-	return b
+	return s
 }
