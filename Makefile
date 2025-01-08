@@ -24,7 +24,7 @@ help: ## print this help
 getdeps: ## fetch necessary dependencies
 	@mkdir -p ${GOPATH}/bin
 	@echo "Installing golangci-lint" && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOLANGCI_DIR)
-	@echo "Installing msgp" && go install -v github.com/tinylib/msgp@v1.1.10-0.20240227114326-6d6f813fff1b
+	@echo "Installing msgp" && go install -v github.com/tinylib/msgp@v1.2.5
 	@echo "Installing stringer" && go install -v golang.org/x/tools/cmd/stringer@latest
 
 crosscompile: ## cross compile minio
@@ -59,6 +59,10 @@ test-root-disable: install-race
 test-ilm: install-race
 	@echo "Running ILM tests"
 	@env bash $(PWD)/docs/bucket/replication/setup_ilm_expiry_replication.sh
+
+test-ilm-transition: install-race
+	@echo "Running ILM tiering tests with healing"
+	@env bash $(PWD)/docs/bucket/lifecycle/setup_ilm_transition.sh
 
 test-pbac: install-race
 	@echo "Running bucket policies tests"
@@ -97,6 +101,14 @@ test-iam-ldap-upgrade-import: install-race ## verify IAM (external LDAP IDP)
 	@echo "Running upgrade tests for IAM (LDAP backend)"
 	@env bash $(PWD)/buildscripts/minio-iam-ldap-upgrade-import-test.sh
 
+test-iam-import-with-missing-entities: install-race ## test import of external iam config withg missing entities
+	@echo "Test IAM import configurations with missing entities"
+	@env bash $(PWD)/docs/distributed/iam-import-with-missing-entities.sh
+
+test-iam-import-with-openid: install-race
+	@echo "Test IAM import configurations with openid"
+	@env bash $(PWD)/docs/distributed/iam-import-with-openid.sh
+
 test-sio-error:
 	@(env bash $(PWD)/docs/bucket/replication/sio-error.sh)
 
@@ -132,6 +144,14 @@ test-site-replication-minio: install-race ## verify automatic site replication
 	@(env bash $(PWD)/docs/site-replication/run-sse-kms-object-replication.sh)
 	@echo "Running tests for automatic site replication of SSE-C objects with compression enabled for site"
 	@(env bash $(PWD)/docs/site-replication/run-ssec-object-replication-with-compression.sh)
+
+test-multipart: install-race ## test multipart
+	@echo "Test multipart behavior when part files are missing"
+	@(env bash $(PWD)/buildscripts/multipart-quorum-test.sh)
+
+test-timeout: install-race ## test multipart
+	@echo "Test server timeout"
+	@(env bash $(PWD)/buildscripts/test-timeout.sh)
 
 verify: install-race ## verify minio various setups
 	@echo "Verifying build with race"
@@ -196,6 +216,10 @@ docker-hotfix: hotfix-push checks ## builds minio docker container with hotfix t
 docker: build ## builds minio docker container
 	@echo "Building minio docker image '$(TAG)'"
 	@docker build -q --no-cache -t $(TAG) . -f Dockerfile
+
+test-resiliency: build
+	@echo "Running resiliency tests"
+	@(DOCKER_COMPOSE_FILE=$(PWD)/docs/resiliency/docker-compose.yaml env bash $(PWD)/docs/resiliency/resiliency-tests.sh)
 
 install-race: checks build-debugging ## builds minio to $(PWD)
 	@echo "Building minio binary with -race to './minio'"
