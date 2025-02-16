@@ -61,6 +61,8 @@ var globalBatchConfig batch.Config
 const (
 	// Keep the completed/failed job stats 3 days before removing it
 	oldJobsExpiration = 3 * 24 * time.Hour
+
+	redactedText = "**REDACTED**"
 )
 
 // BatchJobRequest this is an internal data structure not for external consumption.
@@ -73,6 +75,29 @@ type BatchJobRequest struct {
 	Expire    *BatchJobExpire      `yaml:"expire" json:"expire"`
 	ctx       context.Context      `msg:"-"`
 }
+
+// RedactSensitive will redact any sensitive information in b.
+func (j *BatchJobRequest) RedactSensitive() {
+	j.Replicate.RedactSensitive()
+	j.Expire.RedactSensitive()
+	j.KeyRotate.RedactSensitive()
+}
+
+// RedactSensitive will redact any sensitive information in b.
+func (r *BatchJobReplicateV1) RedactSensitive() {
+	if r == nil {
+		return
+	}
+	if r.Target.Creds.SecretKey != "" {
+		r.Target.Creds.SecretKey = redactedText
+	}
+	if r.Target.Creds.SessionToken != "" {
+		r.Target.Creds.SessionToken = redactedText
+	}
+}
+
+// RedactSensitive will redact any sensitive information in b.
+func (r *BatchJobKeyRotateV1) RedactSensitive() {}
 
 func notifyEndpoint(ctx context.Context, ri *batchJobInfo, endpoint, token string) error {
 	if endpoint == "" {
@@ -276,8 +301,12 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 	}
 	globalBatchJobsMetrics.save(job.ID, ri)
 
+	retryAttempts := job.Replicate.Flags.Retry.Attempts
+	if retryAttempts <= 0 {
+		retryAttempts = batchReplJobDefaultRetries
+	}
 	delay := job.Replicate.Flags.Retry.Delay
-	if delay == 0 {
+	if delay <= 0 {
 		delay = batchReplJobDefaultRetryDelay
 	}
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -297,12 +326,12 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 			return true
 		}
 
-		if !r.Flags.Filter.CreatedAfter.IsZero() && r.Flags.Filter.CreatedAfter.Before(oi.ModTime) {
+		if !r.Flags.Filter.CreatedAfter.IsZero() && r.Flags.Filter.CreatedAfter.After(oi.ModTime) {
 			// skip all objects that are created before the specified time.
 			return true
 		}
 
-		if !r.Flags.Filter.CreatedBefore.IsZero() && r.Flags.Filter.CreatedBefore.After(oi.ModTime) {
+		if !r.Flags.Filter.CreatedBefore.IsZero() && r.Flags.Filter.CreatedBefore.Before(oi.ModTime) {
 			// skip all objects that are created after the specified time.
 			return true
 		}
@@ -377,7 +406,6 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		return err
 	}
 
-	retryAttempts := ri.RetryAttempts
 	retry := false
 	for attempts := 1; attempts <= retryAttempts; attempts++ {
 		attempts := attempts
@@ -394,7 +422,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 			}
 			for _, prefix := range prefixes {
 				prefixObjInfoCh := c.ListObjects(ctx, r.Source.Bucket, miniogo.ListObjectsOptions{
-					Prefix:       strings.TrimSpace(prefix),
+					Prefix:       prefix,
 					WithVersions: minioSrc,
 					Recursive:    true,
 					WithMetadata: true,
@@ -594,12 +622,12 @@ func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLa
 				},
 			}
 
-			opts, err := batchReplicationOpts(ctx, "", gr.ObjInfo)
+			opts, _, err := batchReplicationOpts(ctx, "", gr.ObjInfo)
 			if err != nil {
 				batchLogIf(ctx, err)
 				continue
 			}
-
+			// TODO: I am not sure we read it back, but we aren't sending whether checksums are single/multipart.
 			for k, vals := range opts.Header() {
 				for _, v := range vals {
 					snowballObj.Headers.Add(k, v)
@@ -684,14 +712,14 @@ func (r *BatchJobReplicateV1) ReplicateToTarget(ctx context.Context, api ObjectL
 		return err
 	}
 
-	putOpts, err := batchReplicationOpts(ctx, "", objInfo)
+	putOpts, isMP, err := batchReplicationOpts(ctx, "", objInfo)
 	if err != nil {
 		return err
 	}
 	if r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3 {
 		putOpts.Internal = miniogo.AdvancedPutOptions{}
 	}
-	if objInfo.isMultipart() {
+	if isMP {
 		if err := replicateObjectWithMultipart(ctx, c, tgtBucket, pathJoin(tgtPrefix, objInfo.Name), rd, objInfo, putOpts); err != nil {
 			return err
 		}
@@ -772,22 +800,10 @@ func (ri *batchJobInfo) loadOrInit(ctx context.Context, api ObjectLayer, job Bat
 		switch {
 		case job.Replicate != nil:
 			ri.Version = batchReplVersionV1
-			ri.RetryAttempts = batchReplJobDefaultRetries
-			if job.Replicate.Flags.Retry.Attempts > 0 {
-				ri.RetryAttempts = job.Replicate.Flags.Retry.Attempts
-			}
 		case job.KeyRotate != nil:
 			ri.Version = batchKeyRotateVersionV1
-			ri.RetryAttempts = batchKeyRotateJobDefaultRetries
-			if job.KeyRotate.Flags.Retry.Attempts > 0 {
-				ri.RetryAttempts = job.KeyRotate.Flags.Retry.Attempts
-			}
 		case job.Expire != nil:
 			ri.Version = batchExpireVersionV1
-			ri.RetryAttempts = batchExpireJobDefaultRetries
-			if job.Expire.Retry.Attempts > 0 {
-				ri.RetryAttempts = job.Expire.Retry.Attempts
-			}
 		}
 		return nil
 	}
@@ -980,7 +996,7 @@ func (ri *batchJobInfo) updateAfter(ctx context.Context, api ObjectLayer, durati
 // Note: to be used only with batch jobs that affect multiple versions through
 // a single action. e.g batch-expire has an option to expire all versions of an
 // object which matches the given filters.
-func (ri *batchJobInfo) trackMultipleObjectVersions(bucket string, info ObjectInfo, success bool) {
+func (ri *batchJobInfo) trackMultipleObjectVersions(info ObjectInfo, success bool) {
 	if success {
 		ri.Objects += int64(info.NumVersions)
 	} else {
@@ -1034,10 +1050,15 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	globalBatchJobsMetrics.save(job.ID, ri)
 	lastObject := ri.Object
 
+	retryAttempts := job.Replicate.Flags.Retry.Attempts
+	if retryAttempts <= 0 {
+		retryAttempts = batchReplJobDefaultRetries
+	}
 	delay := job.Replicate.Flags.Retry.Delay
-	if delay < time.Second {
+	if delay <= 0 {
 		delay = batchReplJobDefaultRetryDelay
 	}
+
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	selectObj := func(info FileInfo) (ok bool) {
@@ -1051,12 +1072,12 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			return false
 		}
 
-		if !r.Flags.Filter.CreatedAfter.IsZero() && r.Flags.Filter.CreatedAfter.Before(info.ModTime) {
+		if !r.Flags.Filter.CreatedAfter.IsZero() && r.Flags.Filter.CreatedAfter.After(info.ModTime) {
 			// skip all objects that are created before the specified time.
 			return false
 		}
 
-		if !r.Flags.Filter.CreatedBefore.IsZero() && r.Flags.Filter.CreatedBefore.After(info.ModTime) {
+		if !r.Flags.Filter.CreatedBefore.IsZero() && r.Flags.Filter.CreatedBefore.Before(info.ModTime) {
 			// skip all objects that are created after the specified time.
 			return false
 		}
@@ -1125,7 +1146,6 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 	c.SetAppInfo("minio-"+batchJobPrefix, r.APIVersion+" "+job.ID)
 
-	retryAttempts := ri.RetryAttempts
 	retry := false
 	for attempts := 1; attempts <= retryAttempts; attempts++ {
 		attempts := attempts
@@ -1214,7 +1234,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			}
 			for _, prefix := range prefixes {
 				prefixWalkCh := make(chan itemOrErr[ObjectInfo], 100)
-				if err := api.Walk(ctx, r.Source.Bucket, strings.TrimSpace(prefix), prefixWalkCh, WalkOptions{
+				if err := api.Walk(ctx, r.Source.Bucket, prefix, prefixWalkCh, WalkOptions{
 					Marker:   lastObject,
 					Filter:   selectObj,
 					AskDisks: walkQuorum,
@@ -1556,11 +1576,11 @@ func (j *BatchJobRequest) load(ctx context.Context, api ObjectLayer, name string
 	return err
 }
 
-func batchReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (putOpts miniogo.PutObjectOptions, err error) {
+func batchReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (putOpts miniogo.PutObjectOptions, isMP bool, err error) {
 	// TODO: support custom storage class for remote replication
-	putOpts, err = putReplicationOpts(ctx, "", objInfo, 0)
+	putOpts, isMP, err = putReplicationOpts(ctx, "", objInfo)
 	if err != nil {
-		return putOpts, err
+		return putOpts, isMP, err
 	}
 	putOpts.Internal = miniogo.AdvancedPutOptions{
 		SourceVersionID:    objInfo.VersionID,
@@ -1568,7 +1588,7 @@ func batchReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (p
 		SourceETag:         objInfo.ETag,
 		ReplicationRequest: true,
 	}
-	return putOpts, nil
+	return putOpts, isMP, nil
 }
 
 // ListBatchJobs - lists all currently active batch jobs, optionally takes {jobType}
@@ -1582,9 +1602,6 @@ func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) 
 	}
 
 	jobType := r.Form.Get("jobType")
-	if jobType == "" {
-		jobType = string(madmin.BatchJobReplicate)
-	}
 
 	resultCh := make(chan itemOrErr[ObjectInfo])
 
@@ -1613,7 +1630,7 @@ func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) 
 			continue
 		}
 
-		if jobType == string(req.Type()) {
+		if jobType == string(req.Type()) || jobType == "" {
 			listResult.Jobs = append(listResult.Jobs, madmin.BatchJobResult{
 				ID:      req.ID,
 				Type:    req.Type(),
@@ -1703,6 +1720,8 @@ func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Remove sensitive fields.
+	req.RedactSensitive()
 	buf, err := yaml.Marshal(req)
 	if err != nil {
 		batchLogIf(ctx, err)
@@ -1810,7 +1829,7 @@ func (a adminAPIHandlers) CancelBatchJob(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if _, success := proxyRequestByToken(ctx, w, r, jobID); success {
+	if _, proxied, _ := proxyRequestByToken(ctx, w, r, jobID, true); proxied {
 		return
 	}
 
@@ -1994,7 +2013,6 @@ func (j *BatchJobPool) AddWorker() {
 					}
 				}
 			}
-			job.delete(j.ctx, j.objLayer)
 			j.canceler(job.ID, false)
 		case <-j.workerKillCh:
 			return
@@ -2055,7 +2073,9 @@ func (j *BatchJobPool) canceler(jobID string, cancel bool) error {
 			canceler()
 		}
 	}
-	delete(j.jobCancelers, jobID)
+	if cancel {
+		delete(j.jobCancelers, jobID)
+	}
 	return nil
 }
 
@@ -2181,9 +2201,40 @@ func (m *batchJobMetrics) purgeJobMetrics() {
 			m.RUnlock()
 			for _, jobID := range toDeleteJobMetrics {
 				m.delete(jobID)
+				j := BatchJobRequest{
+					ID: jobID,
+				}
+				j.delete(GlobalContext, newObjectLayerFn())
 			}
 		}
 	}
+}
+
+// load metrics from disk on startup
+func (m *batchJobMetrics) init(ctx context.Context, objectAPI ObjectLayer) error {
+	resultCh := make(chan itemOrErr[ObjectInfo])
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if err := objectAPI.Walk(ctx, minioMetaBucket, batchJobReportsPrefix, resultCh, WalkOptions{}); err != nil {
+		return err
+	}
+
+	for result := range resultCh {
+		if result.Err != nil {
+			return result.Err
+		}
+		ri := &batchJobInfo{}
+		if err := ri.loadByPath(ctx, objectAPI, result.Item.Name); err != nil {
+			if !errors.Is(err, errNoSuchJob) {
+				batchLogIf(ctx, err)
+			}
+			continue
+		}
+		m.metrics[ri.JobID] = ri
+	}
+	return nil
 }
 
 func (m *batchJobMetrics) delete(jobID string) {

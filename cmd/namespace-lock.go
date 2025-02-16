@@ -185,7 +185,7 @@ func (di *distLockInstance) Unlock(lc LockContext) {
 	if lc.cancel != nil {
 		lc.cancel()
 	}
-	di.rwMutex.Unlock(lc.ctx)
+	di.rwMutex.Unlock(context.Background())
 }
 
 // RLock - block until read lock is taken or timeout has occurred.
@@ -229,6 +229,7 @@ type localLockInstance struct {
 // path. The returned lockInstance object encapsulates the nsLockMap,
 // volume, path and operation ID.
 func (n *nsLockMap) NewNSLock(lockers func() ([]dsync.NetLocker, string), volume string, paths ...string) RWLocker {
+	sort.Strings(paths)
 	opsID := mustGetUUID()
 	if n.isDistErasure {
 		drwmutex := dsync.NewDRWMutex(&dsync.Dsync{
@@ -237,7 +238,6 @@ func (n *nsLockMap) NewNSLock(lockers func() ([]dsync.NetLocker, string), volume
 		}, pathsJoinPrefix(volume, paths...)...)
 		return &distLockInstance{drwmutex, opsID}
 	}
-	sort.Strings(paths)
 	return &localLockInstance{n, volume, paths, opsID}
 }
 

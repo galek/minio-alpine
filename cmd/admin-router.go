@@ -159,14 +159,14 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 
 		// Info operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/info").HandlerFunc(adminMiddleware(adminAPI.ServerInfoHandler, traceAllFlag, noObjLayerFlag))
-		adminRouter.Methods(http.MethodGet, http.MethodPost).Path(adminVersion + "/inspect-data").HandlerFunc(adminMiddleware(adminAPI.InspectDataHandler, noGZFlag, traceAllFlag))
+		adminRouter.Methods(http.MethodGet, http.MethodPost).Path(adminVersion + "/inspect-data").HandlerFunc(adminMiddleware(adminAPI.InspectDataHandler, noGZFlag, traceHdrsS3HFlag))
 
 		// StorageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/storageinfo").HandlerFunc(adminMiddleware(adminAPI.StorageInfoHandler, traceAllFlag))
 		// DataUsageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/datausageinfo").HandlerFunc(adminMiddleware(adminAPI.DataUsageInfoHandler, traceAllFlag))
 		// Metrics operation
-		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/metrics").HandlerFunc(adminMiddleware(adminAPI.MetricsHandler, traceAllFlag))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/metrics").HandlerFunc(adminMiddleware(adminAPI.MetricsHandler, traceHdrsS3HFlag))
 
 		if globalIsDistErasure || globalIsErasure {
 			// Heal operations
@@ -193,9 +193,9 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		// Profiling operations - deprecated API
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/profiling/start").HandlerFunc(adminMiddleware(adminAPI.StartProfilingHandler, traceAllFlag, noObjLayerFlag)).
 			Queries("profilerType", "{profilerType:.*}")
-		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/profiling/download").HandlerFunc(adminMiddleware(adminAPI.DownloadProfilingHandler, traceAllFlag, noObjLayerFlag))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/profiling/download").HandlerFunc(adminMiddleware(adminAPI.DownloadProfilingHandler, traceHdrsS3HFlag, noObjLayerFlag))
 		// Profiling operations
-		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/profile").HandlerFunc(adminMiddleware(adminAPI.ProfileHandler, traceAllFlag, noObjLayerFlag))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/profile").HandlerFunc(adminMiddleware(adminAPI.ProfileHandler, traceHdrsS3HFlag, noObjLayerFlag))
 
 		// Config KV operations.
 		if enableConfigOps {
@@ -244,6 +244,9 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		// STS accounts ops
 		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/temporary-account-info").HandlerFunc(adminMiddleware(adminAPI.TemporaryAccountInfo)).Queries("accessKey", "{accessKey:.*}")
 
+		// Access key (service account/STS) operations
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/list-access-keys-bulk").HandlerFunc(adminMiddleware(adminAPI.ListAccessKeysBulk)).Queries("listType", "{listType:.*}")
+
 		// Info policy IAM latest
 		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/info-canned-policy").HandlerFunc(adminMiddleware(adminAPI.InfoCannedPolicy)).Queries("name", "{name:.*}")
 		// List policies latest
@@ -290,6 +293,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 
 		// Import IAM info
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/import-iam").HandlerFunc(adminMiddleware(adminAPI.ImportIAM, noGZFlag))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/import-iam-v2").HandlerFunc(adminMiddleware(adminAPI.ImportIAMV2, noGZFlag))
 
 		// IDentity Provider configuration APIs
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(adminMiddleware(adminAPI.AddIdentityProviderCfg))
