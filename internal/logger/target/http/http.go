@@ -43,8 +43,6 @@ import (
 )
 
 const (
-	// Timeout for the webhook http call
-	webhookCallTimeout = 5 * time.Second
 
 	// maxWorkers is the maximum number of concurrent http loggers
 	maxWorkers = 16
@@ -69,18 +67,21 @@ var (
 
 // Config http logger target
 type Config struct {
-	Enabled    bool              `json:"enabled"`
-	Name       string            `json:"name"`
-	UserAgent  string            `json:"userAgent"`
-	Endpoint   *xnet.URL         `json:"endpoint"`
-	AuthToken  string            `json:"authToken"`
-	ClientCert string            `json:"clientCert"`
-	ClientKey  string            `json:"clientKey"`
-	BatchSize  int               `json:"batchSize"`
-	QueueSize  int               `json:"queueSize"`
-	QueueDir   string            `json:"queueDir"`
-	Proxy      string            `json:"string"`
-	Transport  http.RoundTripper `json:"-"`
+	Enabled     bool              `json:"enabled"`
+	Name        string            `json:"name"`
+	UserAgent   string            `json:"userAgent"`
+	Endpoint    *xnet.URL         `json:"endpoint"`
+	AuthToken   string            `json:"authToken"`
+	ClientCert  string            `json:"clientCert"`
+	ClientKey   string            `json:"clientKey"`
+	BatchSize   int               `json:"batchSize"`
+	QueueSize   int               `json:"queueSize"`
+	QueueDir    string            `json:"queueDir"`
+	MaxRetry    int               `json:"maxRetry"`
+	RetryIntvl  time.Duration     `json:"retryInterval"`
+	Proxy       string            `json:"string"`
+	Transport   http.RoundTripper `json:"-"`
+	HTTPTimeout time.Duration     `json:"httpTimeout"`
 
 	// Custom logger
 	LogOnceIf func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
@@ -135,8 +136,9 @@ type Target struct {
 
 	initQueueOnce once.Init
 
-	config Config
-	client *http.Client
+	config      Config
+	client      *http.Client
+	httpTimeout time.Duration
 }
 
 // Name returns the name of the target
@@ -222,15 +224,13 @@ func (h *Target) initMemoryStore(ctx context.Context) (err error) {
 }
 
 func (h *Target) send(ctx context.Context, payload []byte, payloadCount int, payloadType string, timeout time.Duration) (err error) {
-	h.failedMessages.Add(int64(payloadCount))
-
 	defer func() {
 		if err != nil {
 			if xnet.IsNetworkOrHostDown(err, false) {
 				h.status.Store(statusOffline)
 			}
+			h.failedMessages.Add(int64(payloadCount))
 		} else {
-			h.failedMessages.Add(-int64(payloadCount))
 			h.status.Store(statusOnline)
 		}
 	}()
@@ -266,15 +266,13 @@ func (h *Target) send(ctx context.Context, payload []byte, payloadCount int, pay
 	// Drain any response.
 	xhttp.DrainBody(resp.Body)
 
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent:
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 		// accepted HTTP status codes.
 		return nil
-	case http.StatusForbidden:
+	} else if resp.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("%s returned '%s', please check if your auth token is correctly set", h.Endpoint(), resp.Status)
-	default:
-		return fmt.Errorf("%s returned '%s', please check your endpoint configuration", h.Endpoint(), resp.Status)
 	}
+	return fmt.Errorf("%s returned '%s', please check your endpoint configuration", h.Endpoint(), resp.Status)
 }
 
 func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
@@ -328,9 +326,6 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 		}
 	}()
 
-	var entry interface{}
-	var ok bool
-	var err error
 	lastBatchProcess := time.Now()
 
 	buf := bytebufferpool.Get()
@@ -345,60 +340,75 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 	globalBuffer := logChBuffers[name]
 	logChLock.Unlock()
 
-	newTicker := time.NewTicker(time.Second)
-	isTick := false
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
+	var count int
 	for {
-		isTick = false
-		select {
-		case _ = <-newTicker.C:
-			isTick = true
-		case entry, _ = <-globalBuffer:
-		case entry, ok = <-h.logCh:
-			if !ok {
+		var (
+			ok    bool
+			entry any
+		)
+
+		if count < h.batchSize {
+			tickered := false
+			select {
+			case _ = <-ticker.C:
+				tickered = true
+			case entry, _ = <-globalBuffer:
+			case entry, ok = <-h.logCh:
+				if !ok {
+					return
+				}
+			case <-ctx.Done():
 				return
 			}
-		case <-ctx.Done():
-			return
-		}
 
-		var count int
-		if !isTick {
-			h.totalMessages.Add(1)
-
-			if !isDirQueue {
-				if err := enc.Encode(&entry); err != nil {
-					h.config.LogOnceIf(
-						ctx,
-						fmt.Errorf("unable to encode webhook log entry, err  '%w' entry: %v\n", err, entry),
-						h.Name(),
-					)
-					h.failedMessages.Add(1)
-					continue
+			if !tickered {
+				h.totalMessages.Add(1)
+				if !isDirQueue {
+					if err := enc.Encode(&entry); err != nil {
+						h.config.LogOnceIf(
+							ctx,
+							fmt.Errorf("unable to encode webhook log entry, err  '%w' entry: %v\n", err, entry),
+							h.Name(),
+						)
+						h.failedMessages.Add(1)
+						continue
+					}
+				} else {
+					entries = append(entries, entry)
 				}
 				count++
-			} else {
-				entries = append(entries, entry)
-				count++
 			}
-		}
 
-		if count != h.batchSize {
 			if len(h.logCh) > 0 || len(globalBuffer) > 0 || count == 0 {
+				// there is something in the log queue
+				// process it first, even if we tickered
+				// first, or we have not received any events
+				// yet, still wait on it.
 				continue
 			}
 
-			if h.batchSize > 1 {
-				// If we are doing batching, we should wait
-				// at least one second before sending.
-				// Even if there is nothing in the queue.
-				if time.Since(lastBatchProcess).Seconds() < 1 {
-					continue
-				}
+			// If we are doing batching, we should wait
+			// at least for a second, before sending.
+			// Even if there is nothing in the queue.
+			if h.batchSize > 1 && time.Since(lastBatchProcess) < time.Second {
+				continue
 			}
 		}
 
+		// if we have reached the count send at once
+		// or we have crossed last second before batch was sent, send at once
 		lastBatchProcess = time.Now()
+
+		var retries int
+		retryIntvl := h.config.RetryIntvl
+		if retryIntvl <= 0 {
+			retryIntvl = 3 * time.Second
+		}
+
+		maxRetries := h.config.MaxRetry
 
 	retry:
 		// If the channel reaches above half capacity
@@ -417,25 +427,32 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 			}
 		}
 
+		var err error
 		if !isDirQueue {
-			err = h.send(ctx, buf.Bytes(), count, h.payloadType, webhookCallTimeout)
+			err = h.send(ctx, buf.Bytes(), count, h.payloadType, h.httpTimeout)
 		} else {
-			err = h.store.PutMultiple(entries)
+			_, err = h.store.PutMultiple(entries)
 		}
 
 		if err != nil {
-			h.config.LogOnceIf(
-				context.Background(),
-				fmt.Errorf("unable to send webhook log entry(s) to '%s' err '%w': %d", name, err, count),
-				name,
-			)
-
 			if errors.Is(err, context.Canceled) {
 				return
 			}
 
-			time.Sleep(3 * time.Second)
-			goto retry
+			h.config.LogOnceIf(
+				context.Background(),
+				fmt.Errorf("unable to send audit/log entry(s) to '%s' err '%w': %d", name, err, count),
+				name,
+			)
+
+			time.Sleep(retryIntvl)
+			if maxRetries == 0 {
+				goto retry
+			}
+			retries++
+			if retries <= maxRetries {
+				goto retry
+			}
 		}
 
 		entries = make([]interface{}, 0)
@@ -503,10 +520,11 @@ func New(config Config) (*Target, error) {
 	}
 
 	h := &Target{
-		logCh:      make(chan interface{}, config.QueueSize),
-		config:     config,
-		batchSize:  config.BatchSize,
-		maxWorkers: int64(maxWorkers),
+		logCh:       make(chan interface{}, config.QueueSize),
+		config:      config,
+		batchSize:   config.BatchSize,
+		maxWorkers:  int64(maxWorkers),
+		httpTimeout: config.HTTPTimeout,
 	}
 	h.status.Store(statusOffline)
 
@@ -532,7 +550,7 @@ func New(config Config) (*Target, error) {
 // SendFromStore - reads the log from store and sends it to webhook.
 func (h *Target) SendFromStore(key store.Key) (err error) {
 	var eventData []byte
-	eventData, err = h.store.GetRaw(key.Name)
+	eventData, err = h.store.GetRaw(key)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -549,12 +567,12 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 		}
 	}
 
-	if err := h.send(context.Background(), eventData, count, h.payloadType, webhookCallTimeout); err != nil {
+	if err := h.send(context.Background(), eventData, count, h.payloadType, h.httpTimeout); err != nil {
 		return err
 	}
 
 	// Delete the event from store.
-	return h.store.Del(key.Name)
+	return h.store.Del(key)
 }
 
 // Send the log message 'entry' to the http target.
